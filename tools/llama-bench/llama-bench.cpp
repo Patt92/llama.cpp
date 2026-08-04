@@ -28,6 +28,24 @@
 #include "llama.h"
 #include "log.h"
 
+#ifdef LLAMA_BENCH_ROCTX
+#include <rocprofiler-sdk-roctx/roctx.h>
+
+struct scoped_roctx_range {
+    explicit scoped_roctx_range(const char * name) {
+        roctxRangePush(name);
+    }
+
+    ~scoped_roctx_range() {
+        roctxRangePop();
+    }
+};
+#else
+struct scoped_roctx_range {
+    explicit scoped_roctx_range(const char *) {}
+};
+#endif
+
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -2304,7 +2322,10 @@ int llama_bench(int argc, char ** argv) {
                 llama_model_free(lmodel);
             }
 
-            lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
+            {
+                scoped_roctx_range range("llama-bench/model-load");
+                lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
+            }
             if (lmodel == NULL) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
                 return 1;
@@ -2312,7 +2333,11 @@ int llama_bench(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
-        llama_context * ctx = llama_init_from_model(lmodel, cparams);
+        llama_context * ctx;
+        {
+            scoped_roctx_range range("llama-bench/context-init");
+            ctx = llama_init_from_model(lmodel, cparams);
+        }
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_model_free(lmodel);
@@ -2356,6 +2381,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
                 //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
+                scoped_roctx_range range("llama-bench/warmup-prompt");
                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
@@ -2368,6 +2394,7 @@ int llama_bench(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
                 }
+                scoped_roctx_range range("llama-bench/warmup-generation");
                 bool res = test_gen(ctx, 1, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
@@ -2386,6 +2413,7 @@ int llama_bench(int argc, char ** argv) {
 
                 if (is_cached) {
                     // if previously we have computed at this depth, just restore the state
+                    scoped_roctx_range range("llama-bench/depth-restore");
                     const size_t ret = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
                     if (ret == 0) {
                         // if the old state is incompatible with the current context - reprocess from scratch
@@ -2398,6 +2426,7 @@ int llama_bench(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
+                    scoped_roctx_range range("llama-bench/depth-compute");
                     bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
@@ -2425,6 +2454,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+                scoped_roctx_range range("llama-bench/prompt");
                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
@@ -2438,6 +2468,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+                scoped_roctx_range range("llama-bench/generation");
                 bool res = test_gen(ctx, t.n_gen, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
