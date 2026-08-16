@@ -516,10 +516,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // kernel: decode (n_q = 1) never uses WMMA (n_q*gqa_ratio_eff <= 8), so a
     // WMMA verify batch would produce different logits than decode.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8 && Q->ne[1] > 8) {
-        // The kernel instantiates logit_softcap only for heads 128/256/512.
-        if (logit_softcap == 0.0f || Q->ne[0] == 128) {
-            return BEST_FATTN_KERNEL_MMA_F16;
-        }
+        return BEST_FATTN_KERNEL_MMA_F16;
     }
 
     // If there are no tensor cores available, use the generic tile kernel:
