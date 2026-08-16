@@ -16,30 +16,72 @@
 
 </div>
 
-> [!IMPORTANT]
-> ## Patt92 ROCm / Strix Halo fork — V5
->
-> This branch is based on upstream llama.cpp commit
-> [`4df29be4f4c3673f428170fda944a5b19f743bb8`](https://github.com/ggml-org/llama.cpp/commit/4df29be4f4c3673f428170fda944a5b19f743bb8)
-> and retains upstream functionality while adding ROCm/HIP tuning for AMD Strix Halo
-> (`gfx1151` / RDNA3.5). It is intended for a ROCm build, not as a replacement for
-> the default portable upstream build.
->
-> Compared with upstream, V5 adds:
->
-> - hipCUB-backed HIP top-k/argsort, including the RPC path used by distributed inference;
-> - Strix Halo kernel selection and tuning for Flash Attention, MMQ/MMVQ, Q8 MoE,
->   Gated Delta Net, Lightning Indexer and DeepSeek-V4 long-context prefill;
-> - a gfx1151-specialized Lightning Indexer top-k path and safer per-layer fused-op
->   fallback behavior for mixed ROCm/RPC execution;
-> - Qwen3.5/Qwen3.8-oriented SSM/DeltaNet, MoE and Q8_1 graph fusions, plus Q6_K
->   MMVQ decode work; and
-> - deterministic speculative/MTP verification paths so decode and verify batches
->   select compatible attention and MMVQ kernels.
->
-> The native-BF16 Flash-Attention tile series from the external ROCm research branch
-> is deliberately not included: it overlaps this fork's tested gfx1151 tiled-FA path
-> and needs a separate benchmark before it can safely replace it.
+## Patt92 ROCm / Strix Halo fork — V5
+
+This branch is based on upstream llama.cpp commit
+[`4df29be4f4c3673f428170fda944a5b19f743bb8`](https://github.com/ggml-org/llama.cpp/commit/4df29be4f4c3673f428170fda944a5b19f743bb8).
+It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
+(`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
+optimization branch. It retains normal upstream functionality, but is not intended to
+replace the portable default upstream build.
+
+### Included changes relative to upstream
+
+#### HIP, RPC and long-context routing
+
+- Enables hipCUB for HIP top-k and argsort, including the distributed RPC execution
+  path, so these operations remain GPU-capable on ROCm.
+- Adds a gfx1151-local Lightning Indexer top-k specialization for 512, 1024 and 2048
+  candidates up to 8192 score entries, avoiding the expensive generic device-wide sort
+  during DeepSeek-V4 long-context prefill.
+- Keeps the Lightning Indexer key cache in F16 when a quantized KV cache is selected,
+  where required by the DeepSeek path.
+- Resolves fused operations per layer and device instead of disabling an entire graph
+  on a single ROCm/RPC backend mismatch; the default fallback remains unfused GPU work,
+  not CPU work.
+
+#### Strix Halo compute tuning
+
+- Adds RDNA3.5/gfx1151 kernel and launch tuning for MMQ, MMVQ, Q8 MoE and expert MMQ.
+- Caches MMVQ Q8_1 activations and partitions MMQ waves across rows and columns.
+- Adds AMD WMMA Lightning Indexer support and tuned tiled Flash Attention, including a
+  fix for NaNs in the compacted-tile mask path.
+- Tunes Gated Delta Net and adds quantized-KV Flash Attention support for Strix Halo.
+- Extends the gfx1151 MMVQ selection to the relevant Q4/Q5/Q6/Q8 and MXFP4 decode
+  types, including the Q6_K VDR=2 decode kernel.
+- Keeps HIP integrated-GPU host-buffer handling safe.
+
+#### DeepSeek-V4 and speculative decoding
+
+- Makes the grouped output-projection input contiguous for small multi-token
+  DeepSeek-V4 speculative batches.
+- Uses matching MMVQ and Flash-Attention kernel configurations for decode and small
+  speculative/MTP verification batches, preventing numerical divergence between the
+  logits used for acceptance checks.
+- Keeps fused DeepSeek-V4 HC and Gated Delta Net operations on devices that support
+  them while safely falling back only for mismatching layers.
+
+#### Qwen3.5 / Qwen3.8 and hybrid SSM models
+
+- Fuses SSM gate/beta projections, the SSM convolution-output L2 norm, and the SSM
+  pre-scan chain (convolution, L2 norm, gate/beta).
+- Folds SSM convolution-input concatenation into QKV MMVQ and fuses paired MMVQ
+  matmuls that share an activation.
+- Caches graph-local Q8_1 matmul inputs, folds Q8_1 quantization into RMS norm and
+  gating-MUL, and fuses a matmul-plus-add-through-view sequence.
+- Folds MoE top-k weights into the down projection and fuses the shared-expert output
+  chain.
+- Fuses IMRoPE and set-rows for BF16 KV cache use, and aligns the attention-gate
+  tensor-parallel split with attention-Q.
+
+### Deliberate exclusions
+
+- Native-BF16 Flash-Attention tile changes from an external ROCm research series are
+  not included. They overlap the tested gfx1151 tiled-FA path in this branch and need
+  their own ROCm correctness and performance benchmark before replacement.
+- Vulkan shaders, Vulkan resource management and Vulkan-only environment flags are not
+  copied into this HIP branch. Algorithmic ideas from them may be ported separately,
+  with a dedicated HIP implementation and benchmark.
 
 ## Quick start
 
