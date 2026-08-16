@@ -16,6 +16,31 @@
 
 </div>
 
+> [!IMPORTANT]
+> ## Patt92 ROCm / Strix Halo fork — V5
+>
+> This branch is based on upstream llama.cpp commit
+> [`4df29be4f4c3673f428170fda944a5b19f743bb8`](https://github.com/ggml-org/llama.cpp/commit/4df29be4f4c3673f428170fda944a5b19f743bb8)
+> and retains upstream functionality while adding ROCm/HIP tuning for AMD Strix Halo
+> (`gfx1151` / RDNA3.5). It is intended for a ROCm build, not as a replacement for
+> the default portable upstream build.
+>
+> Compared with upstream, V5 adds:
+>
+> - hipCUB-backed HIP top-k/argsort, including the RPC path used by distributed inference;
+> - Strix Halo kernel selection and tuning for Flash Attention, MMQ/MMVQ, Q8 MoE,
+>   Gated Delta Net, Lightning Indexer and DeepSeek-V4 long-context prefill;
+> - a gfx1151-specialized Lightning Indexer top-k path and safer per-layer fused-op
+>   fallback behavior for mixed ROCm/RPC execution;
+> - Qwen3.5/Qwen3.8-oriented SSM/DeltaNet, MoE and Q8_1 graph fusions, plus Q6_K
+>   MMVQ decode work; and
+> - deterministic speculative/MTP verification paths so decode and verify batches
+>   select compatible attention and MMVQ kernels.
+>
+> The native-BF16 Flash-Attention tile series from the external ROCm research branch
+> is deliberately not included: it overlaps this fork's tested gfx1151 tiled-FA path
+> and needs a separate benchmark before it can safely replace it.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
