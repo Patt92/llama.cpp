@@ -626,6 +626,84 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+template<typename T>
+static __global__ void mul_mat_vec_f_rank1_id(
+        const T * x, const float * y, const int32_t * ids, float * dst,
+        const int64_t nrows, const int64_t stride_row_x, const int64_t stride_expert_x,
+        const int64_t stride_channel_y, const int64_t stride_token_y,
+        const int64_t stride_channel_dst, const int64_t stride_token_dst,
+        const int64_t ids_stride) {
+    const int64_t row = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    const int64_t channel = blockIdx.y;
+    const int64_t token   = blockIdx.z;
+    const int32_t expert  = ids[channel + token*ids_stride];
+
+    dst[token*stride_token_dst + channel*stride_channel_dst + row] =
+        ggml_cuda_cast<float>(x[expert*stride_expert_x + row*stride_row_x]) *
+        y[token*stride_token_y + channel*stride_channel_y];
+}
+
+bool ggml_cuda_should_use_mmvf_rank1_id(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+    if (ids == nullptr || src0->ne[0] != 1 || src0->ne[1] != dst->ne[0] || src0->ne[2] != ids->ne[0] || src0->ne[3] != 1 ||
+            src1->ne[0] != 1 || src1->ne[1] != ids->ne[0] || src1->ne[2] != dst->ne[2] ||
+            src1->ne[3] != 1 || ids->ne[1] != dst->ne[2] || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            dst->ne[1] != ids->ne[0] || dst->ne[3] != 1 ||
+            dst->ne[2] > MMVF_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) ||
+            src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    return src0->nb[0] == ggml_type_size(src0->type) &&
+           src0->nb[1] == src0->nb[0] &&
+           src1->nb[0] == sizeof(float) &&
+           ids->nb[0] == sizeof(int32_t) &&
+           dst->nb[0] == sizeof(float);
+}
+
+void ggml_cuda_mul_mat_vec_f_rank1_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_should_use_mmvf_rank1_id(src0, src1, ids, dst));
+
+    const dim3 block_dims(256, 1, 1);
+    const dim3 block_nums((dst->ne[0] + block_dims.x - 1) / block_dims.x, dst->ne[1], dst->ne[2]);
+    const ggml_cuda_kernel_launch_params launch_params = { block_nums, block_dims, 0, ctx.stream() };
+
+    const int64_t stride_row_x       = src0->nb[1] / ggml_type_size(src0->type);
+    const int64_t stride_expert_x    = src0->nb[2] / ggml_type_size(src0->type);
+    const int64_t stride_channel_y   = src1->nb[1] / sizeof(float);
+    const int64_t stride_token_y     = src1->nb[2] / sizeof(float);
+    const int64_t stride_channel_dst =  dst->nb[1] / sizeof(float);
+    const int64_t stride_token_dst   =  dst->nb[2] / sizeof(float);
+    const int64_t ids_stride         =  ids->nb[1] / sizeof(int32_t);
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_cuda_kernel_launch(mul_mat_vec_f_rank1_id<float>, launch_params,
+                (const float *) src0->data, (const float *) src1->data, (const int32_t *) ids->data, (float *) dst->data,
+                dst->ne[0], stride_row_x, stride_expert_x, stride_channel_y, stride_token_y, stride_channel_dst, stride_token_dst, ids_stride);
+            break;
+        case GGML_TYPE_F16:
+            ggml_cuda_kernel_launch(mul_mat_vec_f_rank1_id<half>, launch_params,
+                (const half *) src0->data, (const float *) src1->data, (const int32_t *) ids->data, (float *) dst->data,
+                dst->ne[0], stride_row_x, stride_expert_x, stride_channel_y, stride_token_y, stride_channel_dst, stride_token_dst, ids_stride);
+            break;
+        case GGML_TYPE_BF16:
+            ggml_cuda_kernel_launch(mul_mat_vec_f_rank1_id<nv_bfloat16>, launch_params,
+                (const nv_bfloat16 *) src0->data, (const float *) src1->data, (const int32_t *) ids->data, (float *) dst->data,
+                dst->ne[0], stride_row_x, stride_expert_x, stride_channel_y, stride_token_y, stride_channel_dst, stride_token_dst, ids_stride);
+            break;
+        default:
+            GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
+    }
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
