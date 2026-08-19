@@ -17,6 +17,248 @@
 
 </div>
 
+## Patt92 ROCm / Strix Halo fork — V13
+
+This branch is based on upstream llama.cpp commit
+[`fe8156f789011f6ea0baf6917ea09f88b89d9554`](https://github.com/ggml-org/llama.cpp/commit/fe8156f789011f6ea0baf6917ea09f88b89d9554).
+It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
+(`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
+optimization branch. It retains normal upstream functionality, but is not intended to
+replace the portable default upstream build.
+
+### Included changes relative to upstream
+
+#### HIP, RPC and long-context routing
+
+- Enables hipCUB for HIP top-k and argsort, including the distributed RPC execution
+  path, so these operations remain GPU-capable on ROCm.
+- Includes upstream RPC protocol 5.1 and its graph-use-count propagation, allowing
+  supported backend fusions to run on the RPC worker. Controller and worker must use
+  the same V13 build; mixed RPC 5.0/5.1 binaries are unsupported.
+- Adds a gfx1151-local Lightning Indexer top-k specialization for 512, 1024 and 2048
+  candidates up to 8192 score entries, avoiding the expensive generic device-wide sort
+  during DeepSeek-V4 long-context prefill.
+- Keeps the Lightning Indexer key cache in F16 when a quantized KV cache is selected,
+  where required by the DeepSeek path.
+- Resolves fused operations per layer and device instead of disabling an entire graph
+  on a single ROCm/RPC backend mismatch; the default fallback remains unfused GPU work,
+  not CPU work.
+- Restores a fixed scheduler split-input cut-off after a dynamically grown split buffer.
+  This prevents cross-backend input copies from remaining live across ever-larger graph
+  regions in controller-plus-RPC layouts.
+- Validates HIP MMVF dispatch for rank-1 MoE LoRA-B `MUL_MAT_ID` tensors, as used by
+  DeepSeek-V4 expert adapters. The even-K MMVF kernel is never selected for this
+  layout; it uses the tested general GPU fallback instead. This avoids an RPC-worker
+  GPU fault at the cost of graph reuse for the affected LoRA operation.
+
+#### Strix Halo compute tuning
+
+- Adds RDNA3.5/gfx1151 kernel and launch tuning for MMQ, MMVQ, Q8 MoE and expert MMQ.
+- Caches MMVQ Q8_1 activations and partitions MMQ waves across rows and columns.
+- Adds AMD WMMA Lightning Indexer support and tuned tiled Flash Attention, including a
+  fix for NaNs in the compacted-tile mask path.
+- Tunes Gated Delta Net and adds quantized-KV Flash Attention support for Strix Halo.
+- Extends the gfx1151 MMVQ selection to the relevant Q4/Q5/Q6/Q8 and MXFP4 decode
+  types, including the Q6_K VDR=2 decode kernel.
+- Keeps HIP integrated-GPU host-buffer handling safe.
+
+#### DeepSeek-V4 and speculative decoding
+
+- Makes the grouped output-projection input contiguous for small multi-token
+  DeepSeek-V4 speculative batches.
+- Uses matching MMVQ and Flash-Attention kernel configurations for decode and small
+  speculative/MTP verification batches, preventing numerical divergence between the
+  logits used for acceptance checks.
+- Resets deferred MTP hidden state when a reused slot starts a genuinely new sequence
+  and serializes that state with context checkpoints. This addresses the inter-request
+  state leak tracked by upstream issue #26425 without discarding valid cached-prefix
+  state.
+- Keeps fused DeepSeek-V4 HC and Gated Delta Net operations on devices that support
+  them while safely falling back only for mismatching layers.
+
+#### Qwen3.5 / Qwen3.8 and hybrid SSM models
+
+- Fuses SSM gate/beta projections, the SSM convolution-output L2 norm, and the SSM
+  pre-scan chain (convolution, L2 norm, gate/beta).
+- Folds SSM convolution-input concatenation into QKV MMVQ and fuses paired MMVQ
+  matmuls that share an activation.
+- Caches graph-local Q8_1 matmul inputs, folds Q8_1 quantization into RMS norm and
+  gating-MUL, and fuses a matmul-plus-add-through-view sequence.
+- Folds MoE top-k weights into the down projection and fuses the shared-expert output
+  chain.
+- Fuses IMRoPE and set-rows for BF16 KV cache use, and aligns the attention-gate
+  tensor-parallel split with attention-Q.
+- Adds the model-specific DFlash2 checkpoint format, local grouped dynamic depthwise
+  convolution, candidate selector and stochastic maximal-coupling verification from
+  upstream PR #27342. DFlash2 activates only for a DFlash2 checkpoint; it does not
+  silently replace MTP, DSpark or ordinary autoregressive decoding.
+- Capability-gates DFlash2 activation against the graph that is actually built. A
+  metadata-only selector no longer enters a zero-acceptance DFlash2 path, and an
+  unsupported DFlash2 selector on a DeepSeek-V4 backbone is rejected explicitly.
+- Adds FastMTP compact-draft-vocabulary support for Qwen3.8 sidecars carrying an I64
+  `d2t` map. The draft LM head evaluates only its compact vocabulary and scatters the
+  logits back into the full target vocabulary before verification. Shape, I32/I64 index type,
+  vocabulary range and required output-head invariants are validated at load/build time.
+
+### Recommended `llama-server` profiles for Qwen3.8-27B
+
+FastMTP improves token generation only when the compact draft predicts target tokens
+with useful acceptance. It does not accelerate target-model prompt processing. Measure
+`draft acceptance`, accepted mean length and final `eval time`, not draft speed alone.
+
+#### Correctness baseline: no speculative decoder
+
+```sh
+--spec-type none \
+--parallel 1 \
+--batch-size 2048 \
+--ubatch-size 512 \
+--flash-attn on
+```
+
+Run the same prompt, seed and sampler more than once before enabling a draft. This is
+the reference for both output stability and true target-model generation speed.
+
+#### Embedded Qwen MTP head
+
+```sh
+--spec-type draft-mtp \
+--spec-draft-n-max 2 \
+--spec-draft-device ROCm0 \
+--spec-draft-ngl all \
+--spec-draft-type-k f16 \
+--spec-draft-type-v f16 \
+--parallel 1 \
+--batch-size 2048 \
+--ubatch-size 512 \
+--flash-attn on
+```
+
+Do not pass `--spec-draft-model` for the embedded head. Test `--spec-draft-n-max 1`,
+`2` and `3`; keep the value with the best end-to-end generation rate rather than the
+largest value. Do not add `--spec-default`, because that also enables an independent
+ngram drafter.
+
+#### HauhauCS compact FastMTP sidecar
+
+```sh
+--spec-type draft-mtp \
+--spec-draft-model /opt/models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf \
+--spec-draft-device ROCm0 \
+--spec-draft-ngl all \
+--spec-draft-n-max 3 \
+--spec-draft-p-min 0 \
+--spec-draft-type-k f16 \
+--spec-draft-type-v f16 \
+--parallel 1 \
+--ctx-size 204800 \
+--batch-size 2048 \
+--ubatch-size 512 \
+--flash-attn on \
+--load-mode none \
+--temp 1.0 \
+--top-k 20 \
+--top-p 0.95 \
+--min-p 0.0 \
+--repeat-penalty 1.0 \
+--presence-penalty 0.0
+```
+
+The sidecar is model-variant-specific: use the matching target/checkpoint family and
+do not assume that another Qwen3.8 quant or fine-tune has an identical token map.
+Depth 3 is the published starting point, not a universal optimum. The source model's
+reported speedups were measured on NVIDIA Blackwell, not ROCm; this fork supplies the
+backend-neutral graph plus HIP `FILL`/`SET_ROWS` execution, but gfx1151 throughput must
+be established locally. Start with F16 draft K/V; try Q8 only after repeated requests
+remain stable.
+
+For maximum single-request speed use `--parallel 1`. Higher parallelism can improve
+aggregate throughput but usually lowers per-request generation speed. The shown
+`--batch-size 2048 --ubatch-size 512` is already sufficient for small MTP verification
+batches; making either value much larger is primarily a memory/performance experiment,
+not a correctness fix.
+
+#### DFlash2 sidecar
+
+```sh
+--spec-type draft-dflash \
+--spec-draft-model /opt/models/Qwen3.8-27B/Qwen3.8-27B-DFlash2-BF16.gguf \
+--spec-draft-device ROCm0 \
+--spec-draft-ngl all \
+--spec-draft-n-max 8 \
+--spec-draft-type-k f16 \
+--spec-draft-type-v f16
+```
+
+The CLI type is `draft-dflash`, not `draft-dflash2` and not `draft-mtp`. DFlash2 is
+still sourced from an open upstream PR, so validate it separately from FastMTP before
+using it in a production alias.
+
+### Qwen3.8 speculative-decoding correctness notes
+
+- Do not combine `--spec-default` with `--spec-type draft-mtp` while isolating output
+  corruption. `--spec-default` adds an independent modified-ngram drafter; it is not a
+  set of harmless MTP defaults. Use one speculative method at a time.
+- Establish a deterministic no-draft baseline first, then test plain
+  `--spec-type draft-mtp` with `--spec-draft-n-max 1` and `2`. Draft K/V should start
+  at F16 for correctness isolation; quantize it only after the same prompt and seed
+  remain stable.
+- V13 contains a source-level MTP sequence/reset and checkpoint-state fix for the
+  inter-request degradation reported in upstream issue #26425. During the first ROCm
+  soak test, `--ctx-checkpoints 0` remains a useful conservative comparison rather
+  than a permanent requirement.
+- The fork keeps decode and small speculative-verification MMVQ/Flash-Attention launch
+  shapes consistent on gfx1151. If output is correct locally but corrupt over RPC,
+  set `GGML_CUDA_DISABLE_FUSION=1` in the RPC worker environment for an A/B run. RPC
+  5.1 can execute backend fusions remotely that older RPC builds never reached.
+- `--batch-size` and `--ubatch-size` primarily affect throughput and memory pressure;
+  they are not correctness switches for committed speculative tokens. Change them
+  only after the no-draft and single-drafter comparisons are clean.
+- DFlash2 support is an experimental preview from an open upstream PR. It is a
+  separate drafter and requires a DFlash2 checkpoint; it is not presented as a fix
+  for an existing MTP checkpoint.
+
+### Sources and provenance
+
+- [@ggml-org](https://github.com/ggml-org/llama.cpp) provides the upstream base. This
+  branch is rebased on the exact upstream commit stated above.
+- [@Patt92](https://github.com/Patt92/llama.cpp) maintains this integration branch and
+  supplies the HIP RPC top-k/argsort patch, including the current HIP-only rank-1 MoE
+  LoRA MMVF dispatch fix.
+- [@Geramy](https://github.com/Geramy/llama.cpp) is the provenance for the original
+  hipCUB/CUB-on-HIP top-k and argsort approach. Its useful HIP content was rebased
+  into the Patt92 RPC patch; no older branch is required at build time.
+- [@Nathanw1014](https://github.com/Nathanw1014/llama.cpp) supplies the selected
+  Strix Halo/RDNA3.5 HIP tuning, DeepSeek-V4, Flash-Attention, MMQ/MMVQ and
+  backend-neutral fused-op work, including the DFlash2 graph-capability guard.
+  Vulkan-only implementation code is excluded.
+- [@antirez](https://github.com/antirez/ds4) is the algorithmic source for the
+  gfx1151-local Lightning Indexer top-k adaptation. Only the compatible HIP
+  specialization is used; ds4 runtime, model and storage code is not included.
+- [@stew675](https://github.com/stew675/llama.cpp) supplies the selected
+  ROCm-compatible Qwen3.5/Qwen3.8 and hybrid-SSM fusions, MMVQ tuning and
+  speculative decode/verification consistency fixes.
+- [@SubSir](https://github.com/SubSir) / [@z-lab](https://github.com/z-lab) supplies
+  the DFlash2 implementation currently proposed in
+  [ggml-org/llama.cpp#27342](https://github.com/ggml-org/llama.cpp/pull/27342).
+- [@HauhauCS](https://huggingface.co/HauhauCS) supplies the
+  [compact-vocabulary FastMTP format and original Qwen3.8 runtime patch](https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF).
+  This branch retains that algorithm while adding explicit loader and graph validation.
+
+### Deliberate exclusions
+
+- Native-BF16 Flash-Attention tile changes from an external ROCm research series are
+  not included. They overlap the tested gfx1151 tiled-FA path in this branch and need
+  their own ROCm correctness and performance benchmark before replacement.
+- The external adaptive-MTP depth experiment is not included. It is backend-neutral,
+  but needs a separate correctness and throughput test with the RPC memory layout
+  before it can be considered for this branch.
+- No unreviewed change is used to reinterpret or skip target-model verification for
+  MTP. DFlash2's additional verifier is used only by DFlash2 checkpoints.
+- Vulkan shaders, Vulkan resource management and Vulkan-only environment flags are not
+  copied into this HIP branch. Algorithmic ideas from them may be ported separately,
+  with a dedicated HIP implementation and benchmark.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
