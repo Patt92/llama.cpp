@@ -639,7 +639,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_q = std::lcm(n_embd_q, blck_size_perf);
-            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
+            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias) ||
+                    std::regex_match(tensor_name, pattern_attn_gate_weight)) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
@@ -2459,6 +2460,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add backend sampling layers (if any)
     llm->build_sampling();
+    llm->build_post_sampling();
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
@@ -2971,6 +2973,14 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+int32_t llama_model_dflash2_top_k(const struct llama_model * model) {
+    // must match build_arch_graph: the DSV4 decode graph does not build the selector lattice
+    if (model->dflash_selector_hidden == nullptr || model->hparams.dsv4_hc_mult > 0) {
+        return 0;
+    }
+    return (int32_t) model->hparams.dflash_selector_top_k;
 }
 
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
