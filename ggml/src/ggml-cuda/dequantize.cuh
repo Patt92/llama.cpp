@@ -119,6 +119,17 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// Published ROCmFPX Q8 GGUFs keep Q8's signed payload but store their block
+// scale as UE4M3.  This is deliberately a separate path: regular Q8_0 stays
+// byte-for-byte and instruction-for-instruction unchanged.
+static __device__ __forceinline__ void dequantize_q8_0_rocmfpx(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp8 * x = (const block_rocmfp8 *) vx;
+    const float d = ggml_cuda_ue4m3_to_fp32(x[ib].e);
+
+    v.x = d * x[ib].qs[iqs + 0];
+    v.y = d * x[ib].qs[iqs + 1];
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

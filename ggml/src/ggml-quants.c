@@ -566,6 +566,66 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// Q8_0_ROCMFPX uses the same signed 8-bit payload as Q8_0, but an unsigned
+// E4M3 scale byte.  Keep it self-contained: stock Q8_0's layout and kernels
+// are not changed.
+static float rocmfpx_q8_scale_to_f32(const uint8_t e) {
+    if (e == 0x7f) {
+        return 0.0f;
+    }
+    const int exponent = e >> 3;
+    const int mantissa = e & 0x7;
+    return exponent == 0 ? ldexpf((float) mantissa, -10) : ldexpf((float) (8 + mantissa), exponent - 11);
+}
+
+static uint8_t rocmfpx_q8_nearest_scale(const float target) {
+    if (!(target > 0.0f) || !isfinite(target)) {
+        return 0;
+    }
+    uint8_t best = 1;
+    float best_delta = fabsf(rocmfpx_q8_scale_to_f32(best) - target);
+    for (uint8_t e = 2; e <= 126; ++e) {
+        const float delta = fabsf(rocmfpx_q8_scale_to_f32(e) - target);
+        if (delta < best_delta) {
+            best = e;
+            best_delta = delta;
+        }
+    }
+    return best;
+}
+
+void quantize_row_q8_0_rocmfpx_ref(const float * GGML_RESTRICT x, block_rocmfp8 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP8 == 0);
+    for (int64_t ib = 0; ib < k / QK_ROCMFP8; ++ib) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK_ROCMFP8; ++j) {
+            amax = MAX(amax, fabsf(x[ib*QK_ROCMFP8 + j]));
+        }
+        y[ib].e = rocmfpx_q8_nearest_scale(amax / 127.0f);
+        const float d = rocmfpx_q8_scale_to_f32(y[ib].e);
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        for (int j = 0; j < QK_ROCMFP8; ++j) {
+            y[ib].qs[j] = (int8_t) MAX(-127, MIN(127, (int) lroundf(x[ib*QK_ROCMFP8 + j] * id)));
+        }
+    }
+}
+
+void dequantize_row_q8_0_rocmfpx(const block_rocmfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP8 == 0);
+    for (int64_t ib = 0; ib < k / QK_ROCMFP8; ++ib) {
+        const float d = rocmfpx_q8_scale_to_f32(x[ib].e);
+        for (int j = 0; j < QK_ROCMFP8; ++j) {
+            y[ib*QK_ROCMFP8 + j] = d * x[ib].qs[j];
+        }
+    }
+}
+
+size_t quantize_q8_0_rocmfpx(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    quantize_row_q8_0_rocmfpx_ref(src, (block_rocmfp8 *) dst, nrows * n_per_row);
+    return (size_t) nrows * (size_t) (n_per_row / QK_ROCMFP8) * sizeof(block_rocmfp8);
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
