@@ -226,6 +226,16 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// ROCmFPX Q8: 32 signed values and one UE4M3 scale byte.  This isolated
+// definition is the on-disk layout used by published Q8_0_ROCMFPX GGUFs.
+#define QK_ROCMFP8 32
+#define QR_ROCMFP8 1
+typedef struct {
+    int8_t  qs[QK_ROCMFP8];
+    uint8_t e;
+} block_rocmfp8;
+static_assert(sizeof(block_rocmfp8) == QK_ROCMFP8 + sizeof(uint8_t), "wrong rocmfpx q8 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
