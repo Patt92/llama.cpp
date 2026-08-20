@@ -17,7 +17,41 @@
 
 </div>
 
-## Patt92 ROCm / Strix Halo fork — V13
+## Patt92 ROCm / Strix Halo fork — V13 (clean rebuild)
+
+This is a clean rebuild on upstream llama.cpp commit
+[`cd26896c19e6775b29a86908b5f049bbaec73305`](https://github.com/ggml-org/llama.cpp/commit/cd26896c19e6775b29a86908b5f049bbaec73305).
+It retains the complete, tested V12 Strix-Halo/gfx1151 HIP stack and adds only the
+published `Q8_0_ROCMFPX` GGUF format required by existing ROCmFPX Q8 models.
+
+The ROCmFPX addition is deliberately narrow: the on-disk type 103 / file type 111,
+CPU and HIP UE4M3-scale dequantization, HIP `GET_ROWS`, and the existing V12 MMVQ
+decode path. Normal `Q8_0` code and tuning are untouched. No historical ROCmFPX
+backend, MMQ, Flash-Attention, DeepSeek, Draft/MTP, server, Vulkan, Metal, OpenCL,
+or NVIDIA-specific code is imported.
+
+`Q8_0_ROCMFPX` is experimental. It is intended to load published Qwen3.8 Q8 ROCmFPX
+GGUFs without changing ordinary-model behavior. It does not force MMQ; that old
+MMQ transplant caused the earlier `mmq.cuh:98` abort and is intentionally excluded.
+Benchmark the custom quantification separately before relying on a throughput claim.
+
+### Included V12 stack
+
+- hipCUB top-k/argsort and RPC-compatible HIP routing.
+- gfx1151 MMVQ/MMQ, Flash Attention, rocWMMA Lightning Indexer, DeepSeek-V4 and
+  Qwen3.8/SSM tuning.
+- DeepSeek rank-1 MoE-LoRA fallback and speculative decode/verify correctness fixes.
+- Qwen3.8 DFlash2 capability gating and HauhauCS FastMTP support, with validation.
+
+### Explicitly excluded
+
+- The former broad ROCmFPX port. It was based on an old llama.cpp snapshot and
+  overwrote current upstream behavior, including an F16-compatible `ggml_fill`
+  path required by DeepSeek-V4. It is withdrawn and must not be deployed.
+- ROCmFPX Q2/Q3/Q4/Q6/Turbo formats, historical MMQ instances, old HIP copy/convert
+  code, and all non-HIP backend changes.
+
+## Historical withdrawn V13 notes — do not use
 
 This branch is based on upstream llama.cpp commit
 [`fe8156f789011f6ea0baf6917ea09f88b89d9554`](https://github.com/ggml-org/llama.cpp/commit/fe8156f789011f6ea0baf6917ea09f88b89d9554).

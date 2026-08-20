@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // Keep the published ROCmFPX Q8 type ID: existing GGUFs encode it.
+        GGML_TYPE_Q8_0_ROCMFPX = 103,
+        GGML_TYPE_COUNT   = 104,
     };
 
     // precision
@@ -475,6 +477,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX = 111, // experimental UE4M3-scale Q8
     };
 
     // available tensor operations:
