@@ -17,47 +17,10 @@
 
 </div>
 
-## Patt92 ROCm / Strix Halo fork — V13 (clean rebuild)
-
-This is a clean rebuild on upstream llama.cpp commit
-[`cd26896c19e6775b29a86908b5f049bbaec73305`](https://github.com/ggml-org/llama.cpp/commit/cd26896c19e6775b29a86908b5f049bbaec73305).
-It retains the complete, tested V12 Strix-Halo/gfx1151 HIP stack and adds only the
-published `Q8_0_ROCMFPX` GGUF format required by existing ROCmFPX Q8 models.
-
-The ROCmFPX addition is deliberately narrow: the on-disk type 103 / file type 111,
-CPU and HIP UE4M3-scale dequantization, HIP `GET_ROWS`, the existing V12 MMVQ decode
-path, and one current-ABI gfx1151 MMQ loader. That loader expands ROCmFPX's UE4M3
-scale into the established Q8 shared-memory format before the current Q8 WMMA/MMQ
-dot-product executes. Normal `Q8_0` code and tuning are untouched. No historical
-ROCmFPX backend, MMQ, Flash-Attention, DeepSeek, Draft/MTP, server, Vulkan, Metal,
-OpenCL, or NVIDIA-specific code is imported.
-
-`Q8_0_ROCMFPX` is experimental. It is intended to load published Qwen3.8 Q8 ROCmFPX
-GGUFs without changing ordinary-model behavior. It does not force MMQ globally: only
-the custom type can select its dedicated loader on HIP/gfx1151. The old MMQ transplant
-caused the earlier `mmq.cuh:98` abort and remains excluded. Benchmark the custom
-quantification separately before relying on a throughput claim.
-
-### Included V12 stack
-
-- hipCUB top-k/argsort and RPC-compatible HIP routing.
-- gfx1151 MMVQ/MMQ, Flash Attention, rocWMMA Lightning Indexer, DeepSeek-V4 and
-  Qwen3.8/SSM tuning.
-- DeepSeek rank-1 MoE-LoRA fallback and speculative decode/verify correctness fixes.
-- Qwen3.8 DFlash2 capability gating and HauhauCS FastMTP support, with validation.
-
-### Explicitly excluded
-
-- The former broad ROCmFPX port. It was based on an old llama.cpp snapshot and
-  overwrote current upstream behavior, including an F16-compatible `ggml_fill`
-  path required by DeepSeek-V4. It is withdrawn and must not be deployed.
-- ROCmFPX Q2/Q3/Q4/Q6/Turbo formats, historical MMQ instances, old HIP copy/convert
-  code, and all non-HIP backend changes.
-
-## Historical withdrawn V13 notes — do not use
+## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`fe8156f789011f6ea0baf6917ea09f88b89d9554`](https://github.com/ggml-org/llama.cpp/commit/fe8156f789011f6ea0baf6917ea09f88b89d9554).
+[`cd26896c19e6775b29a86908b5f049bbaec73305`](https://github.com/ggml-org/llama.cpp/commit/cd26896c19e6775b29a86908b5f049bbaec73305).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -71,7 +34,7 @@ replace the portable default upstream build.
   path, so these operations remain GPU-capable on ROCm.
 - Includes upstream RPC protocol 5.1 and its graph-use-count propagation, allowing
   supported backend fusions to run on the RPC worker. Controller and worker must use
-  the same V13 build; mixed RPC 5.0/5.1 binaries are unsupported.
+  the same fork build; mixed RPC 5.0/5.1 binaries are unsupported.
 - Adds a gfx1151-local Lightning Indexer top-k specialization for 512, 1024 and 2048
   candidates up to 8192 score entries, avoiding the expensive generic device-wide sort
   during DeepSeek-V4 long-context prefill.
@@ -98,6 +61,18 @@ replace the portable default upstream build.
 - Extends the gfx1151 MMVQ selection to the relevant Q4/Q5/Q6/Q8 and MXFP4 decode
   types, including the Q6_K VDR=2 decode kernel.
 - Keeps HIP integrated-GPU host-buffer handling safe.
+
+#### ROCmFPX Q8 GGUF support
+
+- Supports published `Q8_0_ROCMFPX` / `Q8_0_ROCMFPX_AGENT` GGUFs (on-disk type 103,
+  file types 111 and 115), including CPU and HIP UE4M3-scale dequantization and HIP
+  `GET_ROWS`.
+- Uses a dedicated gfx1151 MMQ tile loader for the 33-byte ROCmFPX-Q8 block layout.
+  It materializes the current Q8 shared-memory representation, then uses the current
+  Q8 WMMA/MMQ dot-product and RDNA3.5 configuration. Ordinary `Q8_0` remains on its
+  own unchanged path.
+- Treats ROCmFPX Q8 as experimental: validate model quality and throughput locally
+  before deploying it as a production default.
 
 #### DeepSeek-V4 and speculative decoding
 
@@ -240,7 +215,7 @@ using it in a production alias.
   `--spec-type draft-mtp` with `--spec-draft-n-max 1` and `2`. Draft K/V should start
   at F16 for correctness isolation; quantize it only after the same prompt and seed
   remain stable.
-- V13 contains a source-level MTP sequence/reset and checkpoint-state fix for the
+- This fork contains a source-level MTP sequence/reset and checkpoint-state fix for the
   inter-request degradation reported in upstream issue #26425. During the first ROCm
   soak test, `--ctx-checkpoints 0` remains a useful conservative comparison rather
   than a permanent requirement.
