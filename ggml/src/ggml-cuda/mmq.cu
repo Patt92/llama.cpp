@@ -28,6 +28,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q8_0:
             mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
             break;
+        case GGML_TYPE_Q8_0_ROCMFPX:
+            mul_mat_q_case<GGML_TYPE_Q8_0_ROCMFPX>(ctx, args, stream);
+            break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
             mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
@@ -306,6 +309,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
+#ifdef GGML_USE_HIP
+    // The dedicated ROCmFPX loader is tuned and configured only for RDNA3.5.
+    // Keep other HIP targets on the existing non-MMQ path rather than letting a
+    // missing architecture configuration reach the generic MMQ launcher.
+    if (type == GGML_TYPE_Q8_0_ROCMFPX && !GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        return false;
+    }
+#endif
+
     bool mmq_supported;
 
     switch (type) {
@@ -316,6 +328,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+#ifdef GGML_USE_HIP
+        case GGML_TYPE_Q8_0_ROCMFPX:
+#endif
 // -------------------------------------------------
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
