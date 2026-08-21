@@ -25,15 +25,18 @@ It retains the complete, tested V12 Strix-Halo/gfx1151 HIP stack and adds only t
 published `Q8_0_ROCMFPX` GGUF format required by existing ROCmFPX Q8 models.
 
 The ROCmFPX addition is deliberately narrow: the on-disk type 103 / file type 111,
-CPU and HIP UE4M3-scale dequantization, HIP `GET_ROWS`, and the existing V12 MMVQ
-decode path. Normal `Q8_0` code and tuning are untouched. No historical ROCmFPX
-backend, MMQ, Flash-Attention, DeepSeek, Draft/MTP, server, Vulkan, Metal, OpenCL,
-or NVIDIA-specific code is imported.
+CPU and HIP UE4M3-scale dequantization, HIP `GET_ROWS`, the existing V12 MMVQ decode
+path, and one current-ABI gfx1151 MMQ loader. That loader expands ROCmFPX's UE4M3
+scale into the established Q8 shared-memory format before the current Q8 WMMA/MMQ
+dot-product executes. Normal `Q8_0` code and tuning are untouched. No historical
+ROCmFPX backend, MMQ, Flash-Attention, DeepSeek, Draft/MTP, server, Vulkan, Metal,
+OpenCL, or NVIDIA-specific code is imported.
 
 `Q8_0_ROCMFPX` is experimental. It is intended to load published Qwen3.8 Q8 ROCmFPX
-GGUFs without changing ordinary-model behavior. It does not force MMQ; that old
-MMQ transplant caused the earlier `mmq.cuh:98` abort and is intentionally excluded.
-Benchmark the custom quantification separately before relying on a throughput claim.
+GGUFs without changing ordinary-model behavior. It does not force MMQ globally: only
+the custom type can select its dedicated loader on HIP/gfx1151. The old MMQ transplant
+caused the earlier `mmq.cuh:98` abort and remains excluded. Benchmark the custom
+quantification separately before relying on a throughput claim.
 
 ### Included V12 stack
 
