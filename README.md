@@ -17,10 +17,10 @@
 
 </div>
 
-## Patt92 ROCm / Strix Halo fork
+## Patt92 ROCm / Strix Halo fork - V15
 
 This branch is based on upstream llama.cpp commit
-[`cd26896c19e6775b29a86908b5f049bbaec73305`](https://github.com/ggml-org/llama.cpp/commit/cd26896c19e6775b29a86908b5f049bbaec73305).
+[`eb25b7263e1604b4382295563f5a924002d6f87c`](https://github.com/ggml-org/llama.cpp/commit/eb25b7263e1604b4382295563f5a924002d6f87c).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -100,6 +100,8 @@ replace the portable default upstream build.
   chain.
 - Fuses IMRoPE and set-rows for BF16 KV cache use, and aligns the attention-gate
   tensor-parallel split with attention-Q.
+- Builds the recurrent Qwen3.5-MoE attention result into the graph before the
+  Gated Delta Net state update, preserving the required execution order.
 - Adds the model-specific DFlash2 checkpoint format, local grouped dynamic depthwise
   convolution, candidate selector and stochastic maximal-coupling verification from
   upstream PR #27342. DFlash2 activates only for a DFlash2 checkpoint; it does not
