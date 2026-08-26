@@ -10,6 +10,7 @@ import gguf
 
 from .base import ModelBase
 from .glm import GlmMoeDsaModel
+from .qwen3vl import Glm4VVisionModel
 
 
 @ModelBase.register("Glm5NextForConditionalGeneration", "Glm5NextForCausalLM")
@@ -104,3 +105,28 @@ class Glm5NextModel(GlmMoeDsaModel):
                 return [(self.format_tensor_name(tensor, bid) + ext, data_torch)]
 
         return super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Glm5NextForConditionalGeneration")
+# [TAG_HF_EXAMPLE_MISSING]
+class Glm5NextVisionModel(Glm4VVisionModel):
+    """The vision tower is the GLM-OCR ViT under a `model.visual.` prefix.
+
+    Every tensor already maps through the GLM-4V entries. The one structural
+    difference is a clamp on the SwiGLU gate and up projections, applied in the
+    per-block MLP and again in the merger, so it gets its own projector type
+    rather than a flag on glm4v.
+    """
+
+    clip_projector_type = gguf.VisionProjectorType.GLM5NEXT
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_vision is not None
+
+        # Glm4VVisionModel bypasses Qwen3VLVisionModel entirely, which is also where
+        # the merge size is written, so no GLM4V-family mmproj carries this key and
+        # clip.cpp falls back to a hardcoded 2. Write it rather than rely on that
+        self.gguf_writer.add_vision_spatial_merge_size(int(self.hparams_vision["spatial_merge_size"]))
+
+        self.gguf_writer.add_vision_swiglu_limit(float(self.hparams_vision["swiglu_limit"]))
