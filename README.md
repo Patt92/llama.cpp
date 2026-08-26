@@ -17,10 +17,10 @@
 
 </div>
 
-## Patt92 ROCm / Strix Halo fork - V15
+## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`eb25b7263e1604b4382295563f5a924002d6f87c`](https://github.com/ggml-org/llama.cpp/commit/eb25b7263e1604b4382295563f5a924002d6f87c).
+[`11cd98842874cc1b87ac274bd2d5cceb38102bb2`](https://github.com/ggml-org/llama.cpp/commit/11cd98842874cc1b87ac274bd2d5cceb38102bb2).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -38,6 +38,11 @@ replace the portable default upstream build.
 - Adds a gfx1151-local Lightning Indexer top-k specialization for 512, 1024 and 2048
   candidates up to 8192 score entries, avoiding the expensive generic device-wide sort
   during DeepSeek-V4 long-context prefill.
+- Adds indexed sparse HIP Flash Attention for the DeepSeek-V4 CSA F16 layout. Large
+  prefills read only the raw attention window plus the 512 rows selected by the
+  Lightning Indexer instead of scanning the full compressed KV cache. The path is
+  enabled only when the dense cache is at least three times larger than the active
+  set; decode, small verification batches and short contexts retain the existing path.
 - Keeps the Lightning Indexer key cache in F16 when a quantized KV cache is selected,
   where required by the DeepSeek path.
 - Resolves fused operations per layer and device instead of disabling an entire graph
@@ -113,6 +118,28 @@ replace the portable default upstream build.
   `d2t` map. The draft LM head evaluates only its compact vocabulary and scatters the
   logits back into the full target vocabulary before verification. Shape, I32/I64 index type,
   vocabulary range and required output-head invariants are validated at load/build time.
+
+### DeepSeek-V4 long-context prefill
+
+The indexed sparse HIP Flash Attention path is automatic and has no new command-line
+flag. It requires the existing DeepSeek-V4 CSA graph, `--flash-attn on`, and F16 target
+K/V cache types. A representative server configuration includes:
+
+```sh
+--flash-attn on \
+--cache-type-k f16 \
+--cache-type-v f16 \
+--batch-size 2048 \
+--ubatch-size 512
+```
+
+The optimization starts only for prefill batches of at least 64 tokens and when the
+full compressed cache is at least three times larger than raw-window plus Top-K. This
+keeps short-context and token-generation behavior unchanged. It reduces the
+context-linear CSA Flash Attention work, but other model layers can still limit total
+prompt throughput; measure identical prompts and cache state before and after the
+build. Set `GGML_CUDA_DISABLE_DSV4_SPARSE_FA=1` in the `llama-server` environment to
+force the previous dense path for an A/B comparison without rebuilding.
 
 ### Recommended `llama-server` profiles for Qwen3.8-27B
 
@@ -244,8 +271,9 @@ using it in a production alias.
   into the Patt92 RPC patch; no older branch is required at build time.
 - [@Nathanw1014](https://github.com/Nathanw1014/llama.cpp) supplies the selected
   Strix Halo/RDNA3.5 HIP tuning, DeepSeek-V4, Flash-Attention, MMQ/MMVQ and
-  backend-neutral fused-op work, including the DFlash2 graph-capability guard.
-  Vulkan-only implementation code is excluded.
+  backend-neutral fused-op work, including the DFlash2 graph-capability guard. This
+  branch also ports the indexed sparse DeepSeek-V4 attention design from Nathan's Vulkan
+  research to a separate HIP tile implementation; Vulkan shader code is not copied.
 - [@antirez](https://github.com/antirez/ds4) is the algorithmic source for the
   gfx1151-local Lightning Indexer top-k adaptation. Only the compatible HIP
   specialization is used; ds4 runtime, model and storage code is not included.
