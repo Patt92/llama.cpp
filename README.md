@@ -26,6 +26,43 @@ It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Hal
 optimization branch. It retains normal upstream functionality, but is not intended to
 replace the portable default upstream build.
 
+### Applying the standalone patch
+
+Every published state of this branch also ships as a single standalone patch,
+`rocm-halo-strix.patch`, attached to the matching release. The patch applies to a clean
+checkout of the exact upstream commit named above and to no other commit: it is generated
+with full context from that base, so `git apply` refuses it anywhere else instead of
+producing a silently mismatched tree.
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git checkout 11cd98842874cc1b87ac274bd2d5cceb38102bb2
+git apply --check /path/to/rocm-halo-strix.patch
+git apply /path/to/rocm-halo-strix.patch
+```
+
+`git apply --check` performs a dry run and reports conflicts without touching the working
+tree; run it first. Use `git apply --stat` to list the affected files. The patch contains
+binary hunks, so `patch -p1` cannot be used. Nothing is committed by `git apply` — commit
+the result yourself if you want it in history.
+
+Build it exactly like upstream llama.cpp. A ROCm build for Strix Halo is:
+
+```sh
+HIPCXX=/opt/rocm/lib/llvm/bin/clang HIP_PATH=/opt/rocm ROCM_PATH=/opt/rocm \
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_HIP=ON \
+  -DGGML_HIP_ROCWMMA_FATTN=ON \
+  -DGGML_RPC=ON \
+  -DGPU_TARGETS=gfx1151
+cmake --build build --parallel "$(nproc)"
+```
+
+Adjust `GPU_TARGETS` for a different AMD GPU. The optimizations in this branch are gated on
+RDNA3.5/gfx1151 at runtime, so other targets fall back to ordinary upstream behavior.
+
 ### Included changes relative to upstream
 
 #### HIP, RPC and long-context routing
