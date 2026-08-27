@@ -85,7 +85,15 @@ replace the portable default upstream build.
   `llama_memory_hybrid` and this fork's DeepSeek-V4 caches are not modified, which is why
   this PR was chosen over the competing draft #27754 — the latter also rewrites the shared
   KV cache.
-- **Text-only.** GLM-5.3-Flash is natively multimodal; the vision path is not included.
+- Includes the vision tower, the 2026-08-26 image preprocessor and the bicubic resampler
+  from the competing draft #27754, ported onto this text graph. Only its `tools/mtmd`
+  changes and the two `gguf-py` writer helpers were taken; its text and KV-cache rewrite
+  was not. `test-mtmd-impl` passes 216 assertions including the glm5next budget and resize
+  cases.
+- Reads the k-pool size from either `attention.indexer.block_size` (#27752) or
+  `attention.indexer.kpool` (#27754), because the two converters disagree on the key name.
+  Without this, a GGUF from the other converter aborts at
+  `GLM5NEXT requires index_kpool`.
 - Treat it as experimental. Neither draft PR has been validated against the real 328 GB
   checkpoint by its author, and the 288-expert stacking, the FP8 `weight_scale_inv`
   dequantisation and the NextN block have only been exercised on a synthetic model.
