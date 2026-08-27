@@ -20,7 +20,7 @@
 ## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`fac889fb38fd0e267636bd95bf096555e45b2270`](https://github.com/ggml-org/llama.cpp/commit/fac889fb38fd0e267636bd95bf096555e45b2270).
+[`6fdd0ac8907fd973a42b876357823ad2124cd8ed`](https://github.com/ggml-org/llama.cpp/commit/6fdd0ac8907fd973a42b876357823ad2124cd8ed).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -355,7 +355,7 @@ producing a silently mismatched tree.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout fac889fb38fd0e267636bd95bf096555e45b2270
+git checkout 6fdd0ac8907fd973a42b876357823ad2124cd8ed
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
