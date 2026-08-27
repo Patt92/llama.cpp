@@ -2466,7 +2466,9 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                scoped_roctx_profile profile;
+                // RAII only: without LLAMA_BENCH_ROCTX this is an empty struct, so the
+                // variable is genuinely unused and would warn in the default build.
+                [[maybe_unused]] scoped_roctx_profile profile;
                 scoped_roctx_range range("llama-bench/prompt");
                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
