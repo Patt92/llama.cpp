@@ -101,9 +101,9 @@ replace the portable default upstream build.
   and the template then calls `.items()` on that string. The visible symptom is
   `Unable to generate parser for this template ... Callee is not a function: got Undefined
   (hint: 'items')` on the first request with tools. A corrected template that changes only
-  those four subscripts is attached to the release as
-  `glm-5.3-flash-chat-template.jinja`; pass it with `--chat-template-file`. No rebuild and
-  no re-quantisation are needed.
+  those four subscripts is published at a stable URL:
+  [`glm-5.3-flash-chat-template.jinja`](https://github.com/Patt92/llama.cpp/releases/download/model-assets/glm-5.3-flash-chat-template.jinja).
+  Pass it with `--chat-template-file`. No rebuild and no re-quantisation are needed.
 - Treat it as experimental. Neither draft PR has been validated against the real 328 GB
   checkpoint by its author, and the 288-expert stacking, the FP8 `weight_scale_inv`
   dequantisation and the NextN block have only been exercised on a synthetic model.
