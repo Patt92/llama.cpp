@@ -94,6 +94,16 @@ replace the portable default upstream build.
   `attention.indexer.kpool` (#27754), because the two converters disagree on the key name.
   Without this, a GGUF from the other converter aborts at
   `GLM5NEXT requires index_kpool`.
+- The chat template shipped inside the published GLM-5.3-Flash GGUFs does not render under
+  this project's Jinja engine. It indexes list elements as `m.content.0.type`, which Jinja2
+  accepts but which fails here with `Static member property must be an identifier`. That
+  breaks the object-arguments capability probe, so tool-call arguments stay a JSON string,
+  and the template then calls `.items()` on that string. The visible symptom is
+  `Unable to generate parser for this template ... Callee is not a function: got Undefined
+  (hint: 'items')` on the first request with tools. A corrected template that changes only
+  those four subscripts is attached to the release as
+  `glm-5.3-flash-chat-template.jinja`; pass it with `--chat-template-file`. No rebuild and
+  no re-quantisation are needed.
 - Treat it as experimental. Neither draft PR has been validated against the real 328 GB
   checkpoint by its author, and the 288-expert stacking, the FP8 `weight_scale_inv`
   dequantisation and the NextN block have only been exercised on a synthetic model.
