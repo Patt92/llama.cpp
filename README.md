@@ -20,7 +20,7 @@
 ## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`11cd98842874cc1b87ac274bd2d5cceb38102bb2`](https://github.com/ggml-org/llama.cpp/commit/11cd98842874cc1b87ac274bd2d5cceb38102bb2).
+[`d7a2074112d27649303fa107eb8c94db1ee435f3`](https://github.com/ggml-org/llama.cpp/commit/d7a2074112d27649303fa107eb8c94db1ee435f3).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -58,7 +58,15 @@ replace the portable default upstream build.
 
 #### Strix Halo compute tuning
 
-- Adds RDNA3.5/gfx1151 kernel and launch tuning for MMQ, MMVQ, Q8 MoE and expert MMQ.
+- Overrides four entries of upstream's own RDNA3.5 MMQ configuration table for wide Q8_0,
+  Q5_K and Q6_K tiles, and adds the expert-MMQ tile selection that picks the `MUL_MAT_ID`
+  J dimension from the average rows per expert (`GGML_CUDA_MMQ_ID_J` to force or disable
+  it). The overrides replace existing entries rather than removing them, so no shape loses
+  its MMQ configuration.
+- Adds RDNA3.5/gfx1151 launch tuning for MMVQ and Q8 MoE.
+- Adds optional ROCTX ranges to `llama-bench` (`-DLLAMA_BENCH_ROCTX=ON`, requires the ROCm
+  `rocprofiler-sdk-roctx` headers), with profiling scoped to the prompt runs, so
+  `rocprofv3` output can be attributed to prefill instead of the whole process.
 - Caches MMVQ Q8_1 activations and partitions MMQ waves across rows and columns.
 - Adds AMD WMMA Lightning Indexer support and tuned tiled Flash Attention, including a
   fix for NaNs in the compacted-tile mask path.
@@ -312,7 +320,7 @@ producing a silently mismatched tree.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 11cd98842874cc1b87ac274bd2d5cceb38102bb2
+git checkout d7a2074112d27649303fa107eb8c94db1ee435f3
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
