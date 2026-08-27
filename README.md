@@ -150,13 +150,10 @@ replace the portable default upstream build.
   tensor-parallel split with attention-Q.
 - Builds the recurrent Qwen3.5-MoE attention result into the graph before the
   Gated Delta Net state update, preserving the required execution order.
-- Adds the model-specific DFlash2 checkpoint format, local grouped dynamic depthwise
-  convolution, candidate selector and stochastic maximal-coupling verification from
-  upstream PR #27342. DFlash2 activates only for a DFlash2 checkpoint; it does not
-  silently replace MTP, DSpark or ordinary autoregressive decoding.
-- Capability-gates DFlash2 activation against the graph that is actually built. A
-  metadata-only selector no longer enters a zero-acceptance DFlash2 path, and an
-  unsupported DFlash2 selector on a DeepSeek-V4 backbone is rejected explicitly.
+- Capability-gates DFlash2 activation against the graph that is actually built: an
+  unsupported DFlash2 selector on a DeepSeek-V4 backbone is rejected at load, because
+  that backbone's graph does not build the selector lattice. DFlash2 itself is no longer
+  carried here — upstream merged PR #27342 and this branch uses that implementation.
 - Adds FastMTP compact-draft-vocabulary support for Qwen3.8 sidecars carrying an I64
   `d2t` map. The draft LM head evaluates only its compact vocabulary and scatters the
   logits back into the full target vocabulary before verification. Shape, I32/I64 index type,
@@ -298,9 +295,8 @@ using it in a production alias.
 - `--batch-size` and `--ubatch-size` primarily affect throughput and memory pressure;
   they are not correctness switches for committed speculative tokens. Change them
   only after the no-draft and single-drafter comparisons are clean.
-- DFlash2 support is an experimental preview from an open upstream PR. It is a
-  separate drafter and requires a DFlash2 checkpoint; it is not presented as a fix
-  for an existing MTP checkpoint.
+- DFlash2 is upstream functionality as of PR #27342. It is a separate drafter and
+  requires a DFlash2 checkpoint; it is not a fix for an existing MTP checkpoint.
 
 ### Sources and provenance
 
