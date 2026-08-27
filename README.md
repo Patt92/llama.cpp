@@ -20,7 +20,7 @@
 ## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`d7a2074112d27649303fa107eb8c94db1ee435f3`](https://github.com/ggml-org/llama.cpp/commit/d7a2074112d27649303fa107eb8c94db1ee435f3).
+[`fe235f434368dfbdf3091a6cea92c00a98d2cee4`](https://github.com/ggml-org/llama.cpp/commit/fe235f434368dfbdf3091a6cea92c00a98d2cee4).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -74,6 +74,23 @@ replace the portable default upstream build.
 - Extends the gfx1151 MMVQ selection to the relevant Q4/Q5/Q6/Q8 and MXFP4 decode
   types, including the Q6_K VDR=2 decode kernel.
 - Keeps HIP integrated-GPU host-buffer handling safe.
+
+#### GLM-5.3-Flash (`glm5next`) — experimental
+
+- Carries the still-open upstream draft PR #27752 (`eauchs`), which adds the `glm5next`
+  architecture: converter, text graph, KDA linear attention, MLA with a DSA indexer and
+  k-pool compression, gated-residual hyper-connections and the 288-expert MoE. Without it,
+  a GLM-5.3-Flash GGUF fails at load with `unknown model architecture: 'glm5next'`.
+- The DSA path uses its own `llama_memory_hybrid_idx` container. `llama_kv_cache`,
+  `llama_memory_hybrid` and this fork's DeepSeek-V4 caches are not modified, which is why
+  this PR was chosen over the competing draft #27754 — the latter also rewrites the shared
+  KV cache.
+- **Text-only.** GLM-5.3-Flash is natively multimodal; the vision path is not included.
+- Treat it as experimental. Neither draft PR has been validated against the real 328 GB
+  checkpoint by its author, and the 288-expert stacking, the FP8 `weight_scale_inv`
+  dequantisation and the NextN block have only been exercised on a synthetic model.
+  GGUFs produced by a different converter may use tensor names this loader does not expect;
+  that surfaces as a missing-tensor error at load, not as silent corruption.
 
 #### ROCmFPX Q8 GGUF support
 
@@ -320,7 +337,7 @@ producing a silently mismatched tree.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout d7a2074112d27649303fa107eb8c94db1ee435f3
+git checkout fe235f434368dfbdf3091a6cea92c00a98d2cee4
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
