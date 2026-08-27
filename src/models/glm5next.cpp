@@ -73,8 +73,15 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,  hparams.indexer_n_head,     false);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,  hparams.indexer_head_size,  false);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,       hparams.indexer_top_k,      false);
-    // index_kpool: tokens per compressed key, always_select_tail is implied (see build_dsa_top_k)
+    // index_kpool: tokens per compressed key, always_select_tail is implied (see build_dsa_top_k).
+    // Converters disagree on the key name for this value: upstream PR #27752 writes
+    // `attention.indexer.block_size`, the competing PR #27754 writes `attention.indexer.kpool`.
+    // The semantics and the `indexer_top_k % kpool == 0` constraint are identical, so accept
+    // either rather than aborting on a GGUF produced by the other converter.
     ml.get_key(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,  hparams.indexer_block_size, false);
+    if (hparams.indexer_block_size == 0) {
+        ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,   hparams.indexer_block_size, false);
+    }
 
     if (hparams.indexer_head_size > 0) {
         GGML_ASSERT(hparams.indexer_n_head > 0);

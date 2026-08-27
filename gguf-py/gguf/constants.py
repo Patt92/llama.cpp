@@ -222,6 +222,7 @@ class Keys:
             KEY_LENGTH = "{arch}.attention.indexer.key_length"
             TOP_K      = "{arch}.attention.indexer.top_k"
             BLOCK_SIZE   = "{arch}.attention.indexer.block_size"    # MSA
+            KPOOL        = "{arch}.attention.indexer.kpool"         # glm5next alias (PR #27754)
             LOCAL_BLOCKS = "{arch}.attention.indexer.local_blocks"  # MSA
             TYPES      = "{arch}.attention.indexer.types"
 
