@@ -126,8 +126,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     const struct ggml_tensor * selector_meta = ml->get_tensor_meta("selector_hidden.weight");
     if (selector_meta) {
-        // retained from nathan/dflash2-capgate 0b0f35d0e: graph_dsv4 has no
-        // build_post_sampling, so a DSV4 backbone must not attach selector tensors
+        // retained from nathan/dflash2-capgate 0b0f35d0e: the DSV4 backbone graph
+        // does not build the selector lattice, so it must not attach selector tensors
         if (hparams.dsv4_hc_mult > 0) {
             throw std::runtime_error("DFlash2 selector is not supported on the DSV4 backbone");
         }
