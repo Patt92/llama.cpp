@@ -1,10 +1,6 @@
 #pragma once
 
-#include "llama-batch.h"
-#include "llama-graph.h"
-#include "llama-kv-cache.h"
-#include "llama-memory.h"
-#include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
 
 #include <memory>
 #include <vector>
@@ -13,22 +9,10 @@
 // llama_memory_hybrid_idx
 //
 
-// utilizes three memories for architectures that are hybrid recurrent/attention AND run
-//   sparse attention driven by a lightning indexer (GLM-5.3-Flash):
-//     - llama_memory_recurrent : the linear-attention (KDA) layer states
-//     - llama_kv_cache         : the (MLA) K cache of the full-attention layers
-//     - llama_kv_cache         : the indexer cache of those same layers, one row per token
-//
-// [TAG_IDX_CACHE_SHARE_SLOTS] the indexer cache never runs find_slot: it is handed the
-//   attention cache's slot infos, so cell j always means the same token in both. Letting it
-//   pick its own slots would silently drift after a context rewrite (the two caches have
-//   independent ring-buffer heads), and the top-k indices would then address the wrong cells.
-//
-// the context also exposes the host-side k-pool metadata, built from the public
-//   llama_kv_cache::get_cells(), the same way llama_kv_cache_msa exposes its position maps.
-//   nothing arch-specific is added to llama_kv_cache itself.
+// llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
+// the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
-class llama_memory_hybrid_idx : public llama_memory_i {
+class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
         const llama_model & model,
@@ -44,19 +28,16 @@ public:
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
-                            /* indexer */
-                 uint32_t   idx_row_size,   // floats cached per token (the graph packs its own layout)
-                 uint32_t   idx_kpool,      // tokens per k-pool
-                     bool   idx_select_tail,// the incomplete trailing pool is always visible
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
-    const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr,
-    const layer_filter_cb & filter_idx  = nullptr);
+    const layer_filter_cb & filter_attn,
+    const layer_filter_cb & filter_recr,
+                            /* the indexer cache exists only if this is given */
+    const layer_filter_cb & filter_idx);
 
     ~llama_memory_hybrid_idx() = default;
 
@@ -73,8 +54,6 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
-    bool get_can_shift() const override;
-
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -82,9 +61,6 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
-
-    llama_pos seq_pos_min(llama_seq_id seq_id) const override;
-    llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -97,103 +73,84 @@ public:
     // llama_memory_hybrid_idx specific API
     //
 
-    llama_kv_cache         * get_mem_attn() const { return mem_attn.get(); }
-    llama_memory_recurrent * get_mem_recr() const { return mem_recr.get(); }
-
-    // null when the model has no indexer - the graph then falls back to dense attention
-    llama_kv_cache         * get_mem_idx () const { return mem_idx.get();  }
-
-    uint32_t get_kpool()       const { return kpool;       }
-    bool     get_select_tail() const { return select_tail; }
+    llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
 private:
-    const llama_hparams & hparams;
+    // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
+    // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
+    void state_drop(llama_seq_id seq_id);
 
-    // llama_kv_cache keeps only a reference to its hparams, so the tuned copy lives here
+    // the indexer cache holds one key head per layer, so it needs its own hparams:
+    // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
-    const uint32_t kpool       = 1;
-    const bool     select_tail = false;
-
-    const std::unique_ptr<llama_kv_cache>         mem_attn;
-    const std::unique_ptr<llama_memory_recurrent> mem_recr;
-    const std::unique_ptr<llama_kv_cache>         mem_idx;
+    const std::unique_ptr<llama_kv_cache> mem_idx;
 };
 
-class llama_memory_hybrid_idx_context : public llama_memory_context_i {
+class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    // init failure
+    // used for errors
     explicit llama_memory_hybrid_idx_context(llama_memory_status status);
 
-    // init full
+    // used to create a full-cache context
     explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
 
-    // init update
-    explicit llama_memory_hybrid_idx_context(
-        llama_memory_hybrid_idx * mem,
-                  llama_context * lctx,
-                           bool   optimize);
-
-    // init success - sinfos_attn drives BOTH the attention and the indexer cache
+    // used to create an update context
     llama_memory_hybrid_idx_context(
-          llama_memory_hybrid_idx * mem,
-                  slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches);
+            llama_memory_hybrid_idx * mem,
+                      llama_context * lctx,
+                               bool   optimize);
+
+    // used to create a batch processing context from a batch
+    llama_memory_hybrid_idx_context(
+            llama_memory_hybrid_idx * mem,
+                    slot_info_vec_t   sinfos_attn,
+                    slot_info_vec_t   sinfos_idx,
+          std::vector<llama_ubatch>   ubatches);
 
     ~llama_memory_hybrid_idx_context() = default;
 
+    //
+    // llama_memory_context_i
+    //
+
     bool next()  override;
     bool apply() override;
-
-    llama_memory_status  get_status() const override;
-    const llama_ubatch & get_ubatch() const override;
 
     //
     // llama_memory_hybrid_idx_context specific API
     //
 
-    const llama_kv_cache_context         * get_attn() const;
-    const llama_memory_recurrent_context * get_recr() const;
+    // nullptr with no indexer, and for the update context, which builds no sparse graph
+    const llama_kv_cache_context * get_idx() const;
 
-    // null when the model has no indexer
-    const llama_kv_cache_context         * get_idx () const;
+    // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
+    uint32_t get_n_stream() const;
 
-    uint32_t get_kpool() const { return kpool; }
-
-    // host-side k-pool metadata for one ubatch, built from the attention cache cells:
-    //   cell_pool  I32 [n_kv, ns]            the pool a cell belongs to (0 when it has none)
-    //   pool_cells I32 [kpool*n_pools, ns]   the cells making up each complete pool
-    //   bias       F32 [n_kv, n_tps, ns]     -INF invisible, +1e9 always-visible tail, 0 otherwise
-    // a pool is a run of `kpool` consecutive token *positions*, so nothing here assumes the
-    // cache is laid out contiguously. Cells of an incomplete pool cannot be pooled and are
-    // reachable only through the tail bias. Pooling by position, not by cache order, differs
-    // from the reference after a seq_rm or a context shift.
-    //
-    // limitation: pools are built once per stream, so a unified cache holding several
-    // sequences pools their cells together and degrades the selection. The attention mask
-    // itself stays per token, so no sequence ever sees another one's tokens.
-    void set_input_kpool(
-            ggml_tensor * cell_pool,
-            ggml_tensor * pool_cells,
-            ggml_tensor * bias,
-            const llama_ubatch * ubatch) const;
+    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
+    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
+    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+    // the caller then adds the attention mask, the only part of the bias that varies within a block
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias) const;
 
 private:
-    llama_memory_hybrid_idx * mem = nullptr;
+    const llama_memory_hybrid_idx * mem = nullptr;
 
-    const uint32_t kpool       = 1;
-    const bool     select_tail = false;
+    // streams per ubatch, read from the slot infos before ctx_idx takes them
+    // declared first, so it is initialised while sinfos_idx is still intact
+    const std::vector<uint32_t> ns_ubatch;
 
-    // the index of the next ubatch to process
-    size_t i_next = 0;
+    // null unless the model has an indexer and this is a batch or full context
+    const llama_memory_context_ptr ctx_idx;
 
-    std::vector<llama_ubatch> ubatches;
-
-    const llama_memory_context_ptr ctx_attn;
-    const llama_memory_context_ptr ctx_recr;
-    const llama_memory_context_ptr ctx_idx; // null when the model has no indexer
-
-    const llama_memory_status status;
+    // mirrors the base class's ubatch cursor, which is private there
+    size_t i_cur = 0;
 };

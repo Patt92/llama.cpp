@@ -13,7 +13,7 @@
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
-#include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-kpool.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -1195,7 +1195,7 @@ void llm_graph_input_mem_hybrid_idx::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_mem_hybrid_idx::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+    const auto * mctx = static_cast<const llama_memory_hybrid_kpool_context *>(params.mctx);
 
     this->mctx = mctx;
 
@@ -3648,7 +3648,7 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
 }
 
 llm_graph_input_mem_hybrid_idx * llm_graph_context::build_inp_mem_hybrid_idx() const {
-    const auto * mctx_cur = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_kpool_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl    (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());

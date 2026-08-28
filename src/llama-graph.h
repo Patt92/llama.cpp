@@ -30,7 +30,7 @@ class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
-class llama_memory_hybrid_idx_context;
+class llama_memory_hybrid_kpool_context;
 class llama_memory_hybrid_iswa_context;
 
 // certain models (typically multi-modal) can produce different types of graphs
@@ -725,7 +725,7 @@ public:
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_k> inp_attn,
             std::unique_ptr<llm_graph_input_rs>     inp_rs,
-            const llama_memory_hybrid_idx_context * mctx) :
+            const llama_memory_hybrid_kpool_context * mctx) :
         inp_attn(std::move(inp_attn)),
         inp_rs(std::move(inp_rs)),
         cparams(cparams),
@@ -744,7 +744,7 @@ public:
 
     const llama_cparams cparams;
 
-    const llama_memory_hybrid_idx_context * mctx;
+    const llama_memory_hybrid_kpool_context * mctx;
 };
 
 class llm_graph_input_mem_hybrid_iswa : public llm_graph_input_i {

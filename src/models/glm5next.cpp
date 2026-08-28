@@ -1,6 +1,6 @@
 #include "models.h"
 
-#include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-kpool.h"
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
@@ -14,7 +14,7 @@
 //   - mHC is the deepseek4 formulation, except the final collapse is a plain mean
 //
 // The full layers pick the cells they attend to with the DSA k-pool indexer, held in
-// llama_memory_hybrid_idx next to the recurrent states and the MLA cache. A GGUF without
+// llama_memory_hybrid_kpool next to the recurrent states and the MLA cache. A GGUF without
 // indexer weights still builds the dense graph.
 //
 // Not wired up yet:
@@ -612,7 +612,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
 class llm_graph_input_kpool : public llm_graph_input_i {
 public:
-    llm_graph_input_kpool(const llama_memory_hybrid_idx_context * mctx) : mctx(mctx) {}
+    llm_graph_input_kpool(const llama_memory_hybrid_kpool_context * mctx) : mctx(mctx) {}
     virtual ~llm_graph_input_kpool() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -627,7 +627,7 @@ public:
     }
 
     bool can_reuse(const llm_graph_params & params) override {
-        const auto * mctx_cur = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        const auto * mctx_cur = static_cast<const llama_memory_hybrid_kpool_context *>(params.mctx);
 
         mctx = mctx_cur;
 
@@ -646,7 +646,7 @@ public:
     ggml_tensor * pool_cells = nullptr; // I32 [kpool*n_pools, n_stream]
     ggml_tensor * bias       = nullptr; // F32 [n_kv, n_tokens/n_stream, n_stream]
 
-    const llama_memory_hybrid_idx_context * mctx;
+    const llama_memory_hybrid_kpool_context * mctx;
 };
 
 llm_graph_input_kpool * llama_model_glm5next::graph::build_inp_kpool(llm_graph_input_mem_hybrid_idx * inp_hyb) {
