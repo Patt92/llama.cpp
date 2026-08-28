@@ -175,7 +175,10 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader &) {
     const int trunk_flags = mtp_only   ? TENSOR_NOT_REQUIRED : 0;
     int       mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
     if (!ml->load_mtp) {
-        mtp_flags |= TENSOR_SKIP;
+        // a skipped tensor must not also be required: without this a GGUF whose NextN
+        // block omits any tensor fails to load at all, even though the block is unused.
+        // Same pairing as create_tensor_qkv's `skip` constant.
+        mtp_flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
     }
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
