@@ -1345,6 +1345,11 @@ struct llama_model_glm5next : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // tag ctor: initialise the context and helpers without building the trunk,
+        // so graph_mtp can reuse build_mla_layer/build_ffn_layer on the NextN block
+        struct no_trunk_t {};
+        graph(const llama_model & model, const llm_graph_params & params, no_trunk_t);
+
         const llama_model & model;
 
         // manifold-constrained hyper-connections (mHC), same formulation as deepseek4
@@ -1380,6 +1385,12 @@ struct llama_model_glm5next : public llama_model_base {
                 llm_graph_input_attn_k * inp_attn, llm_graph_input_kpool * inp_kpool,
                 float kq_scale, int il);
         ggml_tensor * build_ffn_layer(ggml_tensor * cur, const llama_layer & layer, int il);
+    };
+
+    // LLM_GRAPH_TYPE_DECODER_MTP draft head: the NextN block is a dense DSA decoder
+    // layer with plain residuals (no mHC mixer) and its own shared LM head
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

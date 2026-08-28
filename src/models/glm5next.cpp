@@ -163,8 +163,20 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader &) {
     const int64_t d_conv   = hparams.ssm_d_conv;
     const int64_t d_inner  = head_dim * n_head;
 
-    // the NextN/MTP block is loaded but ignored - there is no MTP graph yet
-    const int mtp_flags = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+    // the NextN/MTP block backs the DECODER_MTP draft head. Follow the glm-dsa
+    // pattern: trunk and NextN may live in separate GGUFs in either direction, and
+    // the block is only materialised when the loader was asked for it.
+    const bool mtp_only = (hparams.n_layer_nextn > 0) &&
+        (ml->get_weight("blk.0.attn_norm.weight") == nullptr);
+    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
+    const bool trunk_only = (hparams.n_layer_nextn > 0) &&
+        (ml->get_weight(mtp_probe.c_str()) == nullptr);
+
+    const int trunk_flags = mtp_only   ? TENSOR_NOT_REQUIRED : 0;
+    int       mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
+    if (!ml->load_mtp) {
+        mtp_flags |= TENSOR_SKIP;
+    }
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -179,7 +191,7 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader &) {
 
         const bool is_mtp  = i >= n_layer;
         const bool is_recr = !is_mtp && hparams.is_recr(i);
-        const int  flags   = is_mtp ? mtp_flags : 0;
+        const int  flags   = is_mtp ? mtp_flags : trunk_flags;
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
@@ -279,6 +291,9 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm5next::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -961,5 +976,129 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
+    ggml_build_forward_expand(gf, cur);
+}
+
+// no-trunk tag ctor: prepares the graph context and its helpers without emitting the
+// trunk. graph_mtp uses it so it can call build_mla_layer/build_ffn_layer directly.
+llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_params & params,
+        no_trunk_t) :
+    llm_build_delta_net_base(params), model(model) {
+}
+
+// LLM_GRAPH_TYPE_DECODER_MTP draft head for GLM-5.3-Flash (glm5next).
+//
+// Mirrors the deepseek-family NextN layout, as glm-dsa does for GLM-5.2:
+//   enorm(embed) + hnorm(prev_hidden) -> concat(e, h) -> eh_proj ->
+//   one dense DSA decoder block (MLA attention + MoE FFN, exactly the trunk helpers) ->
+//   shared_head_norm (fallback output_norm) -> shared LM head.
+//
+// Two things differ from a trunk layer and are deliberate:
+//   - no mHC mixer. The NextN block keeps plain residuals, and the loader does not
+//     create hc_* tensors for it, so build_hc_pre/build_hc_post must not run here.
+//   - no DSA indexer. build_mla_layer takes inp_kpool = nullptr, which makes it skip
+//     build_dsa_top_k and run dense MLA, the same choice glm-dsa's MTP head makes.
+llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    graph(model, params, no_trunk_t{}) {
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "glm5next MTP requires n_layer_nextn > 0");
+    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
+                cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
+                "nextn_layer_offset out of range [0, n_layer_nextn)");
+
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "glm5next MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "glm5next MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "glm5next MTP block missing nextn.hnorm");
+    GGML_ASSERT(layer.attn_norm     && "glm5next MTP block missing attn_norm");
+    GGML_ASSERT(layer.ffn_norm      && "glm5next MTP block missing ffn_norm");
+
+    // nope-only, so no YaRN mscale correction - identical to the trunk graph
+    const float kq_scale = 1.0f / sqrtf(float(hparams.n_embd_head_k_mla()));
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    ggml_tensor * tok_embd;
+    if (ubatch.token) {
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    } else {
+        tok_embd = inp->embd;
+    }
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * h_embd = inp->h;
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // MLA with absorption uses a K-only cache (V is a view of K)
+    auto * inp_attn = build_attn_inp_k();
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    cb(cur, "mtp_eh_proj", il);
+
+    // dense DSA decoder block, plain residuals
+    ggml_tensor * inpSA = cur;
+
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    cur = build_mla_layer(cur, layer, inp_attn, /*inp_kpool =*/ nullptr, kq_scale, il);
+    cb(cur, "mtp_attn_out", il);
+
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cb(ffn_inp, "mtp_ffn_inp", il);
+
+    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    cur = build_ffn_layer(cur, layer, il);
+    cb(cur, "mtp_ffn_out", il);
+
+    cur = ggml_add(ctx0, cur, ffn_inp);
+    cb(cur, "mtp_post_ffn", il);
+
+    // the post-norm hidden state seeds the next MTP step
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
+            ? layer.nextn.shared_head_norm
+            : model.output_norm;
+    GGML_ASSERT(head_norm_w && "glm5next MTP: missing nextn.shared_head_norm and output_norm");
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    cb(cur, "mtp_shared_head_norm", -1);
+
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    GGML_ASSERT(head_w && "glm5next MTP: missing LM head (nextn.shared_head_head or model.output)");
+    cur = build_lora_mm(head_w, cur, head_s);
+    cb(cur, "result_output", -1);
+
+    res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
 }
