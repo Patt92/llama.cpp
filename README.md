@@ -108,6 +108,12 @@ replace the portable default upstream build.
   so this is compile-verified only; measure the acceptance rate before relying on it.
   Ordinary loading is unchanged: the NextN tensors keep `TENSOR_SKIP` unless MTP is asked
   for, so a run without `--spec-type draft-mtp` behaves exactly as before.
+- The converter already emits the NextN block: `Glm5NextModel` inherits `block_count`,
+  `filter_tensors` and `nextn_predict_layers` from `GlmMoeDsaModel`, so a GGUF converted
+  with this tree carries the MTP head. Published GLM-5.3-Flash GGUFs generally do not —
+  if `n_layer_nextn` is 0 in the startup log, that file has no NextN block and
+  `--spec-type draft-mtp` will refuse the context with a clear error rather than
+  misbehaving.
 - The chat template shipped inside the published GLM-5.3-Flash GGUFs does not render under
   this project's Jinja engine. It indexes list elements as `m.content.0.type`, which Jinja2
   accepts but which fails here with `Static member property must be an identifier`. That
