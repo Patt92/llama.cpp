@@ -964,8 +964,12 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cb(inpL, "l_out", il);
     }
 
+    // when unmasked nextn embeddings are requested, t_h_nextn must keep all rows, so
+    // the narrowing is deferred until after the final norm (same as glm-dsa)
+    const bool defer_out_ids = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+
     // narrow to the output rows before collapsing the streams
-    if (inp_out_ids) {
+    if (inp_out_ids && !defer_out_ids) {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
@@ -975,6 +979,16 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "hc_head", -1);
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+
+    // post-norm hidden state feeds the NextN/MTP draft head. Without this the draft
+    // head reads whatever the host buffer happened to hold and rejects every token.
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (inp_out_ids && defer_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
