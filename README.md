@@ -20,7 +20,7 @@
 ## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`6fdd0ac8907fd973a42b876357823ad2124cd8ed`](https://github.com/ggml-org/llama.cpp/commit/6fdd0ac8907fd973a42b876357823ad2124cd8ed).
+[`ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc`](https://github.com/ggml-org/llama.cpp/commit/ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -81,7 +81,11 @@ replace the portable default upstream build.
   architecture: converter, text graph, KDA linear attention, MLA with a DSA indexer and
   k-pool compression, gated-residual hyper-connections and the 288-expert MoE. Without it,
   a GLM-5.3-Flash GGUF fails at load with `unknown model architecture: 'glm5next'`.
-- The DSA path uses its own `llama_memory_hybrid_idx` container. `llama_kv_cache`,
+- The DSA path uses its own `llama_memory_hybrid_kpool` container, renamed from
+  `llama_memory_hybrid_idx` when upstream introduced a different class of that name for
+  Qwen3.8-Flash-Next (`qwen4exp`, PR #27742). The two are unrelated: upstream's derives from
+  `llama_memory_hybrid` and has no k-pool; this one is standalone and carries the k-pool
+  metadata GLM-5.3 needs. Both coexist. `llama_kv_cache`,
   `llama_memory_hybrid` and this fork's DeepSeek-V4 caches are not modified, which is why
   this PR was chosen over the competing draft #27754 — the latter also rewrites the shared
   KV cache.
@@ -94,6 +98,16 @@ replace the portable default upstream build.
   `attention.indexer.kpool` (#27754), because the two converters disagree on the key name.
   Without this, a GGUF from the other converter aborts at
   `GLM5NEXT requires index_kpool`.
+- Adds the NextN/MTP draft head, which neither upstream draft implements. It follows the
+  GLM-5.2 head in `glm-dsa.cpp`: `enorm(embed) + hnorm(prev_hidden) -> concat -> eh_proj ->
+  one dense DSA decoder block -> shared_head_norm -> shared LM head`. It reuses the trunk's
+  own attention and FFN builders rather than duplicating them, runs without the mHC mixer
+  (the NextN block has no `hc_*` tensors) and without the DSA indexer, and an MTP context
+  allocates a KV cache holding only the NextN layers. Enable with `--spec-type draft-mtp`.
+  **Never executed.** There is no MTP harness in `test-llama-archs` for any architecture,
+  so this is compile-verified only; measure the acceptance rate before relying on it.
+  Ordinary loading is unchanged: the NextN tensors keep `TENSOR_SKIP` unless MTP is asked
+  for, so a run without `--spec-type draft-mtp` behaves exactly as before.
 - The chat template shipped inside the published GLM-5.3-Flash GGUFs does not render under
   this project's Jinja engine. It indexes list elements as `m.content.0.type`, which Jinja2
   accepts but which fails here with `Static member property must be an identifier`. That
@@ -351,7 +365,7 @@ producing a silently mismatched tree.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 6fdd0ac8907fd973a42b876357823ad2124cd8ed
+git checkout ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
