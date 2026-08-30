@@ -11,9 +11,14 @@
 #endif // GGML_USE_NCCL
 
 #if HIP_VERSION >= 60100000
+// rocPRIM 4.2.0 crashes in the segmented sort used by the CUB top-k/argsort path;
+// fixed in 4.4.0. Fall back to the hand-written kernels on older rocPRIM.
+#include <rocprim/rocprim_version.hpp>
+#if defined(ROCPRIM_VERSION) && (ROCPRIM_VERSION >= 400400)
 #define GGML_CUDA_USE_CUB
 #include <hipcub/hipcub.hpp>
 namespace cub = hipcub;
+#endif // ROCPRIM_VERSION >= 400400
 #endif // HIP_VERSION >= 60100000
 
 
