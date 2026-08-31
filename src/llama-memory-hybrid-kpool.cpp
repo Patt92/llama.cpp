@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstring>
+#include <map>
 
 //
 // llama_memory_hybrid_kpool
@@ -109,7 +111,135 @@ llama_memory_hybrid_kpool::llama_memory_hybrid_kpool(
             filter_idx,
             nullptr,
             nullptr);
-    }()) {}
+    }()) {
+    if (!mem_idx) {
+        return;
+    }
+
+    // [TAG_KPOOL_KEY_CACHE] the indexer packs key | gate into one row, so a key is half of it
+    GGML_ASSERT(idx_row_size % 2 == 0);
+
+    idx_head   = idx_row_size/2;
+    n_pool_max = kv_size/kpool;
+    n_stream   = mem_attn->get_n_stream();
+
+    GGML_ASSERT(n_pool_max > 0);
+
+    pool_valid.assign((size_t) n_pool_max*n_stream, 0);
+
+    const int32_t n_layer = (int32_t) hparams.n_layer();
+
+    pool_k_l.resize(n_layer, nullptr);
+
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+
+            ctx_map.emplace(buft, ctx);
+
+            return ctx;
+        }
+
+        return it->second.get();
+    };
+
+    for (int32_t il = 0; il < n_layer; ++il) {
+        if (!filter_idx(il)) {
+            continue;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (offload) {
+            buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+        }
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            throw std::runtime_error("failed to create ggml context for the k-pool key cache");
+        }
+
+        // + 1 row per stream: the scratch slot that absorbs padded refresh writes
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, idx_head, (int64_t)(n_pool_max + 1)*n_stream);
+        ggml_format_name(t, "cache_kpool_l%d", il);
+        pool_k_l[il] = t;
+    }
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for the k-pool key cache");
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        LLAMA_LOG_INFO("%s: %10s k-pool key cache size = %8.2f MiB (%u pools, head %u)\n", __func__,
+                ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                n_pool_max, idx_head);
+        ctxs_bufs_pool.emplace_back(std::move(ctx), buf);
+    }
+}
+
+void llama_memory_hybrid_kpool::invalidate_pool_keys() {
+    std::fill(pool_valid.begin(), pool_valid.end(), 0);
+}
+
+uint32_t llama_memory_hybrid_kpool::n_pool_pending() const {
+    if (!mem_idx || n_pool_max == 0) {
+        return 0;
+    }
+
+    const uint32_t r = kpool;
+
+    uint32_t n_max = 0;
+
+    // a pool needs its key when it is complete but not yet cached. Completeness is decided the
+    // same way set_input_kpool decides it, so the two always agree on the pool set.
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        // a unified cache keeps every sequence in one stream; otherwise stream s is sequence s
+        const llama_seq_id seq_of_stream = n_stream == 1 ? 0 : (llama_seq_id) s;
+
+        const auto & cells = mem_attn->get_cells(seq_of_stream);
+
+        std::vector<uint32_t> filled(n_pool_max, 0);
+
+        for (uint32_t j = 0; j < cells.size(); ++j) {
+            if (cells.is_empty(j)) {
+                continue;
+            }
+
+            const uint32_t b = (uint32_t) (cells.pos_get(j)/(llama_pos) r);
+            if (b < n_pool_max) {
+                filled[b]++;
+            }
+        }
+
+        uint32_t n = 0;
+        for (uint32_t b = 0; b < n_pool_max; ++b) {
+            if (filled[b] >= r && !pool_valid[s*n_pool_max + b]) {
+                n++;
+            }
+        }
+
+        n_max = std::max(n_max, n);
+    }
+
+    return n_max;
+}
 
 llama_memory_context_ptr llama_memory_hybrid_kpool::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -182,6 +312,8 @@ bool llama_memory_hybrid_kpool::get_can_shift() const {
 }
 
 void llama_memory_hybrid_kpool::clear(bool data) {
+    invalidate_pool_keys();
+
     mem_attn->clear(data);
     mem_recr->clear(data);
     if (mem_idx) {
@@ -197,6 +329,8 @@ bool llama_memory_hybrid_kpool::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_
     }
 
     // both attention caches always get the same call, so their cells stay in lockstep
+    invalidate_pool_keys();
+
     const bool res = mem_attn->seq_rm(seq_id, p0, p1);
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
@@ -205,6 +339,8 @@ bool llama_memory_hybrid_kpool::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_
 }
 
 void llama_memory_hybrid_kpool::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    invalidate_pool_keys();
+
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     if (mem_idx) {
@@ -213,6 +349,8 @@ void llama_memory_hybrid_kpool::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq
 }
 
 void llama_memory_hybrid_kpool::seq_keep(llama_seq_id seq_id) {
+    invalidate_pool_keys();
+
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
     if (mem_idx) {
@@ -221,6 +359,8 @@ void llama_memory_hybrid_kpool::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_kpool::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    invalidate_pool_keys();
+
     mem_attn->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
     if (mem_idx) {
@@ -229,6 +369,8 @@ void llama_memory_hybrid_kpool::seq_add(llama_seq_id seq_id, llama_pos p0, llama
 }
 
 void llama_memory_hybrid_kpool::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    invalidate_pool_keys();
+
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
     if (mem_idx) {
@@ -270,6 +412,8 @@ void llama_memory_hybrid_kpool::state_write(llama_io_write_i & io, llama_seq_id 
 }
 
 void llama_memory_hybrid_kpool::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    invalidate_pool_keys();
+
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
         if (mem_idx) {
@@ -381,19 +525,31 @@ const llama_kv_cache_context * llama_memory_hybrid_kpool_context::get_idx() cons
 
 void llama_memory_hybrid_kpool_context::set_input_kpool(
         ggml_tensor * cell_pool,
-        ggml_tensor * pool_cells,
         ggml_tensor * bias,
+        ggml_tensor * rec_pool_idx,
+        ggml_tensor * rec_pool_cells,
         const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
-    GGML_ASSERT(cell_pool->type == GGML_TYPE_I32 && pool_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(cell_pool->type == GGML_TYPE_I32);
     GGML_ASSERT(bias->type == GGML_TYPE_F32);
+
+    // [TAG_KPOOL_KEY_CACHE] both refresh inputs exist together or not at all
+    GGML_ASSERT((rec_pool_idx == nullptr) == (rec_pool_cells == nullptr));
+
+    const int64_t n_rec = rec_pool_idx ? rec_pool_idx->ne[0] : 0;
+
+    if (n_rec > 0) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(rec_pool_idx->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(rec_pool_cells->buffer));
+        GGML_ASSERT(rec_pool_idx->type == GGML_TYPE_I32 && rec_pool_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(rec_pool_cells->ne[0] == n_rec*(int64_t) kpool);
+    }
 
     const int64_t r      = kpool;
     const int64_t n_kv   = cell_pool->ne[0];
     const int64_t n_ns   = cell_pool->ne[1];   // streams in this ubatch
-    const int64_t n_pool = pool_cells->ne[0]/r;
+    const int64_t n_pool = n_kv/r;
 
     GGML_ASSERT(r > 0 && n_pool > 0);
     GGML_ASSERT(ubatch->n_tokens % n_ns == 0);
@@ -401,8 +557,11 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
     const int64_t n_tps = ubatch->n_tokens/n_ns;
 
     int32_t * dst_cell_pool  = (int32_t *) cell_pool->data;
-    int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
     float   * dst_bias       = (float   *) bias->data;
+
+    // [TAG_KPOOL_KEY_CACHE] the pool -> cells map is only needed to build rec_pool_cells now,
+    // so it is host scratch rather than a graph input the allocator would have to back
+    std::vector<int32_t> pool_cells_buf((size_t) r*n_pool);
 
     // one pass per stream: cell j is a different token in each
     std::vector<int32_t> pool_of(n_kv);
@@ -413,8 +572,8 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
 
         const auto & cells = mem->get_mem_attn()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_pool  = dst_cell_pool  + s*n_kv;
-        int32_t * cur_pool_cells = dst_pool_cells + s*(r*n_pool);
+        int32_t * cur_cell_pool  = dst_cell_pool + s*n_kv;
+        int32_t * cur_pool_cells = pool_cells_buf.data();
 
         // pool b covers token positions [b*r, (b+1)*r). -1 = the cell has no usable pool.
         std::fill(pool_of.begin(), pool_of.end(), -1);
@@ -443,6 +602,34 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
         for (int64_t b = 0; b < n_pool; ++b) {
             if (filled[b] < (int32_t) r) {
                 std::fill(cur_pool_cells + b*r, cur_pool_cells + (b + 1)*r, 0);
+            }
+        }
+
+        // [TAG_KPOOL_KEY_CACHE] name the complete pools whose key is not cached yet - the graph
+        // refreshes exactly these, and every other pool is read straight out of the cache.
+        // Marking them valid here is safe: the graph that consumes these inputs is the one that
+        // writes the keys, and any cache edit in between clears the whole map anyway.
+        if (n_rec > 0) {
+            int32_t * cur_rec_idx   = (int32_t *) rec_pool_idx->data   + s*n_rec;
+            int32_t * cur_rec_cells = (int32_t *) rec_pool_cells->data + s*n_rec*r;
+
+            int64_t n = 0;
+            for (int64_t b = 0; b < n_pool && n < n_rec; ++b) {
+                if (filled[b] < (int32_t) r || mem->is_pool_valid((uint32_t) s, (uint32_t) b)) {
+                    continue;
+                }
+
+                cur_rec_idx[n] = (int32_t) b;
+                std::copy(cur_pool_cells + b*r, cur_pool_cells + (b + 1)*r, cur_rec_cells + n*r);
+
+                mem->mark_pool_valid((uint32_t) s, (uint32_t) b);
+                n++;
+            }
+
+            // park the unused refresh slots on the scratch row, which is never read back
+            for (int64_t i = n; i < n_rec; ++i) {
+                cur_rec_idx[i] = (int32_t) mem->get_n_pool_max();
+                std::fill(cur_rec_cells + i*r, cur_rec_cells + (i + 1)*r, 0);
             }
         }
 

@@ -638,12 +638,17 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(cell_pool, pool_cells, bias, ubatch);
+        mctx->set_input_kpool(cell_pool, bias, rec_pool_idx, rec_pool_cells, ubatch);
 
-        GGML_ASSERT(ggml_backend_buffer_is_host(ape_slots->buffer));
-        int32_t * data = (int32_t *) ape_slots->data;
-        for (int64_t i = 0; i < ape_slots->ne[0]; ++i) {
-            data[i] = (int32_t) i;
+        // [TAG_KPOOL_KEY_CACHE] ape_slots is read only by the refresh branch. Filling an input
+        // the graph never reads would trip GGML_ASSERT(buffer): the allocator leaves unread
+        // inputs unbacked.
+        if (ape_slots) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(ape_slots->buffer));
+            int32_t * data = (int32_t *) ape_slots->data;
+            for (int64_t i = 0; i < ape_slots->ne[0]; ++i) {
+                data[i] = (int32_t) i;
+            }
         }
     }
 
@@ -658,14 +663,21 @@ public:
         res &= cell_pool->ne[0] == (int64_t) mctx_cur->get_idx()->get_n_kv();
         res &= cell_pool->ne[1]*bias->ne[1] == params.ubatch.n_tokens;
 
+        // [TAG_KPOOL_KEY_CACHE] the refresh batch is sized from the pending count at build
+        // time, so a graph built for fewer pools than are pending now must not be reused
+        res &= (int64_t) mctx_cur->n_pool_pending() <= (rec_pool_idx ? rec_pool_idx->ne[0] : 0);
+
         return res;
     }
 
     ggml_tensor * k_idxs     = nullptr; // I64 [n_tokens]
     ggml_tensor * ape_slots  = nullptr; // I32 [kpool], the identity - reads the ape rows in order
     ggml_tensor * cell_pool  = nullptr; // I32 [n_kv, n_stream]
-    ggml_tensor * pool_cells = nullptr; // I32 [kpool*n_pools, n_stream]
     ggml_tensor * bias       = nullptr; // F32 [n_kv, n_tokens/n_stream, n_stream]
+
+    // [TAG_KPOOL_KEY_CACHE] the pools whose keys this pass recomputes, and their member cells
+    ggml_tensor * rec_pool_idx   = nullptr; // I32 [n_rec, n_stream]
+    ggml_tensor * rec_pool_cells = nullptr; // I32 [kpool*n_rec, n_stream]
 
     const llama_memory_hybrid_kpool_context * mctx;
 };
@@ -694,14 +706,25 @@ llm_graph_input_kpool * llama_model_glm5next::graph::build_inp_kpool(llm_graph_i
     auto kp = std::make_unique<llm_graph_input_kpool>(inp_hyb->mctx);
 
     kp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    kp->ape_slots  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r);
     kp->cell_pool  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, ns);
-    kp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_pool, ns);
     kp->bias       = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tokens/ns, ns);
 
-    ggml_set_input(kp->ape_slots);
+    // [TAG_KPOOL_KEY_CACHE] size the refresh batch from what is actually pending. In steady
+    // state that is one pool per kpool tokens of the ubatch; it only spikes to the whole
+    // window right after a cache edit drops the map, and then for a single pass.
+    const int64_t n_rec = std::min<int64_t>(n_pool, inp_hyb->mctx->n_pool_pending());
+
+    if (n_rec > 0) {
+        kp->ape_slots      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r);
+        kp->rec_pool_idx   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_rec,   ns);
+        kp->rec_pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_rec, ns);
+
+        ggml_set_input(kp->ape_slots);
+        ggml_set_input(kp->rec_pool_idx);
+        ggml_set_input(kp->rec_pool_cells);
+    }
+
     ggml_set_input(kp->cell_pool);
-    ggml_set_input(kp->pool_cells);
     ggml_set_input(kp->bias);
 
     return (llm_graph_input_kpool *) res->add_input(std::move(kp));
@@ -717,7 +740,7 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_top_k(
     const int64_t r      = hparams.indexer_block_size;
     const int64_t n_kv   = inp->cell_pool->ne[0];
     const int64_t ns     = inp->cell_pool->ne[1];
-    const int64_t n_pool = inp->pool_cells->ne[0]/r;
+    const int64_t n_pool = n_kv/r;
     const int64_t n_tps  = n_tokens/ns;
 
     // key and gate logits packed into one cache row: the gate depends on the token hidden
@@ -734,26 +757,51 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_top_k(
     ggml_tensor * all = mctx_idx->get_k(ctx0, il);
     all = ggml_view_3d(ctx0, all, 2*d, n_kv, ns, all->nb[2], all->nb[3], 0);
 
-    // gathers per stream: pool_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, all, inp->pool_cells);
-    members = ggml_reshape_4d(ctx0, members, 2*d, r, n_pool, ns);
+    // [TAG_KPOOL_KEY_CACHE] a pool key depends only on the r indexer rows of a complete pool,
+    // so it is fixed once that pool fills up. Pooling the whole window on every pass made this
+    // block scale with n_kv - seven n_kv-row tensors per layer, all live at once, and an RPC
+    // split forces them across backends. Only the pools named by rec_pool_* are recomputed
+    // here; the rest are read straight out of the persistent cache below.
+    const int64_t n_pool_max = inp->mctx->get_n_pool_max();
 
-    ggml_tensor * m_k = ggml_cont(ctx0, ggml_view_4d(ctx0, members, d, r, n_pool, ns,
-            members->nb[1], members->nb[2], members->nb[3], 0));
-    ggml_tensor * m_g = ggml_cont(ctx0, ggml_view_4d(ctx0, members, d, r, n_pool, ns,
-            members->nb[1], members->nb[2], members->nb[3], ggml_row_size(members->type, d)));
+    ggml_tensor * pool_cache = inp->mctx->get_pool_k(il);
+    GGML_ASSERT(pool_cache && pool_cache->ne[0] == d);
 
-    // pool key = softmax(gate + ape) . keys over the r members, channel by channel. The ape is
-    // an intra-pool position bias and, with no rope anywhere, the only ordering signal here.
-    m_g = ggml_add(ctx0, m_g, ggml_get_rows(ctx0, layer.indexer_comp_ape, inp->ape_slots));
+    // [d, n_pool_max + 1, ns] - the extra row per stream absorbs padded refresh writes
+    ggml_tensor * cache_3d = ggml_view_3d(ctx0, pool_cache, d, n_pool_max + 1, ns,
+            pool_cache->nb[1], pool_cache->nb[1]*(n_pool_max + 1), 0);
 
-    // softmax normalizes ne[0], so bring the member axis there
-    ggml_tensor * w = ggml_soft_max(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, m_g, 1, 0, 2, 3)));
-    ggml_tensor * v = ggml_cont(ctx0, ggml_permute(ctx0, m_k, 1, 0, 2, 3));
+    if (inp->rec_pool_idx) {
+        const int64_t n_rec = inp->rec_pool_idx->ne[0];
 
-    ggml_tensor * pooled = ggml_sum_rows(ctx0, ggml_mul(ctx0, v, w));
-    pooled = ggml_cont(ctx0, ggml_permute(ctx0, pooled, 1, 0, 2, 3));
-    pooled = ggml_reshape_3d(ctx0, pooled, d, n_pool, ns);
+        // gathers per stream: rec_pool_cells row s indexes stream s's own cells
+        ggml_tensor * members = ggml_get_rows(ctx0, all, inp->rec_pool_cells);
+        members = ggml_reshape_4d(ctx0, members, 2*d, r, n_rec, ns);
+
+        ggml_tensor * m_k = ggml_cont(ctx0, ggml_view_4d(ctx0, members, d, r, n_rec, ns,
+                members->nb[1], members->nb[2], members->nb[3], 0));
+        ggml_tensor * m_g = ggml_cont(ctx0, ggml_view_4d(ctx0, members, d, r, n_rec, ns,
+                members->nb[1], members->nb[2], members->nb[3], ggml_row_size(members->type, d)));
+
+        // pool key = softmax(gate + ape) . keys over the r members, channel by channel. The ape
+        // is an intra-pool position bias and, with no rope anywhere, the only ordering signal.
+        m_g = ggml_add(ctx0, m_g, ggml_get_rows(ctx0, layer.indexer_comp_ape, inp->ape_slots));
+
+        // softmax normalizes ne[0], so bring the member axis there
+        ggml_tensor * w = ggml_soft_max(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, m_g, 1, 0, 2, 3)));
+        ggml_tensor * v = ggml_cont(ctx0, ggml_permute(ctx0, m_k, 1, 0, 2, 3));
+
+        ggml_tensor * fresh = ggml_sum_rows(ctx0, ggml_mul(ctx0, v, w));
+        fresh = ggml_cont(ctx0, ggml_permute(ctx0, fresh, 1, 0, 2, 3));
+        fresh = ggml_reshape_3d(ctx0, fresh, d, n_rec, ns);
+        cb(fresh, "indexer_k_pooled_new", il);
+
+        // read the cache through the write, so the scheduler cannot float the read above it
+        cache_3d = ggml_set_rows(ctx0, cache_3d, fresh, inp->rec_pool_idx);
+    }
+
+    ggml_tensor * pooled = ggml_view_3d(ctx0, cache_3d, d, n_pool, ns,
+            cache_3d->nb[1], cache_3d->nb[2], 0);
     cb(pooled, "indexer_k_pooled", il);
 
     // nope-only: no rope on the indexer query either. mul_mat matches ne[2], so stream s's

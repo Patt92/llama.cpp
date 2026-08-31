@@ -106,6 +106,27 @@ public:
     uint32_t get_kpool()       const { return kpool;       }
     bool     get_select_tail() const { return select_tail; }
 
+    // [TAG_KPOOL_KEY_CACHE] a pool key is a function of the `kpool` indexer rows of a complete
+    // pool, so it stops changing the moment that pool fills up. Recomputing every pool on every
+    // pass made the indexer's working set scale with n_kv instead of with the ubatch: the
+    // gather plus the de-interleave, softmax and weighted sum around it are seven tensors of
+    // n_kv rows per layer, live at once, and an RPC split materializes them across backends.
+    // They are cached here instead and refreshed only for the pools that just completed or were
+    // invalidated by a cache edit. Row n_pool_max is a scratch slot: streams with nothing to
+    // refresh park their padded writes there, so no in-range pool is ever clobbered.
+    ggml_tensor * get_pool_k(int32_t il) const { return pool_k_l[il]; }
+
+    uint32_t get_n_pool_max()  const { return n_pool_max;  }
+    uint32_t get_idx_head()    const { return idx_head;    }
+
+    // how many complete pools still need their key computed, maximised over streams. Read at
+    // graph-build time to size the refresh batch, so it must not depend on the ubatch.
+    uint32_t n_pool_pending() const;
+
+    // drop every cached pool key: any edit that moves or removes cells can change which tokens
+    // make up a pool, and a pool key carries no position of its own to check against
+    void invalidate_pool_keys();
+
 private:
     const llama_hparams & hparams;
 
@@ -118,6 +139,23 @@ private:
     const std::unique_ptr<llama_kv_cache>         mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
     const std::unique_ptr<llama_kv_cache>         mem_idx;
+
+    // [TAG_KPOOL_KEY_CACHE] one [idx_head, n_pool_max + 1] tensor per indexer layer, per stream
+    uint32_t idx_head   = 0;
+    uint32_t n_pool_max = 0;
+    uint32_t n_stream   = 1;
+
+    std::vector<ggml_tensor *> pool_k_l;
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs_pool;
+
+    // pool_valid[s*n_pool_max + b] - set once the key of pool b in stream s has been written
+    mutable std::vector<uint8_t> pool_valid;
+
+public:
+    // set by set_input_kpool once the graph is committed to refreshing these pools
+    void mark_pool_valid(uint32_t s, uint32_t b) const { pool_valid[s*n_pool_max + b] = 1; }
+    bool is_pool_valid  (uint32_t s, uint32_t b) const { return pool_valid[s*n_pool_max + b]; }
 };
 
 class llama_memory_hybrid_kpool_context : public llama_memory_context_i {
@@ -174,11 +212,25 @@ public:
     // limitation: pools are built once per stream, so a unified cache holding several
     // sequences pools their cells together and degrades the selection. The attention mask
     // itself stays per token, so no sequence ever sees another one's tokens.
+    //
+    // [TAG_KPOOL_KEY_CACHE] rec_pool_idx / rec_pool_cells name the pools whose keys are
+    // (re)computed this pass:
+    //   rec_pool_idx   I32 [n_rec, ns]        destination rows in the pool-key cache
+    //   rec_pool_cells I32 [kpool*n_rec, ns]  their member cells, in pool order
+    // Both are padded to n_rec by repeating the previous entry, which recomputes the same pool
+    // twice and is idempotent. A stream with nothing to refresh writes to the scratch row
+    // n_pool_max instead, which is never read back.
     void set_input_kpool(
             ggml_tensor * cell_pool,
-            ggml_tensor * pool_cells,
             ggml_tensor * bias,
+            ggml_tensor * rec_pool_idx,
+            ggml_tensor * rec_pool_cells,
             const llama_ubatch * ubatch) const;
+
+    ggml_tensor * get_pool_k(int32_t il) const { return mem->get_pool_k(il); }
+
+    uint32_t get_n_pool_max()   const { return mem->get_n_pool_max();  }
+    uint32_t n_pool_pending()   const { return mem->n_pool_pending();  }
 
 private:
     llama_memory_hybrid_kpool * mem = nullptr;
