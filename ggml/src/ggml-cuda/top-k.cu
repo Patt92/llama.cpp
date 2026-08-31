@@ -2,7 +2,12 @@
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
-#    include <cub/cub.cuh>
+// [TAG_NO_CUB_HEADER_ON_HIP] ROCm has no <cub/cub.cuh>: vendors/hip.h already includes
+// <hipcub/hipcub.hpp> and aliases cub to hipcub, so including it here breaks the HIP build.
+// Guard rather than delete, so a CUDA build keeps upstream's include.
+#    ifndef GGML_USE_HIP
+#        include <cub/cub.cuh>
+#    endif  // GGML_USE_HIP
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
 #        define CUB_TOP_K_AVAILABLE
 #        include <cuda/iterator>
