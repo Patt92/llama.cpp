@@ -9,7 +9,9 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <stdexcept>
+#include <vector>
 
 //
 // llama_memory_hybrid_kpool

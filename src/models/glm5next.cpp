@@ -4,7 +4,9 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
+#include <string>
 
 //
 // GLM-5.3-Flash: hybrid trunk, KDA linear attention on 3 of every 4 layers and MLA

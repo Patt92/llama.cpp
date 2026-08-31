@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 
+#include <map>
 #include <memory>
 #include <vector>
 
