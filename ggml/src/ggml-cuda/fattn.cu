@@ -546,11 +546,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
+    const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    GGML_ASSERT(K != nullptr);
-    GGML_ASSERT(V != nullptr);
+    // [TAG_FA_ALLOC_SIZE_RPC] the RPC server calls this through
+    // ggml_backend_buft_get_alloc_size on a tensor rebuilt from the wire, and a src that failed
+    // to deserialize simply stays null there. Asserting would abort the server process and the
+    // client only sees "Remote RPC server crashed"; ggml_cuda_get_best_fattn_kernel below also
+    // dereferences Q and K unconditionally. Report the plain size instead - the graph path
+    // always has its srcs, so the padded size is still computed wherever it is actually used.
+    if (Q == nullptr || K == nullptr || V == nullptr) {
+        GGML_LOG_DEBUG("%s: flash-attn tensor without srcs (Q=%p K=%p V=%p), reporting ggml_nbytes\n",
+                __func__, (const void *) Q, (const void *) K, (const void *) V);
+        return ggml_nbytes(dst);
+    }
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 

@@ -919,6 +919,8 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
+    // [TAG_FA_ALLOC_SIZE_RPC] srcs can be missing when the RPC server rebuilds a tensor from
+    // the wire; ggml_cuda_flash_attn_ext_get_alloc_size falls back to ggml_nbytes in that case
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
@@ -4169,8 +4171,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 (mul_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
             const ggml_tensor * weights = mul_node->src[1];
+            // [TAG_MOE_SCALE_ROWS] the epilogue indexes the scale by channel_dst, so it must
+            // hold exactly one value per destination row. Checking ne[0]/ne[1] alone was only
+            // sound while the fusion was limited to a single token: with more than one the
+            // weights are [1, n_expert_used, n_tokens] and ne[2] carries the token count, which
+            // trips GGML_ASSERT(ggml_nelements(x_scale) == dst->ne[1]) in mul_mat_vec_q and
+            // aborts the process - on an RPC worker that surfaces to the client only as
+            // "Remote RPC server crashed". Upstream lifted its own one-token restriction in
+            // 41ef91f7c, so the element count is now checked outright.
             if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
                     weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
+                    ggml_nelements(weights) == mm_node->ne[1] &&
                     ggml_are_same_shape(mm_node, mul_node) &&
                     ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
