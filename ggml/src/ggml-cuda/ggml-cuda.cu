@@ -919,8 +919,6 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    // [TAG_FA_ALLOC_SIZE_RPC] srcs can be missing when the RPC server rebuilds a tensor from
-    // the wire; ggml_cuda_flash_attn_ext_get_alloc_size falls back to ggml_nbytes in that case
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
@@ -1818,18 +1816,24 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    // [TAG_MMID_FUSION_ONE_TOKEN_HIP] upstream 41ef91f7c lifted the one-token restriction on
-    // MUL_MAT_ID mmvq fusion. This branch rewrites most of mmvq.cu (the MoE epilogue with
-    // x_scale_channel_dst, dst_gate and conv_input, and the mul_mat_vec_q_moe kernel), and the
-    // multi-token path through that rewrite produces wrong results on gfx1151: a MoE model
-    // decodes at full speed but emits garbage. Keep the pre-41ef91f7c behaviour on HIP until
-    // the multi-token epilogue is verified there; CUDA keeps upstream's wider batch.
-#if defined(GGML_USE_HIP)
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
         return false;
     }
-#else
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+
+    // [TAG_MMID_FUSION_ONE_TOKEN_HIP] TEMPORARY DIVERGENCE, remove once verified on gfx1151.
+    // Upstream 41ef91f7c lifted the one-token limit on MUL_MAT_ID mmvq fusion. A MoE model on
+    // this branch then loads, decodes at full speed and emits only garbage tokens, so the
+    // multi-token path is held back on HIP until someone can A/B it on hardware. This is not a
+    // fix and it is not upstream's fault as far as anyone has shown: the cause has not been
+    // isolated, and the host used to build this branch compiles no HIP and runs no ROCm.
+    // Set LLAMA_HIP_MMID_MULTI_TOKEN=1 to take upstream's behaviour unchanged.
+#if defined(GGML_USE_HIP)
+    static const bool hip_mmid_multi_token = [] {
+        const char * e = getenv("LLAMA_HIP_MMID_MULTI_TOKEN");
+        return e && atoi(e) != 0;
+    }();
+
+    if (!hip_mmid_multi_token && tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
         return false;
     }
 #endif  // defined(GGML_USE_HIP)
