@@ -557,7 +557,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     // dereferences Q and K unconditionally. Report the plain size instead - the graph path
     // always has its srcs, so the padded size is still computed wherever it is actually used.
     if (Q == nullptr || K == nullptr || V == nullptr) {
-        GGML_LOG_DEBUG("%s: flash-attn tensor without srcs (Q=%p K=%p V=%p), reporting ggml_nbytes\n",
+        // loud on purpose: reporting ggml_nbytes here under-reports the padded size, so if this
+        // ever fires the buffer is too small and the output is silently wrong rather than absent
+        GGML_LOG_ERROR("%s: flash-attn tensor without srcs (Q=%p K=%p V=%p), reporting ggml_nbytes - "
+                "the allocation may be short and results wrong\n",
                 __func__, (const void *) Q, (const void *) K, (const void *) V);
         return ggml_nbytes(dst);
     }
