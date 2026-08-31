@@ -32,9 +32,6 @@ replace the portable default upstream build.
 
 - Enables hipCUB for HIP top-k and argsort, including the distributed RPC execution
   path, so these operations remain GPU-capable on ROCm.
-- Includes upstream RPC protocol 5.1 and its graph-use-count propagation, allowing
-  supported backend fusions to run on the RPC worker. Controller and worker must use
-  the same fork build; mixed RPC 5.0/5.1 binaries are unsupported.
 - Adds a gfx1151-local Lightning Indexer top-k specialization for 512, 1024 and 2048
   candidates up to 8192 score entries, avoiding the expensive generic device-wide sort
   during DeepSeek-V4 long-context prefill.
@@ -58,7 +55,7 @@ replace the portable default upstream build.
 
 #### Strix Halo compute tuning
 
-- Overrides four entries of upstream's own RDNA3.5 MMQ configuration table for wide Q8_0,
+- Overrides four entries of the RDNA3.5 MMQ configuration table for wide Q8_0,
   Q5_K and Q6_K tiles, and adds the expert-MMQ tile selection that picks the `MUL_MAT_ID`
   J dimension from the average rows per expert (`GGML_CUDA_MMQ_ID_J` to force or disable
   it). The overrides replace existing entries rather than removing them, so no shape loses
@@ -98,7 +95,7 @@ replace the portable default upstream build.
   `attention.indexer.kpool` (#27754), because the two converters disagree on the key name.
   Without this, a GGUF from the other converter aborts at
   `GLM5NEXT requires index_kpool`.
-- Adds the NextN/MTP draft head, which neither upstream draft implements. It follows the
+- Adds the NextN/MTP draft head. It follows the
   GLM-5.2 head in `glm-dsa.cpp`: `enorm(embed) + hnorm(prev_hidden) -> concat -> eh_proj ->
   one dense DSA decoder block -> shared_head_norm -> shared LM head`. It reuses the trunk's
   own attention and FFN builders rather than duplicating them, runs without the mHC mixer
@@ -172,8 +169,7 @@ replace the portable default upstream build.
   Gated Delta Net state update, preserving the required execution order.
 - Capability-gates DFlash2 activation against the graph that is actually built: an
   unsupported DFlash2 selector on a DeepSeek-V4 backbone is rejected at load, because
-  that backbone's graph does not build the selector lattice. DFlash2 itself is no longer
-  carried here — upstream merged PR #27342 and this branch uses that implementation.
+  that backbone's graph does not build the selector lattice.
 - Adds FastMTP compact-draft-vocabulary support for Qwen3.8 sidecars carrying an I64
   `d2t` map. The draft LM head evaluates only its compact vocabulary and scatters the
   logits back into the full target vocabulary before verification. Shape, I32/I64 index type,
@@ -279,22 +275,6 @@ aggregate throughput but usually lowers per-request generation speed. The shown
 batches; making either value much larger is primarily a memory/performance experiment,
 not a correctness fix.
 
-#### DFlash2 sidecar
-
-```sh
---spec-type draft-dflash \
---spec-draft-model /opt/models/Qwen3.8-27B/Qwen3.8-27B-DFlash2-BF16.gguf \
---spec-draft-device ROCm0 \
---spec-draft-ngl all \
---spec-draft-n-max 8 \
---spec-draft-type-k f16 \
---spec-draft-type-v f16
-```
-
-The CLI type is `draft-dflash`, not `draft-dflash2` and not `draft-mtp`. DFlash2 is
-still sourced from an open upstream PR, so validate it separately from FastMTP before
-using it in a production alias.
-
 ### Qwen3.8 speculative-decoding correctness notes
 
 - Do not combine `--spec-default` with `--spec-type draft-mtp` while isolating output
@@ -315,9 +295,6 @@ using it in a production alias.
 - `--batch-size` and `--ubatch-size` primarily affect throughput and memory pressure;
   they are not correctness switches for committed speculative tokens. Change them
   only after the no-draft and single-drafter comparisons are clean.
-- DFlash2 is upstream functionality as of PR #27342. It is a separate drafter and
-  requires a DFlash2 checkpoint; it is not a fix for an existing MTP checkpoint.
-
 ### Sources and provenance
 
 - [@ggml-org](https://github.com/ggml-org/llama.cpp) provides the upstream base. This
@@ -330,7 +307,7 @@ using it in a production alias.
   into the Patt92 RPC patch; no older branch is required at build time.
 - [@Nathanw1014](https://github.com/Nathanw1014/llama.cpp) supplies the selected
   Strix Halo/RDNA3.5 HIP tuning, DeepSeek-V4, Flash-Attention, MMQ/MMVQ and
-  backend-neutral fused-op work, including the DFlash2 graph-capability guard. This
+  backend-neutral fused-op work, including the speculative graph-capability guard. This
   branch also ports the indexed sparse DeepSeek-V4 attention design from Nathan's Vulkan
   research to a separate HIP tile implementation; Vulkan shader code is not copied.
 - [@antirez](https://github.com/antirez/ds4) is the algorithmic source for the
@@ -339,9 +316,6 @@ using it in a production alias.
 - [@stew675](https://github.com/stew675/llama.cpp) supplies the selected
   ROCm-compatible Qwen3.5/Qwen3.8 and hybrid-SSM fusions, MMVQ tuning and
   speculative decode/verification consistency fixes.
-- [@SubSir](https://github.com/SubSir) / [@z-lab](https://github.com/z-lab) supplies
-  the DFlash2 implementation currently proposed in
-  [ggml-org/llama.cpp#27342](https://github.com/ggml-org/llama.cpp/pull/27342).
 - [@HauhauCS](https://huggingface.co/HauhauCS) supplies the
   [compact-vocabulary FastMTP format and original Qwen3.8 runtime patch](https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF).
   This branch retains that algorithm while adding explicit loader and graph validation.
