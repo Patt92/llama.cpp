@@ -637,6 +637,7 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] const float * conv_states = nullptr;
     [[maybe_unused]] int conv_kernel_size = 0;
     ggml_glu_op active_glu;
+    float glu_limit = 0.0f;
 
     if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
@@ -646,6 +647,7 @@ static __global__ void mul_mat_vec_q(
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
+        glu_limit     = fusion.glu_limit;
         use_dst_gate  = fusion.dst_gate != nullptr && use_gate;
         if (use_dst_gate) {
             dst_gate = fusion.dst_gate;
@@ -808,6 +810,9 @@ static __global__ void mul_mat_vec_q(
                                 case GGML_GLU_OP_SWIGLU_OAI:
                                     result_val = ggml_cuda_op_swiglu_oai_single(gate_value, result_val);
                                     break;
+                                case GGML_GLU_OP_SWIGLU_CLAMP:
+                                    result_val = ggml_cuda_op_swiglu_clamp_single(gate_value, result_val, glu_limit);
+                                    break;
                                 default:
                                     result_val = result_val * gate_value;
                                     break;
@@ -835,7 +840,7 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1424,6 +1429,7 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_limit = fusion->glu_limit;
         if (fusion->dst_gate) {
             GGML_ASSERT(fusion->dst_gate->type == GGML_TYPE_F32);
             fusion_local.dst_gate = fusion->dst_gate->data;
