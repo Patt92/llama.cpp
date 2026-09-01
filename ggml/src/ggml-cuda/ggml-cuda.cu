@@ -1820,12 +1820,21 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    // [TAG_MMID_FUSION_ONE_TOKEN_HIP] TEMPORARY DIVERGENCE, remove once verified on gfx1151.
-    // Upstream 41ef91f7c lifted the one-token limit on MUL_MAT_ID mmvq fusion. A MoE model on
-    // this branch then loads, decodes at full speed and emits only garbage tokens, so the
-    // multi-token path is held back on HIP until someone can A/B it on hardware. This is not a
-    // fix and it is not upstream's fault as far as anyone has shown: the cause has not been
-    // isolated, and the host used to build this branch compiles no HIP and runs no ROCm.
+    // [TAG_MMID_FUSION_ONE_TOKEN_HIP] TEMPORARY DIVERGENCE, remove once the cause is found.
+    // Upstream 41ef91f7c lifted the one-token limit on MUL_MAT_ID mmvq fusion. A MoE model then
+    // loads, decodes at full speed and emits only garbage tokens on gfx1151. Confirmed by A/B on
+    // hardware: setting LLAMA_HIP_MMID_MULTI_TOKEN=1 reproduces it every time, clearing it fixes
+    // it. dst->ne[2] is the token count, so the window this opens is 2 .. get_mmvq_mmid_max_batch
+    // (8 for Q8_0 on RDNA3); one token and full prefill batches were never affected.
+    //
+    // The fused matmul itself is NOT the culprit: test-backend-ops -o MUL_MAT_ID_FUSION passes
+    // 14/14 on gfx1151 with the flag set, including n=4 with the trailing MUL, which is the
+    // ffn_moe_weighted shape in the middle of that window. So the fault is in which nodes get
+    // fused, not in the kernel that computes them. 41ef91f7c also extended the MoE GLU fusion and
+    // the topk-router fusion past one token, and relaxed ggml_cuda_check_fusion_memory_ranges to
+    // let the logits alias the outputs for up to TOPK_MOE_ROWS_PER_BLOCK (8) rows - the same
+    // upper bound as the broken window. Neither is covered by MUL_MAT_ID_FUSION.
+    //
     // Set LLAMA_HIP_MMID_MULTI_TOKEN=1 to take upstream's behaviour unchanged.
 #if defined(GGML_USE_HIP)
     static const bool hip_mmid_multi_token = [] {
