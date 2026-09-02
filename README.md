@@ -35,6 +35,16 @@ replace the portable default upstream build.
 - Adds a gfx1151-local Lightning Indexer top-k specialization for 512, 1024 and 2048
   candidates up to 8192 score entries, avoiding the expensive generic device-wide sort
   during DeepSeek-V4 long-context prefill.
+- `[TAG_TOPK_RADIX_OVER_CUB_SORT]` Beyond that 8192-column limit, prefers upstream's
+  radix select over the argsort fallback on HIP. Upstream compiles the radix select only
+  when hipCUB is absent, because with hipCUB present `TOP_K` is expected to reach
+  `DeviceTopK`. On ROCm it never does: that path requires `CCCL_MAJOR_VERSION >= 3.2`,
+  a macro hipCUB does not define, so enabling hipCUB silently routed `TOP_K` into a full
+  sort of every column to keep `k` of them. With a Lightning Indexer configured for
+  `top_k = 2048` against a long KV cache that is a device-wide sort of tens of thousands
+  of entries per row per layer, once per ubatch. The radix select is O(ncols) per row and
+  batches all rows into one launch; hipCUB remains in use for `ARGSORT`, which is the
+  reason this fork enables it.
 - Adds indexed sparse HIP Flash Attention for the DeepSeek-V4 CSA F16 layout. Large
   prefills read only the raw attention window plus the 512 rows selected by the
   Lightning Indexer instead of scanning the full compressed KV cache. The path is

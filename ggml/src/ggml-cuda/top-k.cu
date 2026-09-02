@@ -53,7 +53,15 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+// [TAG_TOPK_RADIX_OVER_CUB_SORT] upstream compiles the radix select only when hipCUB is
+// absent, because with hipCUB present TOP_K takes the argsort branch below. On ROCm that
+// branch is always the one taken: CUB_TOP_K_AVAILABLE needs CCCL >= 3.2, a macro hipCUB
+// does not define, so DeviceTopK is never reachable and TOP_K sorts every column to keep
+// k of them. For the GLM-5.3-Flash indexer (k = 2048 over the whole KV cache) that is a
+// full sort of tens of thousands of entries per row per layer. Build the radix select
+// unconditionally on HIP so the dispatch can prefer it; hipCUB stays in use for ARGSORT,
+// which is why this fork enables it in the first place.
+#if defined(GGML_USE_HIP)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -213,7 +221,7 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) - [TAG_TOPK_RADIX_OVER_CUB_SORT]
 
 #if defined(GGML_USE_HIP)
 
@@ -333,6 +341,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
     // RDNA3.5 fast path for the indexer's k = 512/1024/2048 rows; independent of CUB
     if (top_k_strix(src0_d, dst_d, ncols, nrows, k, stream)) {
+        return;
+    }
+
+    // [TAG_TOPK_RADIX_OVER_CUB_SORT] past the strix path's 8192-column limit, select rather
+    // than sort. Without this the hipCUB build falls into the argsort branch and pays a full
+    // sort of `ncols` to keep `k`; the radix select is O(ncols) per row and batches all rows
+    // in one launch. Below 1024 columns the bitonic sort is competitive, so leave it alone.
+    if (ncols > 1024) {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
 #endif  // defined(GGML_USE_HIP)
