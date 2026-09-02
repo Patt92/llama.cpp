@@ -1,0 +1,309 @@
+From 194d637b5d7e9257f9777ac4ddbae9bef19c42ab Mon Sep 17 00:00:00 2001
+From: Patrick Hoffmann <patrickhoffmann@MacBook-Pro-14-HOP.local>
+Date: Thu, 13 Aug 2026 12:09:50 +0200
+Subject: [PATCH] ggml-hip: enable hipCUB for top-k and argsort
+
+---
+ .github/workflows/build-cuda-ubuntu.yml |  2 +-
+ .github/workflows/hip-quality-check.yml |  2 +-
+ ggml/src/ggml-cuda/argsort.cu           |  3 +--
+ ggml/src/ggml-cuda/common.cuh           |  5 -----
+ ggml/src/ggml-cuda/cumsum.cu            | 20 ++++++++------------
+ ggml/src/ggml-cuda/mean.cu              |  5 ++---
+ ggml/src/ggml-cuda/ssm-scan.cu          | 23 +++++++++--------------
+ ggml/src/ggml-cuda/sum.cu               |  8 +++-----
+ ggml/src/ggml-cuda/top-k.cu             |  1 -
+ ggml/src/ggml-cuda/vendors/cuda.h       |  5 +++++
+ ggml/src/ggml-cuda/vendors/hip.h        |  9 +++++++++
+ 11 files changed, 39 insertions(+), 44 deletions(-)
+
+diff --git a/.github/workflows/build-cuda-ubuntu.yml b/.github/workflows/build-cuda-ubuntu.yml
+index 2528b18573a78a9a8e99783acc7b9f0b81688ec7..a30ef678e4c68050039154831171bf19c5106bdd 100644
+--- a/.github/workflows/build-cuda-ubuntu.yml
++++ b/.github/workflows/build-cuda-ubuntu.yml
+@@ -85,7 +85,7 @@ jobs:
+         id: depends
+         run: |
+           sudo apt-get update
+-          sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev rocwmma-dev
++          sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev hipcub-dev libssl-dev rocwmma-dev
+ 
+       - name: ccache
+         uses: ggml-org/ccache-action@v1.2.21
+diff --git a/.github/workflows/hip-quality-check.yml b/.github/workflows/hip-quality-check.yml
+index 5d23f01cf80a87100ce8889fb28cd9f1ce2be796..14c9df634c4543514090b9219366169fcdf09b76 100644
+--- a/.github/workflows/hip-quality-check.yml
++++ b/.github/workflows/hip-quality-check.yml
+@@ -49,7 +49,7 @@ jobs:
+         id: depends
+         run: |
+           sudo apt-get update
+-          sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev python3
++          sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev hipcub-dev libssl-dev python3
+ 
+       - name: ccache
+         uses: ggml-org/ccache-action@v1.2.21
+diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
+index 26af900259721d3cd4a79c44f4a5e9c0e9e4c379..62be4d2995c40c6773a07b773836290ada67f0fd 100644
+--- a/ggml/src/ggml-cuda/argsort.cu
++++ b/ggml/src/ggml-cuda/argsort.cu
+@@ -1,11 +1,10 @@
+ #include "argsort.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#    include <cub/cub.cuh>
+ #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
+ #        define STRIDED_ITERATOR_AVAILABLE
+ #        include <cuda/iterator>
+-#    endif
++#    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1
+ using namespace cub;
+ #endif  // GGML_CUDA_USE_CUB
+ 
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index d27d8acb1d37776dfe955440cb787117bf96270f..e0afdcce815929569b06ba532bfed423ba21ac87 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -107,10 +107,6 @@
+ #define GGML_CUDA_CC_IS_QY2(cc)      (cc >= GGML_CUDA_CC_QY2 && cc < GGML_CUDA_CC_PH1)
+ #define GGML_CUDA_CC_IS_PH1(cc)      (cc >= GGML_CUDA_CC_PH1)
+ 
+-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+-#    define GGML_CUDA_USE_CUB
+-#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+-
+ // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
+ // However, this has been bugged in CTK < 12.3 for MSVC builds, see
+ // https://github.com/ggml-org/llama.cpp/pull/22522#discussion_r3302393293
+@@ -1666,4 +1662,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+     CUDA_CHECK(cudaGetLastError());
+ }
+-
+diff --git a/ggml/src/ggml-cuda/cumsum.cu b/ggml/src/ggml-cuda/cumsum.cu
+index def9c32955f2ddd8ccd92a8e84e903d6e99ed1ef..3cd3470b1ad5394d1a7595a8d6e64e4c32c63c04 100644
+--- a/ggml/src/ggml-cuda/cumsum.cu
++++ b/ggml/src/ggml-cuda/cumsum.cu
+@@ -4,10 +4,6 @@
+ #include "ggml-cuda/common.cuh"
+ #include "ggml.h"
+ 
+-#ifdef GGML_CUDA_USE_CUB
+-#   include <cub/cub.cuh>
+-#endif // GGML_CUDA_USE_CUB
+-
+ template<typename T, int BLOCK_SIZE>
+ static __global__ void cumsum_cub_kernel(
+         const T * __restrict__ src,
+@@ -195,18 +191,18 @@ static void cumsum_cub(ggml_cuda_pool & pool,
+     size_t tmp_size = 0;
+ 
+     // Query how much temp storage CUDA UnBound (CUB) needs
+-    cub::DeviceScan::InclusiveSum(nullptr,   // d_temp_storage (null = just query size)
+-                                  tmp_size,  // reference to size (will be set by CUB)
+-                                  src,       // input pointer
+-                                  dst,       // output pointer
+-                                  ne,        // number of elements
+-                                  stream     // CUDA stream to use
+-    );
++    CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr,   // d_temp_storage (null = just query size)
++                                             tmp_size,  // reference to size (will be set by CUB)
++                                             src,       // input pointer
++                                             dst,       // output pointer
++                                             ne,        // number of elements
++                                             stream     // CUDA stream to use
++    ));
+ 
+     ggml_cuda_pool_alloc<uint8_t> tmp_alloc(pool, tmp_size);
+ 
+     // Perform the inclusive scan
+-    cub::DeviceScan::InclusiveSum((void *) tmp_alloc.get(), tmp_size, src, dst, ne, stream);
++    CUDA_CHECK(cub::DeviceScan::InclusiveSum((void *) tmp_alloc.get(), tmp_size, src, dst, ne, stream));
+ }
+ #endif // GGML_CUDA_USE_CUB
+ 
+diff --git a/ggml/src/ggml-cuda/mean.cu b/ggml/src/ggml-cuda/mean.cu
+index a8f6046e46dae7c430de6fe6feddb930b544b7b8..8cdef4c7f0269a467f98613290ff94ee43f90195 100644
+--- a/ggml/src/ggml-cuda/mean.cu
++++ b/ggml/src/ggml-cuda/mean.cu
+@@ -2,7 +2,6 @@
+ #include "reduce_rows.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#include <cub/cub.cuh>
+ using namespace cub;
+ #endif  // GGML_CUDA_USE_CUB
+ 
+@@ -47,10 +46,10 @@ void ggml_cuda_op_mean(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         size_t           tmp_size = 0;
+         ggml_cuda_pool & pool     = ctx.pool();
+ 
+-        DeviceReduce::Sum(nullptr, tmp_size, src0_d, dst_d, ncols, stream);
++        CUDA_CHECK(DeviceReduce::Sum(nullptr, tmp_size, src0_d, dst_d, ncols, stream));
+ 
+         ggml_cuda_pool_alloc<uint8_t> tmp_alloc(pool, tmp_size);
+-        DeviceReduce::Sum(tmp_alloc.ptr, tmp_size, src0_d, dst_d, ncols, stream);
++        CUDA_CHECK(DeviceReduce::Sum(tmp_alloc.ptr, tmp_size, src0_d, dst_d, ncols, stream));
+ 
+         // Divide by ncols
+         divide_by_count<float><<<1, 1, 0, stream>>>(dst_d, ncols);
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index f3418c2af83d9e07fafff767a90a7b5a90858139..396b72564d2a23d6f3a923bae97899d43db35a10 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -1,13 +1,8 @@
+-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+-#define USE_CUB
+-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
++#include "ssm-scan.cuh"
+ 
+-#ifdef USE_CUB
+-#include <cub/cub.cuh>
++#ifdef GGML_CUDA_USE_CUB
+ using namespace cub;
+-#endif // USE_CUB
+-
+-#include "ssm-scan.cuh"
++#endif // GGML_CUDA_USE_CUB
+ 
+ 
+ // Minimum number of tokens to use SSD (State Space Duality) matmul path instead of scan path.
+@@ -71,7 +66,7 @@ __global__ void __launch_bounds__(splitD, 1)
+     __shared__ float smemB[N];
+     __shared__ float smemC[N];
+ 
+-#ifdef USE_CUB
++#ifdef GGML_CUDA_USE_CUB
+     using BlockLoad = cub::BlockLoad<float, splitD, N, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+     using BlockStore = cub::BlockStore<float, splitD, N, cub::BLOCK_STORE_WARP_TRANSPOSE>;
+ 
+@@ -93,7 +88,7 @@ __global__ void __launch_bounds__(splitD, 1)
+         regA[n] = A_block[threadIdx.x * stride_A + n];
+         regs0[n] = s0_block[threadIdx.x * stride_s0 + n];
+     }
+-#endif
++#endif // GGML_CUDA_USE_CUB
+ 
+ #pragma unroll
+     for (size_t i = 0; i < L; i++)
+@@ -124,7 +119,7 @@ __global__ void __launch_bounds__(splitD, 1)
+         __syncthreads();
+     }
+ 
+-#ifdef USE_CUB
++#ifdef GGML_CUDA_USE_CUB
+     BlockStore(cub_temp_storage.store_temp).Store(s_block, regs0);
+ #else
+     const int stride_s = stride_s0;
+@@ -133,7 +128,7 @@ __global__ void __launch_bounds__(splitD, 1)
+     {
+         s_block[threadIdx.x * stride_s + n] = regs0[n];
+     }
+-#endif
++#endif // GGML_CUDA_USE_CUB
+ }
+ #ifdef __clang__
+ #pragma clang diagnostic pop
+@@ -381,7 +376,7 @@ __global__ void ssm_ssd_prepare_dt_kernel(
+     // Phase 2+3: per-step inclusive scan to build cs[] in token order.
+     // With interleaved distribution the per-thread total scan would not give token-order
+     // prefix sums, so we scan one BLOCK_SIZE slab at a time and carry a running total.
+-#ifdef USE_CUB
++#ifdef GGML_CUDA_USE_CUB
+     using BlockScan = cub::BlockScan<float, BLOCK_SIZE>;
+     __shared__ typename BlockScan::TempStorage scan_temp;
+     __shared__ float step_total;
+@@ -400,7 +395,7 @@ __global__ void ssm_ssd_prepare_dt_kernel(
+         __syncthreads();
+         running += step_total;
+     }
+-#else
++#else // GGML_CUDA_USE_CUB
+     // Fallback: sequential prefix scan in shared memory, one slab at a time.
+     __shared__ float sdata[BLOCK_SIZE];
+     float running = 0.0f;
+diff --git a/ggml/src/ggml-cuda/sum.cu b/ggml/src/ggml-cuda/sum.cu
+index c56257b440661f5c38d54a308a82ecdfa728ca76..85b6be30966071d887e9e0f7cd1d0fb32856db2a 100644
+--- a/ggml/src/ggml-cuda/sum.cu
++++ b/ggml/src/ggml-cuda/sum.cu
+@@ -1,19 +1,17 @@
+ #include "sum.cuh"
+ #include "sumrows.cuh"
++#include <cstdint>
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#include <cub/cub.cuh>
+ using namespace cub;
+ #endif  // GGML_CUDA_USE_CUB
+ 
+-#include <cstdint>
+-
+ void sum_f32_cuda(ggml_cuda_pool & pool, const float * x, float * dst, const int64_t ne, cudaStream_t stream) {
+ #ifdef GGML_CUDA_USE_CUB
+     size_t tmp_size = 0;
+-    DeviceReduce::Sum(nullptr,       tmp_size, x, dst, ne, stream);
++    CUDA_CHECK(DeviceReduce::Sum(nullptr,       tmp_size, x, dst, ne, stream));
+     ggml_cuda_pool_alloc<uint8_t> tmp_alloc(pool, tmp_size);
+-    DeviceReduce::Sum(tmp_alloc.ptr, tmp_size, x, dst, ne, stream);
++    CUDA_CHECK(DeviceReduce::Sum(tmp_alloc.ptr, tmp_size, x, dst, ne, stream));
+ #else
+     // Use (inefficient) sum_rows implementation as a fallback.
+     // For AMD there is rocPRIM which could be used as a drop-in replacement via hipcub but this would require C++11 -> C++14.
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 9681cd29333819f37762e707f58d916018293a49..7492c996599d721af71dcaa3bc1f1bee8e0413cd 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -2,7 +2,6 @@
+ #include "top-k.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#    include <cub/cub.cuh>
+ #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+ #        define CUB_TOP_K_AVAILABLE
+ #        include <cuda/iterator>
+diff --git a/ggml/src/ggml-cuda/vendors/cuda.h b/ggml/src/ggml-cuda/vendors/cuda.h
+index 323c98019347addaea77a80ed2ca41b9c4853a3b..9edeeae3fd995250624d8ee456d84064508e2fac 100644
+--- a/ggml/src/ggml-cuda/vendors/cuda.h
++++ b/ggml/src/ggml-cuda/vendors/cuda.h
+@@ -15,6 +15,11 @@
+ #define FP8_AVAILABLE
+ #endif // CUDART_VERSION >= 11080
+ 
++#if CUDART_VERSION >= 11070
++#define GGML_CUDA_USE_CUB
++#include <cub/cub.cuh>
++#endif // CUDART_VERSION >= 11070
++
+ #if CUDART_VERSION >= 12080
+ #include <cuda_fp4.h>
+ #endif // CUDART_VERSION >= 12080
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index 9aa558f3f4ca0744ffafcc0403f082e8a272935c..b26b3efc36796ac9bdabefab108b146bfa16087a 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -10,6 +10,12 @@
+ #include <rccl/rccl.h>
+ #endif // GGML_USE_NCCL
+ 
++#if HIP_VERSION >= 60100000
++#define GGML_CUDA_USE_CUB
++#include <hipcub/hipcub.hpp>
++namespace cub = hipcub;
++#endif // HIP_VERSION >= 60100000
++
+ 
+ #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
+ #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
+@@ -118,6 +124,9 @@
+ #define cudaStreamPerThread hipStreamPerThread
+ #define cudaStreamSynchronize hipStreamSynchronize
+ #define cudaStreamWaitEvent hipStreamWaitEvent
++#define cudaStreamIsCapturing hipStreamIsCapturing
++#define cudaStreamCaptureStatus hipStreamCaptureStatus
++#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+ #define cudaGraphExec_t hipGraphExec_t
+ #define cudaGraphNode_t hipGraphNode_t
+ #define cudaKernelNodeParams hipKernelNodeParams
+-- 
+2.50.1 (Apple Git-155)
+
