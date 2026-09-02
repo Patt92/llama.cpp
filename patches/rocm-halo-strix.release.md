@@ -1,4 +1,4 @@
-# patt92-rocm-halo-strix-b10858-d3faac9
+# patt92 ROCm / Strix Halo - upstream f027c4f1b refresh
 
 Cumulative ROCm/HIP optimization branch for AMD Strix Halo (`gfx1151` / RDNA3.5),
 rebased onto upstream llama.cpp `f027c4f1b025e05d6a2fc3b741047bda07b85ef7`.
@@ -70,8 +70,10 @@ Carried unchanged from b10844 and still unexercised on hardware:
 
 Verified on Apple M4 Pro, 2026-09-02:
 
-- `git apply --check` clean at `f027c4f1b`; applying it reproduces the exact branch tree
-  `4bd0f2851ec841a8ffb76780672378f5624ddbbe`.
+- `git apply --check` clean at `f027c4f1b`; applying it reproduces the branch tip's tree
+  bit for bit, with a single exception: `patches/rocm-halo-strix.patch` itself, which the
+  patch necessarily cannot contain its own final bytes for. Every source file, test and
+  document matches exactly.
 - `git diff --check` clean outside the stored `patches/*.patch` artifacts.
 - No Vulkan, SYCL, OpenCL or WebGPU file touched.
 - `test-backend-ops`: 3974/3974 across three backends.
