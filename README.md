@@ -20,7 +20,7 @@
 ## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`b81c99b479d4c24e5eeca10de99032ebd343ef8f`](https://github.com/ggml-org/llama.cpp/commit/b81c99b479d4c24e5eeca10de99032ebd343ef8f).
+[`f027c4f1b025e05d6a2fc3b741047bda07b85ef7`](https://github.com/ggml-org/llama.cpp/commit/f027c4f1b025e05d6a2fc3b741047bda07b85ef7).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -184,6 +184,35 @@ replace the portable default upstream build.
   `d2t` map. The draft LM head evaluates only its compact vocabulary and scatters the
   logits back into the full target vocabulary before verification. Shape, I32/I64 index type,
   vocabulary range and required output-head invariants are validated at load/build time.
+
+### Two sparse Flash Attention paths side by side
+
+Upstream `8e93a9773` added its own sparse Flash Attention for DeepSeek-V4 and GLM. It
+solves the same problem as this branch's indexed sparse path, but it is CUDA-only and
+aborts everywhere else:
+
+```
+GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+```
+
+Adopting it as written would remove sparse attention from `gfx1151`, so both
+implementations are kept, separated by the existing compile guards. They differ in how a
+kernel learns which KV columns matter:
+
+- Upstream derives a single `n_kv_max` bound from the mask
+  (`ggml_flash_attn_ext_set_n_kv_max`) and selects a sparse kernel on CUDA only.
+- This branch passes explicit column indices
+  (`ggml_flash_attn_ext_add_top_k(cur, top_k, n_kv_raw)`) and keeps the HIP kernels.
+
+Both APIs exist on the tensor and are independent: `n_kv_max` occupies op-param slot 4,
+the top-k indices are a separate source. A build for NVIDIA hardware gets upstream's
+path; a ROCm build gets this branch's. Nothing switches at runtime.
+
+The one place this is easy to get wrong is `launch_fattn`. Upstream inserted `use_sparse`
+as parameter 5; here it is appended at the end of the parameter list instead, because
+`int` converts to `bool` without a warning and a positional slip in that list would
+compile cleanly and only show up as wrong output. If you port a call site from upstream,
+check the argument order rather than the argument count.
 
 ### DeepSeek-V4 long-context prefill
 
@@ -424,7 +453,7 @@ producing a silently mismatched tree.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout b81c99b479d4c24e5eeca10de99032ebd343ef8f
+git checkout f027c4f1b025e05d6a2fc3b741047bda07b85ef7
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
