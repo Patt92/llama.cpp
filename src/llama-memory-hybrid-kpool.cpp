@@ -527,15 +527,18 @@ const llama_kv_cache_context * llama_memory_hybrid_kpool_context::get_idx() cons
 }
 
 void llama_memory_hybrid_kpool_context::set_input_kpool(
-        ggml_tensor * cell_pool,
+        ggml_tensor * pool_cells,
         ggml_tensor * bias,
+        ggml_tensor * tail_cells,
         ggml_tensor * rec_pool_idx,
         ggml_tensor * rec_pool_cells,
         const llama_ubatch * ubatch) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
-    GGML_ASSERT(cell_pool->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_backend_buffer_is_host(tail_cells->buffer));
+    GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(tail_cells->type == GGML_TYPE_I32);
 
     // [TAG_KPOOL_KEY_CACHE] both refresh inputs exist together or not at all
     GGML_ASSERT((rec_pool_idx == nullptr) == (rec_pool_cells == nullptr));
@@ -550,46 +553,77 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
     }
 
     const int64_t r      = kpool;
-    const int64_t n_kv   = cell_pool->ne[0];
-    const int64_t n_ns   = cell_pool->ne[1];   // streams in this ubatch
-    const int64_t n_pool = n_kv/r;
+    const int64_t n_pool = bias->ne[0];
+    const int64_t n_ns   = pool_cells->ne[1];  // streams in this ubatch
+    const int64_t n_kv   = (int64_t) get_attn()->get_n_kv();
+
+    GGML_ASSERT(pool_cells->ne[0] == r*n_pool);
+    GGML_ASSERT(tail_cells->ne[0] == r);
 
     GGML_ASSERT(r > 0 && n_pool > 0);
     GGML_ASSERT(ubatch->n_tokens % n_ns == 0);
 
     const int64_t n_tps = ubatch->n_tokens/n_ns;
 
-    int32_t * dst_cell_pool  = (int32_t *) cell_pool->data;
+    int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
     float   * dst_bias       = (float   *) bias->data;
+    int32_t * dst_tail       = (int32_t *) tail_cells->data;
 
-    // [TAG_KPOOL_KEY_CACHE] the pool -> cells map is only needed to build rec_pool_cells now,
-    // so it is host scratch rather than a graph input the allocator would have to back
-    std::vector<int32_t> pool_cells_buf((size_t) r*n_pool);
+    // [TAG_KPOOL_POOL_TOPK] the pool -> cells map is a graph input again: the selection now
+    // names pools, and the winners are expanded through this table on the device.
 
     // one pass per stream: cell j is a different token in each
     std::vector<int32_t> pool_of(n_kv);
     std::vector<int32_t> filled(n_pool);
+
+    // [TAG_KPOOL_POOL_TOPK] members that also carry this stream's sequence. A pool is usable
+    // only when all kpool of them do, which is the per-pool form of the per-cell seq_has test
+    // the old cell bias applied.
+    std::vector<int32_t> filled_seq(n_pool);
+
+    // position -> cell, over the narrow window the tails of this ubatch can reach. Built in the
+    // same O(n_kv) pass, so collecting a token's tail costs kpool lookups instead of a scan.
+    std::vector<int32_t> cell_of_pos;
 
     for (int64_t s = 0; s < n_ns; ++s) {
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
 
         const auto & cells = mem->get_mem_attn()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_pool  = dst_cell_pool + s*n_kv;
-        int32_t * cur_pool_cells = pool_cells_buf.data();
+        int32_t * cur_pool_cells = dst_pool_cells + s*r*n_pool;
 
         // pool b covers token positions [b*r, (b+1)*r). -1 = the cell has no usable pool.
-        std::fill(pool_of.begin(), pool_of.end(), -1);
-        std::fill(filled.begin(),  filled.end(),   0);
+        std::fill(pool_of.begin(),    pool_of.end(),    -1);
+        std::fill(filled.begin(),     filled.end(),      0);
+        std::fill(filled_seq.begin(), filled_seq.end(),  0);
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pool, 0);
+
+        // the tail of a token at position q spans [q - r + 1, q] at most
+        llama_pos q_min = ubatch->pos[s*n_tps];
+        llama_pos q_max = q_min;
+        for (int64_t ii = 1; ii < n_tps; ++ii) {
+            q_min = std::min(q_min, ubatch->pos[s*n_tps + ii]);
+            q_max = std::max(q_max, ubatch->pos[s*n_tps + ii]);
+        }
+
+        const llama_pos pos_base = std::max<llama_pos>(0, q_min - (llama_pos) r + 1);
+        const int64_t   pos_span = (int64_t) (q_max - pos_base) + 1;
+
+        cell_of_pos.assign((size_t) pos_span, -1);
 
         for (int64_t j = 0; j < n_kv; ++j) {
             if (cells.is_empty(j)) {
                 continue;
             }
 
-            const llama_pos p = cells.pos_get(j);
-            const int64_t   b = p/r;
+            const llama_pos p      = cells.pos_get(j);
+            const bool      in_seq = cells.seq_has(j, seq_of_stream);
+
+            if (in_seq && p >= pos_base && p - pos_base < (llama_pos) pos_span) {
+                cell_of_pos[p - pos_base] = (int32_t) j;
+            }
+
+            const int64_t b = p/r;
 
             if (b >= n_pool) {
                 continue;
@@ -598,6 +632,7 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
             pool_of[j] = (int32_t) b;
             cur_pool_cells[b*r + (p%r)] = (int32_t) j;
             filled[b]++;
+            filled_seq[b] += in_seq ? 1 : 0;
         }
 
         // an incomplete pool cannot be pooled: its cells are reachable only through the tail
@@ -636,13 +671,6 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
             }
         }
 
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (pool_of[j] >= 0 && filled[pool_of[j]] < (int32_t) r) {
-                pool_of[j] = -1;
-            }
-            cur_cell_pool[j] = pool_of[j] < 0 ? 0 : pool_of[j];
-        }
-
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -653,17 +681,38 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
             // trailing cells simply stay invisible.
             const llama_pos tail_start = select_tail ? (q + 1)/(llama_pos) r*(llama_pos) r : q + 1;
 
-            float * cur_bias = dst_bias + i*n_kv;
+            GGML_ASSERT(seq_id == seq_of_stream);
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                float v = -INFINITY;
+            // [TAG_KPOOL_POOL_TOPK] pool b covers positions [b*r, (b+1)*r). It is usable by this
+            // token exactly when it is complete, entirely this token's sequence, and lies wholly
+            // before the tail - then every member satisfies pos <= q and the per-cell test the
+            // old bias ran n_kv times collapses to one test per pool.
+            float * cur_bias = dst_bias + i*n_pool;
 
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    v = cells.pos_get(j) >= tail_start ? 1e9f : (pool_of[j] < 0 ? -INFINITY : 0.0f);
+            for (int64_t b = 0; b < n_pool; ++b) {
+                const bool ok = filled[b]     >= (int32_t) r &&
+                                filled_seq[b] >= (int32_t) r &&
+                                (llama_pos) ((b + 1)*r) <= tail_start;
+
+                cur_bias[b] = ok ? 0.0f : -INFINITY;
+            }
+
+            // the tail belongs to no complete pool, so it cannot be ranked - it is handed to the
+            // graph separately and concatenated onto the winners. Padding repeats cell 0, which
+            // the KQ mask masks again if it is not actually visible.
+            int32_t * cur_tail = dst_tail + i*r;
+            int64_t   n_tail   = 0;
+
+            for (llama_pos p = tail_start; p <= q && n_tail < r; ++p) {
+                const int64_t idx = (int64_t) (p - pos_base);
+
+                if (idx >= 0 && idx < (int64_t) cell_of_pos.size() && cell_of_pos[idx] >= 0) {
+                    cur_tail[n_tail++] = cell_of_pos[idx];
                 }
+            }
 
-                cur_bias[j] = v;
+            for (int64_t t = n_tail; t < r; ++t) {
+                cur_tail[t] = 0;
             }
         }
     }

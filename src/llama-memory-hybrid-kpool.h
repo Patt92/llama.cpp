@@ -202,9 +202,16 @@ public:
     uint32_t get_kpool() const { return kpool; }
 
     // host-side k-pool metadata for one ubatch, built from the attention cache cells:
-    //   cell_pool  I32 [n_kv, ns]            the pool a cell belongs to (0 when it has none)
     //   pool_cells I32 [kpool*n_pools, ns]   the cells making up each complete pool
-    //   bias       F32 [n_kv, n_tps, ns]     -INF invisible, +1e9 always-visible tail, 0 otherwise
+    //   bias       F32 [n_pools, n_tps, ns]  -INF for a pool this token cannot use, 0 otherwise
+    //   tail_cells I32 [kpool, n_tps, ns]    the incomplete trailing pool's cells, per token
+    //
+    // [TAG_KPOOL_POOL_TOPK] the bias and the selection are per pool, not per cell. All kpool
+    // members of a pool carry the same score, so ranking cells ranks kpool copies of the same
+    // number and the cut lands on a pool boundary regardless; selecting pools and expanding the
+    // winners through pool_cells is the same answer over a kpool-times narrower array. The
+    // incomplete tail has no pool and is appended to the selection rather than ranked into it,
+    // which is what the +1e9 tail bias used to accomplish.
     // a pool is a run of `kpool` consecutive token *positions*, so nothing here assumes the
     // cache is laid out contiguously. Cells of an incomplete pool cannot be pooled and are
     // reachable only through the tail bias. Pooling by position, not by cache order, differs
@@ -222,8 +229,9 @@ public:
     // twice and is idempotent. A stream with nothing to refresh writes to the scratch row
     // n_pool_max instead, which is never read back.
     void set_input_kpool(
-            ggml_tensor * cell_pool,
+            ggml_tensor * pool_cells,
             ggml_tensor * bias,
+            ggml_tensor * tail_cells,
             ggml_tensor * rec_pool_idx,
             ggml_tensor * rec_pool_cells,
             const llama_ubatch * ubatch) const;

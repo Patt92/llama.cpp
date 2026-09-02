@@ -640,7 +640,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(cell_pool, bias, rec_pool_idx, rec_pool_cells, ubatch);
+        mctx->set_input_kpool(pool_cells, bias, tail_cells, rec_pool_idx, rec_pool_cells, ubatch);
 
         // [TAG_KPOOL_KEY_CACHE] ape_slots is read only by the refresh branch. Filling an input
         // the graph never reads would trip GGML_ASSERT(buffer): the allocator leaves unread
@@ -661,9 +661,12 @@ public:
 
         bool res = true;
 
-        res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        res &= cell_pool->ne[0] == (int64_t) mctx_cur->get_idx()->get_n_kv();
-        res &= cell_pool->ne[1]*bias->ne[1] == params.ubatch.n_tokens;
+        const int64_t r = (int64_t) mctx_cur->get_kpool();
+
+        res &= k_idxs->ne[0] == params.ubatch.n_tokens;
+        res &= bias->ne[0]   == (int64_t) mctx_cur->get_idx()->get_n_kv()/r;
+        res &= pool_cells->ne[0] == r*bias->ne[0];
+        res &= pool_cells->ne[1]*bias->ne[1] == params.ubatch.n_tokens;
 
         // [TAG_KPOOL_KEY_CACHE] the refresh batch is sized from the pending count at build
         // time, so a graph built for fewer pools than are pending now must not be reused
@@ -674,8 +677,10 @@ public:
 
     ggml_tensor * k_idxs     = nullptr; // I64 [n_tokens]
     ggml_tensor * ape_slots  = nullptr; // I32 [kpool], the identity - reads the ape rows in order
-    ggml_tensor * cell_pool  = nullptr; // I32 [n_kv, n_stream]
-    ggml_tensor * bias       = nullptr; // F32 [n_kv, n_tokens/n_stream, n_stream]
+    // [TAG_KPOOL_POOL_TOPK] both the bias and the selection live at pool granularity
+    ggml_tensor * pool_cells = nullptr; // I32 [kpool*n_pool, n_stream]
+    ggml_tensor * bias       = nullptr; // F32 [n_pool, n_tokens/n_stream, n_stream]
+    ggml_tensor * tail_cells = nullptr; // I32 [kpool, n_tokens/n_stream, n_stream]
 
     // [TAG_KPOOL_KEY_CACHE] the pools whose keys this pass recomputes, and their member cells
     ggml_tensor * rec_pool_idx   = nullptr; // I32 [n_rec, n_stream]
@@ -708,8 +713,9 @@ llm_graph_input_kpool * llama_model_glm5next::graph::build_inp_kpool(llm_graph_i
     auto kp = std::make_unique<llm_graph_input_kpool>(inp_hyb->mctx);
 
     kp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    kp->cell_pool  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, ns);
-    kp->bias       = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tokens/ns, ns);
+    kp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_pool, ns);
+    kp->bias       = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pool,   n_tokens/ns, ns);
+    kp->tail_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r,        n_tokens/ns, ns);
 
     // [TAG_KPOOL_KEY_CACHE] size the refresh batch from what is actually pending. In steady
     // state that is one pool per kpool tokens of the ubatch; it only spikes to the whole
@@ -726,8 +732,9 @@ llm_graph_input_kpool * llama_model_glm5next::graph::build_inp_kpool(llm_graph_i
         ggml_set_input(kp->rec_pool_cells);
     }
 
-    ggml_set_input(kp->cell_pool);
+    ggml_set_input(kp->pool_cells);
     ggml_set_input(kp->bias);
+    ggml_set_input(kp->tail_cells);
 
     return (llm_graph_input_kpool *) res->add_input(std::move(kp));
 }
@@ -740,9 +747,9 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_top_k(
     const int64_t d      = hparams.indexer_head_size;
     const int64_t nh     = hparams.indexer_n_head;
     const int64_t r      = hparams.indexer_block_size;
-    const int64_t n_kv   = inp->cell_pool->ne[0];
-    const int64_t ns     = inp->cell_pool->ne[1];
-    const int64_t n_pool = n_kv/r;
+    const int64_t n_pool = inp->bias->ne[0];
+    const int64_t ns     = inp->pool_cells->ne[1];
+    const int64_t n_kv   = (int64_t) mctx_idx->get_n_kv();
     const int64_t n_tps  = n_tokens/ns;
 
     // key and gate logits packed into one cache row: the gate depends on the token hidden
@@ -826,19 +833,32 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_top_k(
     score = ggml_reshape_3d(ctx0, score, n_pool, n_tps, ns);
     cb(score, "indexer_score", il);
 
-    // give every cell of a pool its pool's score rather than expanding pool ids into cell ids,
-    // which would need an integer multiply-add ggml has no op for. The r members tie, so the
-    // cut still lands on a pool boundary. bias carries causality and the always-visible tail.
-    ggml_tensor * expanded = ggml_get_rows(ctx0,
-            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_pool);
-    expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-    expanded = ggml_add(ctx0, expanded, inp->bias);
-    cb(expanded, "indexer_score_cells", il);
+    // [TAG_KPOOL_POOL_TOPK] rank pools, not cells. The r members of a pool all carry this same
+    // score, so expanding to cells first only made every number appear r times - the ranking and
+    // the cut are identical either way, over an r-times narrower array. Doing it here removes
+    // the [n_kv, n_tokens] score, its two permute copies and the [n_kv, n_tokens] bias from the
+    // graph; at 262k context and a 2048-token ubatch each of those was 2.1 GB of compute buffer.
+    score = ggml_add(ctx0, score, inp->bias);
+    cb(score, "indexer_score_pools", il);
 
-    // index_topk cells plus the incomplete tail, as in the reference
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+    const int64_t n_sel = std::min<int64_t>(n_pool, ((int64_t) hparams.indexer_top_k + r - 1)/r);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    ggml_tensor * top_pools = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_sel));
+
+    // expand the winning pools through the pool -> cells table. get_rows keeps I32 as I32 and
+    // gathers per channel, so stream s only ever reads stream s's table.
+    ggml_tensor * table = ggml_reshape_3d(ctx0, inp->pool_cells, r, n_pool, ns);
+    ggml_tensor * idx   = ggml_reshape_2d(ctx0, top_pools, n_sel*n_tps, ns);
+
+    ggml_tensor * cells = ggml_get_rows(ctx0, table, idx);
+    cells = ggml_reshape_3d(ctx0, cells, r*n_sel, n_tps, ns);
+
+    // the incomplete tail belongs to no pool and so cannot be ranked - it is appended, which is
+    // what the +1e9 tail bias used to buy. Duplicates and padding are harmless: the consumer
+    // only clears mask entries, and adds the real KQ mask back afterwards.
+    ggml_tensor * top_k = ggml_concat(ctx0, cells, inp->tail_cells, 0);
+
+    const int64_t width = top_k->ne[0];
 
     // build_attn_mask_top_k reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, ns);
