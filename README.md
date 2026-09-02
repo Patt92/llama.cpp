@@ -207,6 +207,31 @@ prompt throughput; measure identical prompts and cache state before and after th
 build. Set `GGML_CUDA_DISABLE_DSV4_SPARSE_FA=1` in the `llama-server` environment to
 force the previous dense path for an A/B comparison without rebuilding.
 
+### glm5next indexer: pool-level selection
+
+The Lightning Indexer scores pools of `kpool` cells and then picks `index_topk` cells for
+the sparse attention to read. Upstream's shape for this expands every pool score to its
+`kpool` member cells before ranking them, which means the ranking sorts `kpool` copies of
+each number and the cut lands on a pool boundary regardless.
+
+`[TAG_KPOOL_POOL_TOPK]` ranks the pools directly and expands only the winners through a
+pool-to-cells table. The selection is the same set - the old width of `index_topk + kpool
+- 1` cells was `index_topk/kpool` complete pools plus the incomplete tail - but the
+`[n_kv, n_tokens]` score array, its two permute/cont copies and the `[n_kv, n_tokens]`
+bias all leave the graph. At a 262144 context and a 2048-token ubatch each of those was
+2.1 GB of compute buffer per indexer layer.
+
+This matters twice over on a memory-tight split. The compute buffer is reserved for the
+worst case `n_kv`, so it scales as `ctx-size` times `ubatch-size` whatever the actual
+context; that product, not the KV cache, is usually what caps `--ubatch-size`. And a
+larger ubatch is the main lever on MoE prefill throughput, because every ubatch reads
+essentially the whole expert set once regardless of how many tokens it carries.
+
+The tail is the one behavioural difference. It belongs to no complete pool and so cannot
+be ranked; it is concatenated onto the winners instead of being forced to the top with a
+`+1e9` bias. Over-selection stays harmless because `build_attn_mask_top_k` only clears
+mask entries and adds the real KQ mask back afterwards.
+
 ### RPC worker aborts and backend fusion
 
 An RPC worker running this branch can abort inside the CUDA/HIP backend with
