@@ -20,7 +20,7 @@
 ## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`0eadefebd3f8f92a86d634a0e5b8fffc9dc792c0`](https://github.com/ggml-org/llama.cpp/commit/0eadefebd3f8f92a86d634a0e5b8fffc9dc792c0).
+[`b81c99b479d4c24e5eeca10de99032ebd343ef8f`](https://github.com/ggml-org/llama.cpp/commit/b81c99b479d4c24e5eeca10de99032ebd343ef8f).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
@@ -197,6 +197,49 @@ prompt throughput; measure identical prompts and cache state before and after th
 build. Set `GGML_CUDA_DISABLE_DSV4_SPARSE_FA=1` in the `llama-server` environment to
 force the previous dense path for an A/B comparison without rebuilding.
 
+### RPC worker aborts and backend fusion
+
+An RPC worker running this branch can abort inside the CUDA/HIP backend with
+
+```
+ggml/src/ggml-cuda/mmvq.cu: GGML_ASSERT(ids || dst->ne[1] == 1) failed
+  ggml_cuda_mul_mat_vec_q
+  ggml_backend_graph_compute
+  rpc_server::graph_compute
+```
+
+systemd reports `code=dumped, status=6/ABRT` and restarts the worker, so the symptom on
+the client is `recv failed (bytes_recv=0)` followed by `Remote RPC server crashed or
+returned malformed response`. The host itself keeps running, which makes this look like
+a network fault rather than a compute fault.
+
+That assert sits **inside** the `if (fusion)` precondition block, so it is unreachable
+when backend fusion is off. Setting
+
+```sh
+GGML_CUDA_DISABLE_FUSION=1
+```
+
+in the worker's environment (for example an `EnvironmentFile` referenced by the systemd
+unit) removes the abort by construction. The remote node then computes the same graph
+without fused epilogues, which costs some throughput on that node only - the host keeps
+its own fusion. Because the switch is decisive rather than cosmetic, it doubles as the
+A/B: if the aborts stop, a fusion group is at fault; if they continue, they are not.
+
+This is **not** the same defect as the multi-token `MUL_MAT_ID` fusion tracked in
+upstream issue #28113 and held back here by `[TAG_MMID_FUSION_ONE_TOKEN_HIP]`. The two
+asserts are adjacent but cover different operations:
+
+```c
+GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(...));  // #28113, MUL_MAT_ID
+GGML_ASSERT(  ids || dst->ne[1] == 1);                             // this abort, plain MUL_MAT
+```
+
+`#28113` is the multi-token expert path and produces garbage tokens rather than an
+abort; the hold-back in this fork only gates `GGML_OP_MUL_MAT_ID` and therefore does
+nothing for the case above. Both are failures of *which nodes get fused* rather than of
+the kernels that compute them, so they are likely related, but they are two defects.
+
 ### Recommended `llama-server` profiles for Qwen3.8-27B
 
 FastMTP improves token generation only when the compact draft predicts target tokens
@@ -289,9 +332,10 @@ not a correctness fix.
   soak test, `--ctx-checkpoints 0` remains a useful conservative comparison rather
   than a permanent requirement.
 - The fork keeps decode and small speculative-verification MMVQ/Flash-Attention launch
-  shapes consistent on gfx1151. If output is correct locally but corrupt over RPC,
-  set `GGML_CUDA_DISABLE_FUSION=1` in the RPC worker environment for an A/B run. RPC
-  5.1 can execute backend fusions remotely that older RPC builds never reached.
+  shapes consistent on gfx1151. If output is correct locally but corrupt over RPC, set
+  `GGML_CUDA_DISABLE_FUSION=1` in the RPC worker environment for an A/B run. RPC 5.1 can
+  execute backend fusions remotely that older RPC builds never reached. The same switch
+  addresses worker aborts - see "RPC worker aborts and backend fusion" above.
 - `--batch-size` and `--ubatch-size` primarily affect throughput and memory pressure;
   they are not correctness switches for committed speculative tokens. Change them
   only after the no-draft and single-drafter comparisons are clean.
@@ -345,7 +389,7 @@ producing a silently mismatched tree.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 0eadefebd3f8f92a86d634a0e5b8fffc9dc792c0
+git checkout b81c99b479d4c24e5eeca10de99032ebd343ef8f
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
