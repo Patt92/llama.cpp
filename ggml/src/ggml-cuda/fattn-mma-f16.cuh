@@ -1894,8 +1894,12 @@ static __global__ void flash_attn_ext_f16(
 
             constexpr bool needs_fixup = false;
             constexpr bool is_fixup = false;
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, 1.0f, logit_softcap,
+            // upstream 8e93a9773 gave process_tile a use_sparse template parameter and an
+            // `indices` argument. This branch is inside #if defined(GGML_USE_HIP), where the
+            // dispatch never instantiates use_sparse=true, and `indices` is only formed further
+            // down (line ~1934), so nullptr is the correct and only reachable value here.
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+                (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, dst_meta, scale, 1.0f, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, 0, kb0_stop);
         }
         return;
