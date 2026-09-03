@@ -19,14 +19,31 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-This branch is rebased directly on the current upstream `llama.cpp` master and intentionally keeps upstream ROCm, fusion, Qwen, and Ornith code paths intact. The sole HIP/RPC divergence is a targeted hipCUB argsort/top-k enablement required for RPC-based MoE routing on current ROCm.
+Based on upstream llama.cpp commit [`42f0225fea945b24e92a0ce716e59b7c13e9b819`](https://github.com/ggml-org/llama.cpp/commit/42f0225fea945b24e92a0ce716e59b7c13e9b819).
 
-- Adds isolated `glm5next` / GLM-5.3-Flash text inference, including its hybrid KDA/MLA memory layout, KPool sparse-indexer cache, and NextN/MTP draft context.
+This branch is rebased directly on the current upstream `llama.cpp` master and intentionally keeps upstream ROCm, fusion, Qwen, and Ornith code paths intact. Its HIP/RPC changes are limited to scoped hipCUB argsort support and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
+
+- Adds isolated `glm5next` / GLM-5.3-Flash text inference, including its hybrid KDA/MLA memory layout and NextN/MTP draft context.
+- Keeps completed GLM indexer pool keys in a persistent cache instead of rebuilding the entire context on every pass.
+- Ranks GLM indexer pools before expanding the selected pools to cells, removing several context-by-ubatch intermediates from the graph.
+- Keeps both mathematically equivalent GLM indexer scorers. HIP defaults to the regular GPU matmul graph because llama.cpp currently has no rocWMMA Lightning Indexer implementation and its generic vector kernel regresses gfx1151 throughput; set `LLAMA_GLM5NEXT_FUSED_LID=1` for an explicit A/B test. Other backends retain the normal fused selection.
 - Adds GLM-5.3-Flash MMProj support, including its vision-specific clamped SwiGLU tower.
 - The GLM-specific hyper-connection fused nodes are retained because they keep GLM graph reservation tractable; no global fusion policy or backend dispatcher is replaced.
-- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort/top-k.
+- Adds `ggml_flash_attn_ext_add_top_k`, an explicit-index counterpart to upstream's mask-derived `ggml_flash_attn_ext_set_n_kv_max`. Upstream's sparse selection is CUDA-only - `ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse` returns false on HIP and MUSA - so on those backends attention reads every KV column even where the caller already knows which few matter. The new call takes the indices directly, on `src[5]` and op_params slot 5, both previously unused; the two APIs are independent and one graph may carry both. No backend reads it yet, so this is API and graph plumbing only and changes nothing on its own.
+- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
+- Keeps multi-backend graph split boundaries fixed across requests to avoid growing RPC compute-buffer peaks under pipeline parallelism.
 
 The port is architecture-gated: it does not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
+
+### Applying the standalone patch
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git checkout 42f0225fea945b24e92a0ce716e59b7c13e9b819
+git apply --check /path/to/rocm-halo-strix.patch
+git apply /path/to/rocm-halo-strix.patch
+```
 
 ## Quick start
 
