@@ -5526,7 +5526,13 @@ void ggml_flash_attn_ext_add_top_k(
     GGML_ASSERT(top_k->ne[1] == a->src[0]->ne[1]);
     GGML_ASSERT(top_k->ne[3] == a->src[0]->ne[3]);
     GGML_ASSERT(n_kv_raw >= 0 && n_kv_raw <= a->src[1]->ne[1]);
-    GGML_ASSERT(top_k->ne[0] > 0 && top_k->ne[0] <= a->src[1]->ne[1] - n_kv_raw);
+    GGML_ASSERT(top_k->ne[0] > 0);
+
+    // Deliberately no upper bound on top_k->ne[0]. The index list is allowed to be wider than
+    // the cache: a selector that works on fixed-size groups pads the last group and may repeat
+    // an index, and a consumer only ever clears mask entries, so duplicates and padding are
+    // harmless. GLM-5.3-Flash hits this on the very first decode, where the pool selector
+    // rounds 512 cache rows up to 516 indices.
 
     a->src[5] = top_k;
     ggml_set_op_params_i32(a, 5, (int32_t) n_kv_raw);
