@@ -2459,6 +2459,27 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Indexed sparse attention: name the KV columns to attend to explicitly, instead of
+    // deriving them from the mask as ggml_flash_attn_ext_set_n_kv_max does.
+    //
+    //   top_k:    [n_top_k, n_batch, 1, n_stream] I32, indices into the K/V rows
+    //   n_kv_raw: length of the dense prefix that is always attended, ahead of the indices
+    //
+    // A backend that ignores src[5] computes the same result from the mask alone, so this is
+    // additive: it lets a backend skip masked-out columns rather than change what they
+    // contribute. The two APIs are independent and use different op_params slots, so one
+    // graph may carry both.
+    GGML_API void ggml_flash_attn_ext_add_top_k(
+            struct ggml_tensor * a,
+            struct ggml_tensor * top_k,
+            int64_t              n_kv_raw);
+
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_top_k(
+            const struct ggml_tensor * a);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_n_kv_raw(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

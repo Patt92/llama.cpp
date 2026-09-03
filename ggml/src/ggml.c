@@ -5515,6 +5515,37 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_add_top_k(
+        struct ggml_tensor * a,
+        struct ggml_tensor * top_k,
+                 int64_t     n_kv_raw) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(top_k));
+    GGML_ASSERT(top_k->ne[1] == a->src[0]->ne[1]);
+    GGML_ASSERT(top_k->ne[3] == a->src[0]->ne[3]);
+    GGML_ASSERT(n_kv_raw >= 0 && n_kv_raw <= a->src[1]->ne[1]);
+    GGML_ASSERT(top_k->ne[0] > 0 && top_k->ne[0] <= a->src[1]->ne[1] - n_kv_raw);
+
+    a->src[5] = top_k;
+    ggml_set_op_params_i32(a, 5, (int32_t) n_kv_raw);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_get_top_k(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return a->src[5];
+}
+
+int32_t ggml_flash_attn_ext_get_n_kv_raw(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return a->src[5] ? ggml_get_op_params_i32(a, 5) : 0;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
