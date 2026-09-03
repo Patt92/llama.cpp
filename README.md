@@ -17,6 +17,17 @@
 
 </div>
 
+## Patt92 ROCm Halo Strix additions
+
+This branch is rebased directly on the current upstream `llama.cpp` master and intentionally keeps upstream ROCm, fusion, Qwen, and Ornith code paths intact. The sole HIP/RPC divergence is a targeted hipCUB argsort/top-k enablement required for RPC-based MoE routing on current ROCm.
+
+- Adds isolated `glm5next` / GLM-5.3-Flash text inference, including its hybrid KDA/MLA memory layout, KPool sparse-indexer cache, and NextN/MTP draft context.
+- Adds GLM-5.3-Flash MMProj support, including its vision-specific clamped SwiGLU tower.
+- The GLM-specific hyper-connection fused nodes are retained because they keep GLM graph reservation tractable; no global fusion policy or backend dispatcher is replaced.
+- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort/top-k.
+
+The port is architecture-gated: it does not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

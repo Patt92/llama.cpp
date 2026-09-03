@@ -30,6 +30,7 @@ class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
+class llama_memory_hybrid_kpool_context;
 class llama_memory_hybrid_iswa_context;
 
 // certain models (typically multi-modal) can produce different types of graphs
@@ -713,6 +714,31 @@ public:
     const llama_memory_hybrid_context * mctx;
 };
 
+// GLM5Next owns a separate KPool indexer cache in addition to its K-only
+// attention cache and recurrent state. This is intentionally distinct from
+// the Qwen4Exp hybrid-indexer input type.
+class llm_graph_input_mem_hybrid_kpool : public llm_graph_input_i {
+public:
+    llm_graph_input_mem_hybrid_kpool(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_k> inp_attn,
+            std::unique_ptr<llm_graph_input_rs> inp_rs,
+            const llama_memory_hybrid_kpool_context * mctx) :
+        inp_attn(std::move(inp_attn)), inp_rs(std::move(inp_rs)), cparams(cparams), mctx(mctx) { }
+    ~llm_graph_input_mem_hybrid_kpool() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_attn_k * get_attn() const { return inp_attn.get(); }
+    llm_graph_input_rs * get_recr() const { return inp_rs.get(); }
+
+    std::unique_ptr<llm_graph_input_attn_k> inp_attn;
+    std::unique_ptr<llm_graph_input_rs> inp_rs;
+    const llama_cparams cparams;
+    const llama_memory_hybrid_kpool_context * mctx;
+};
+
 class llm_graph_input_mem_hybrid_iswa : public llm_graph_input_i {
 public:
     llm_graph_input_mem_hybrid_iswa(
@@ -1342,6 +1368,7 @@ struct llm_graph_context {
 
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
+    llm_graph_input_mem_hybrid_kpool * build_inp_mem_hybrid_kpool() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
 

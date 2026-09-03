@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-kpool.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -202,6 +203,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
+        case LLM_ARCH_GLM5NEXT:
+            return new llama_model_glm5next(params);
         case LLM_ARCH_MISTRAL4:
             return new llama_model_mistral4(params);
         case LLM_ARCH_CHATGLM:
@@ -2419,6 +2422,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr);
                 }
             } break;
+        case LLM_ARCH_GLM5NEXT:
+            {
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                    llama_kv_cache::layer_filter_cb filter_mtp =
+                        [&](int32_t il) { return il >= (int32_t) hparams.n_layer(); };
+                    res = new llama_kv_cache(
+                            *this, hparams, params.type_k, params.type_v, !cparams.flash_attn,
+                            cparams.offload_kqv, cparams.kv_unified, cparams.n_ctx_seq,
+                            cparams.n_seq_max, 1, hparams.n_swa, hparams.swa_type,
+                            nullptr, filter_mtp, nullptr, nullptr);
+                    break;
+                }
+
+                llama_memory_hybrid_kpool::layer_filter_cb filter_recr =
+                    [&](int32_t il) { return (uint32_t) il < hparams.n_layer() && hparams.is_recr(il); };
+                llama_memory_hybrid_kpool::layer_filter_cb filter_attn =
+                    [&](int32_t il) { return (uint32_t) il < hparams.n_layer() && !hparams.is_recr(il); };
+                llama_memory_hybrid_kpool::layer_filter_cb filter_idx = nullptr;
+                if (hparams.indexer_head_size > 0 && hparams.indexer_block_size > 0) {
+                    filter_idx = [&](int32_t il) {
+                        return (uint32_t) il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                    };
+                }
+
+                GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE);
+                res = new llama_memory_hybrid_kpool(
+                        *this, params.type_k, params.type_v, !cparams.flash_attn,
+                        cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
+                        GGML_TYPE_F32, GGML_TYPE_F32, std::max((uint32_t) 1, cparams.n_seq_max),
+                        2*hparams.indexer_head_size, hparams.indexer_block_size, true,
+                        cparams.n_seq_max, cparams.n_rs_seq, cparams.offload_kqv, cparams.kv_unified,
+                        std::move(filter_attn), std::move(filter_recr), std::move(filter_idx));
+            } break;
         case LLM_ARCH_DFLASH:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
@@ -2837,6 +2873,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5NEXT:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

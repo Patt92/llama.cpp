@@ -13,6 +13,7 @@
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-kpool.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -1173,6 +1174,35 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
+    return res;
+}
+
+void llm_graph_input_mem_hybrid_kpool::set_input(const llama_ubatch * ubatch) {
+    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+    const int64_t n_rs = mctx->get_recr()->get_n_rs();
+    if (inp_rs->s_copy) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+        auto * data = (int32_t *) inp_rs->s_copy->data;
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->get_recr()->s_copy(i);
+        }
+    }
+}
+
+bool llm_graph_input_mem_hybrid_kpool::can_reuse(const llm_graph_params & params) {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_kpool_context *>(params.mctx);
+    mctx = mctx_cur;
+
+    bool res = true;
+    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx_cur->get_attn(), params.ubatch, params.cparams);
+    res &= inp_rs->s_copy->ne[0] == mctx_cur->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_extra->ne[0] == mctx_cur->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+    res &= inp_rs->head == mctx_cur->get_recr()->get_head();
+    res &= inp_rs->rs_z == mctx_cur->get_recr()->get_rs_z();
     return res;
 }
 
@@ -3548,6 +3578,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_mem_hybrid_kpool * llm_graph_context::build_inp_mem_hybrid_kpool() const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_kpool_context *>(mctx);
+    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_kpool>(
+            cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    return (llm_graph_input_mem_hybrid_kpool *) res->add_input(std::move(inp));
 }
 
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {

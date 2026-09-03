@@ -5458,7 +5458,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->ne[0] <= 1024;
 #endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
         case GGML_OP_ARGSORT:
-#ifndef GGML_CUDA_USE_CUB
+#if !defined(GGML_CUDA_USE_CUB) && !defined(GGML_HIP_USE_CUB_ARGSORT)
             return op->src[0]->ne[0] <= 1024;
 #else
             return true;

@@ -10,6 +10,21 @@
 #include <rccl/rccl.h>
 #endif // GGML_USE_NCCL
 
+// rocPRIM before 4.4.0 has a broken segmented-sort implementation for the
+// argument shapes used by llama.cpp. Newer ROCm releases provide hipCUB,
+// which lets the RPC backend execute the required argsort/top-k operations.
+#if HIP_VERSION >= 60100000
+#include <rocprim/rocprim_version.hpp>
+#if defined(ROCPRIM_VERSION) && (ROCPRIM_VERSION >= 400400)
+// Keep this deliberately scoped to RPC argsort/top-k. Upstream uses
+// GGML_CUDA_USE_CUB for additional CUDA-only operators (for example cumsum),
+// which must not be enabled merely because hipCUB is available.
+#define GGML_HIP_USE_CUB_ARGSORT
+#include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#endif
+#endif
+
 
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
@@ -139,6 +154,9 @@
 #define cudaGraphExecUpdate hipGraphExecUpdate
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
 #define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaGraph_t hipGraph_t
 #define cudaStream_t hipStream_t
 #define cudaSuccess hipSuccess
