@@ -2617,7 +2617,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // Indexed sparse attention. Purely additive to the mask: a backend that does not read
         // src[5] produces the same result, so this is safe to attach unconditionally wherever
         // the caller actually has the indices.
-        if (top_k) {
+        //
+        // LLAMA_ATTN_TOPK_HINT=0 leaves the hint off entirely. No backend reads it yet, but
+        // attaching it still makes the attention node depend on the index tensor, which the
+        // scheduler and graph-reuse logic do see - so this exists to A/B that in one run
+        // instead of arguing about it.
+        static const bool topk_hint = [] {
+            const char * env = getenv("LLAMA_ATTN_TOPK_HINT");
+            return env == nullptr || strcmp(env, "0") != 0;
+        }();
+
+        if (top_k && topk_hint) {
             ggml_flash_attn_ext_add_top_k(cur, top_k, n_kv_raw);
         }
 
