@@ -537,7 +537,7 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
     GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(tail_cells->buffer));
     GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
-    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F16 || bias->type == GGML_TYPE_F32);
     GGML_ASSERT(tail_cells->type == GGML_TYPE_I32);
 
     // [TAG_KPOOL_KEY_CACHE] both refresh inputs exist together or not at all
@@ -566,7 +566,8 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
     const int64_t n_tps = ubatch->n_tokens/n_ns;
 
     int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
-    float   * dst_bias       = (float   *) bias->data;
+    const bool bias_f16      = bias->type == GGML_TYPE_F16;
+    char    * dst_bias       = (char *) bias->data;
     int32_t * dst_tail       = (int32_t *) tail_cells->data;
 
     // [TAG_KPOOL_POOL_TOPK] the pool -> cells map is a graph input again: the selection now
@@ -687,14 +688,19 @@ void llama_memory_hybrid_kpool_context::set_input_kpool(
             // token exactly when it is complete, entirely this token's sequence, and lies wholly
             // before the tail - then every member satisfies pos <= q and the per-cell test the
             // old bias ran n_kv times collapses to one test per pool.
-            float * cur_bias = dst_bias + i*n_pool;
+            char * cur_bias = dst_bias + i*n_pool*(bias_f16 ? sizeof(ggml_fp16_t) : sizeof(float));
 
             for (int64_t b = 0; b < n_pool; ++b) {
                 const bool ok = filled[b]     >= (int32_t) r &&
                                 filled_seq[b] >= (int32_t) r &&
                                 (llama_pos) ((b + 1)*r) <= tail_start;
 
-                cur_bias[b] = ok ? 0.0f : -INFINITY;
+                const float v = ok ? 0.0f : -INFINITY;
+                if (bias_f16) {
+                    ((ggml_fp16_t *) cur_bias)[b] = ggml_fp32_to_fp16(v);
+                } else {
+                    ((float *) cur_bias)[b] = v;
+                }
             }
 
             // the tail belongs to no complete pool, so it cannot be ranked - it is handed to the

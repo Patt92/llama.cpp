@@ -714,7 +714,11 @@ llm_graph_input_kpool * llama_model_glm5next::graph::build_inp_kpool(llm_graph_i
 
     kp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     kp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_pool, ns);
-    kp->bias       = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pool,   n_tokens/ns, ns);
+    // [TAG_KPOOL_FUSED_INDEXER] the bias is the fused indexer's mask argument, which must be
+    // F16; the unfused fallback adds it to an F32 score instead. Same coupling llama-graph.cpp
+    // applies to the deepseek4 lid mask.
+    kp->bias       = ggml_new_tensor_3d(ctx0,
+            cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32, n_pool, n_tokens/ns, ns);
     kp->tail_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r,        n_tokens/ns, ns);
 
     // [TAG_KPOOL_KEY_CACHE] size the refresh batch from what is actually pending. In steady
@@ -809,27 +813,51 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_top_k(
         cache_3d = ggml_set_rows(ctx0, cache_3d, fresh, inp->rec_pool_idx);
     }
 
-    ggml_tensor * pooled = ggml_view_3d(ctx0, cache_3d, d, n_pool, ns,
-            cache_3d->nb[1], cache_3d->nb[2], 0);
-    cb(pooled, "indexer_k_pooled", il);
-
     // nope-only: no rope on the indexer query either. mul_mat matches ne[2], so stream s's
     // queries only meet stream s's pools.
     ggml_tensor * q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
-    q = ggml_reshape_3d(ctx0, q, d, nh*n_tps, ns);
+    q = ggml_reshape_4d(ctx0, q, d, nh, n_tps, ns);
     cb(q, "indexer_q", il);
-
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled, q);
-    score = ggml_relu(ctx0, ggml_reshape_4d(ctx0, score, n_pool, nh, n_tps, ns));
 
     // relu(x*s) == s*relu(x) for s > 0, so both positive scalars (the softmax scale and
     // n_heads^-1/2) fold into the small weights tensor instead of the big score one
     ggml_tensor * wts = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
     wts = ggml_scale(ctx0, wts, 1.0f/sqrtf(float(d*nh)));
-    wts = ggml_reshape_4d(ctx0, wts, nh, 1, n_tps, ns);
+    wts = ggml_reshape_4d(ctx0, wts, nh, n_tps, 1, ns);
 
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, wts));
+    // [TAG_KPOOL_FUSED_INDEXER] every other DSA model in this tree scores through
+    // ggml_lightning_indexer; glm5next was the one still assembling it from primitives. The
+    // fused op computes exactly the same thing - sum_h max(q_h.k, 0)*w_h, plus the mask - but
+    // never materializes the per-head score. That intermediate was [n_pool, nh, n_tps, ns],
+    // which at 29k context and a 2048-token ubatch is 1.9 GB per layer, written by the matmul
+    // and then walked four more times by relu, a permuted copy, the weighting and sum_rows.
+    // The permuted copy alone moved as much memory as the whole matmul read.
+    ggml_tensor * score = nullptr;
+
+    if (cparams.fused_lid) {
+        ggml_tensor * k_pool = ggml_view_4d(ctx0, cache_3d, d, 1, n_pool, ns,
+                cache_3d->nb[1], cache_3d->nb[1], cache_3d->nb[2], 0);
+
+        score = ggml_lightning_indexer(ctx0, q, k_pool, wts, inp->bias);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        // unfused fallback, kept for the same reason deepseek4 keeps one: the probe drops the
+        // fused op when a backend in the split cannot run it, and running it off-device is
+        // slower than this path. Same arithmetic, materialized.
+        ggml_tensor * pooled = ggml_view_3d(ctx0, cache_3d, d, n_pool, ns,
+                cache_3d->nb[1], cache_3d->nb[2], 0);
+        cb(pooled, "indexer_k_pooled", il);
+
+        score = ggml_mul_mat(ctx0, pooled, ggml_reshape_3d(ctx0, q, d, nh*n_tps, ns));
+        score = ggml_relu(ctx0, ggml_reshape_4d(ctx0, score, n_pool, nh, n_tps, ns));
+
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+        score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score,
+                    ggml_reshape_4d(ctx0, wts, nh, 1, n_tps, ns)));
+        score = ggml_reshape_3d(ctx0, score, n_pool, n_tps, ns);
+        score = ggml_add(ctx0, score, inp->bias);
+    }
+
     score = ggml_reshape_3d(ctx0, score, n_pool, n_tps, ns);
     cb(score, "indexer_score", il);
 
@@ -838,9 +866,6 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_top_k(
     // the cut are identical either way, over an r-times narrower array. Doing it here removes
     // the [n_kv, n_tokens] score, its two permute copies and the [n_kv, n_tokens] bias from the
     // graph; at 262k context and a 2048-token ubatch each of those was 2.1 GB of compute buffer.
-    score = ggml_add(ctx0, score, inp->bias);
-    cb(score, "indexer_score_pools", il);
-
     const int64_t n_sel = std::min<int64_t>(n_pool, ((int64_t) hparams.indexer_top_k + r - 1)/r);
 
     ggml_tensor * top_pools = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_sel));
