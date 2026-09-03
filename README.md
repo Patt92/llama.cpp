@@ -20,11 +20,19 @@
 ## Patt92 ROCm / Strix Halo fork
 
 This branch is based on upstream llama.cpp commit
-[`f027c4f1b025e05d6a2fc3b741047bda07b85ef7`](https://github.com/ggml-org/llama.cpp/commit/f027c4f1b025e05d6a2fc3b741047bda07b85ef7).
+[`0df017d6dd246edb1d06577976c759cf7a3c50d6`](https://github.com/ggml-org/llama.cpp/commit/0df017d6dd246edb1d06577976c759cf7a3c50d6).
 It is a self-contained cumulative ROCm/HIP optimization branch for AMD Strix Halo
 (`gfx1151` / RDNA3.5): it does not depend on the continued existence of any earlier
 optimization branch. It retains normal upstream functionality, but is not intended to
 replace the portable default upstream build.
+
+### Deliberate exclusion: fork-owned fusion dispatch
+
+The branch keeps current upstream CUDA/HIP fusion behaviour unchanged. Its old
+fork-owned Q8.1, MoE, shared-expert and SSM fusion dispatcher blocks are deliberately
+absent, as is the HIP-only one-token `MUL_MAT_ID` fusion restriction. This avoids
+changing which graph nodes upstream decides to fuse while retaining the separate,
+gfx1151-specific kernel and routing tunings below.
 
 ### Included changes relative to upstream
 
@@ -52,9 +60,6 @@ replace the portable default upstream build.
   set; decode, small verification batches and short contexts retain the existing path.
 - Keeps the Lightning Indexer key cache in F16 when a quantized KV cache is selected,
   where required by the DeepSeek path.
-- Resolves fused operations per layer and device instead of disabling an entire graph
-  on a single ROCm/RPC backend mismatch; the default fallback remains unfused GPU work,
-  not CPU work.
 - Restores a fixed scheduler split-input cut-off after a dynamically grown split buffer.
   This prevents cross-backend input copies from remaining live across ever-larger graph
   regions in controller-plus-RPC layouts.
@@ -160,21 +165,9 @@ replace the portable default upstream build.
   and serializes that state with context checkpoints. This addresses the inter-request
   state leak tracked by upstream issue #26425 without discarding valid cached-prefix
   state.
-- Keeps fused DeepSeek-V4 HC and Gated Delta Net operations on devices that support
-  them while safely falling back only for mismatching layers.
 
 #### Qwen3.5 / Qwen3.8 and hybrid SSM models
 
-- Fuses SSM gate/beta projections, the SSM convolution-output L2 norm, and the SSM
-  pre-scan chain (convolution, L2 norm, gate/beta).
-- Folds SSM convolution-input concatenation into QKV MMVQ and fuses paired MMVQ
-  matmuls that share an activation.
-- Caches graph-local Q8_1 matmul inputs, folds Q8_1 quantization into RMS norm and
-  gating-MUL, and fuses a matmul-plus-add-through-view sequence.
-- Folds MoE top-k weights into the down projection and fuses the shared-expert output
-  chain.
-- Fuses IMRoPE and set-rows for BF16 KV cache use, and aligns the attention-gate
-  tensor-parallel split with attention-Q.
 - Builds the recurrent Qwen3.5-MoE attention result into the graph before the
   Gated Delta Net state update, preserving the required execution order.
 - Capability-gates DFlash2 activation against the graph that is actually built: an
@@ -260,49 +253,6 @@ The tail is the one behavioural difference. It belongs to no complete pool and s
 be ranked; it is concatenated onto the winners instead of being forced to the top with a
 `+1e9` bias. Over-selection stays harmless because `build_attn_mask_top_k` only clears
 mask entries and adds the real KQ mask back afterwards.
-
-### RPC worker aborts and backend fusion
-
-An RPC worker running this branch can abort inside the CUDA/HIP backend with
-
-```
-ggml/src/ggml-cuda/mmvq.cu: GGML_ASSERT(ids || dst->ne[1] == 1) failed
-  ggml_cuda_mul_mat_vec_q
-  ggml_backend_graph_compute
-  rpc_server::graph_compute
-```
-
-systemd reports `code=dumped, status=6/ABRT` and restarts the worker, so the symptom on
-the client is `recv failed (bytes_recv=0)` followed by `Remote RPC server crashed or
-returned malformed response`. The host itself keeps running, which makes this look like
-a network fault rather than a compute fault.
-
-That assert sits **inside** the `if (fusion)` precondition block, so it is unreachable
-when backend fusion is off. Setting
-
-```sh
-GGML_CUDA_DISABLE_FUSION=1
-```
-
-in the worker's environment (for example an `EnvironmentFile` referenced by the systemd
-unit) removes the abort by construction. The remote node then computes the same graph
-without fused epilogues, which costs some throughput on that node only - the host keeps
-its own fusion. Because the switch is decisive rather than cosmetic, it doubles as the
-A/B: if the aborts stop, a fusion group is at fault; if they continue, they are not.
-
-This is **not** the same defect as the multi-token `MUL_MAT_ID` fusion tracked in
-upstream issue #28113 and held back here by `[TAG_MMID_FUSION_ONE_TOKEN_HIP]`. The two
-asserts are adjacent but cover different operations:
-
-```c
-GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(...));  // #28113, MUL_MAT_ID
-GGML_ASSERT(  ids || dst->ne[1] == 1);                             // this abort, plain MUL_MAT
-```
-
-`#28113` is the multi-token expert path and produces garbage tokens rather than an
-abort; the hold-back in this fork only gates `GGML_OP_MUL_MAT_ID` and therefore does
-nothing for the case above. Both are failures of *which nodes get fused* rather than of
-the kernels that compute them, so they are likely related, but they are two defects.
 
 ### Recommended `llama-server` profiles for Qwen3.8-27B
 
@@ -396,10 +346,8 @@ not a correctness fix.
   soak test, `--ctx-checkpoints 0` remains a useful conservative comparison rather
   than a permanent requirement.
 - The fork keeps decode and small speculative-verification MMVQ/Flash-Attention launch
-  shapes consistent on gfx1151. If output is correct locally but corrupt over RPC, set
-  `GGML_CUDA_DISABLE_FUSION=1` in the RPC worker environment for an A/B run. RPC 5.1 can
-  execute backend fusions remotely that older RPC builds never reached. The same switch
-  addresses worker aborts - see "RPC worker aborts and backend fusion" above.
+  shapes consistent on gfx1151. Diagnose any remaining instability first against the
+  current upstream fusion path before introducing another backend-specific dispatch.
 - `--batch-size` and `--ubatch-size` primarily affect throughput and memory pressure;
   they are not correctness switches for committed speculative tokens. Change them
   only after the no-draft and single-drafter comparisons are clean.
@@ -414,16 +362,15 @@ not a correctness fix.
   hipCUB/CUB-on-HIP top-k and argsort approach. Its useful HIP content was rebased
   into the Patt92 RPC patch; no older branch is required at build time.
 - [@Nathanw1014](https://github.com/Nathanw1014/llama.cpp) supplies the selected
-  Strix Halo/RDNA3.5 HIP tuning, DeepSeek-V4, Flash-Attention, MMQ/MMVQ and
-  backend-neutral fused-op work, including the speculative graph-capability guard. This
+  Strix Halo/RDNA3.5 HIP tuning, DeepSeek-V4, Flash-Attention and MMQ/MMVQ work. This
   branch also ports the indexed sparse DeepSeek-V4 attention design from Nathan's Vulkan
   research to a separate HIP tile implementation; Vulkan shader code is not copied.
 - [@antirez](https://github.com/antirez/ds4) is the algorithmic source for the
   gfx1151-local Lightning Indexer top-k adaptation. Only the compatible HIP
   specialization is used; ds4 runtime, model and storage code is not included.
-- [@stew675](https://github.com/stew675/llama.cpp) supplies the selected
-  ROCm-compatible Qwen3.5/Qwen3.8 and hybrid-SSM fusions, MMVQ tuning and
-  speculative decode/verification consistency fixes.
+- [@stew675](https://github.com/stew675/llama.cpp) is provenance for selected
+  ROCm-compatible Qwen3.5/Qwen3.8, hybrid-SSM, MMVQ and speculative
+  decode/verification consistency work. Its fork-owned fusion dispatch is excluded.
 - [@HauhauCS](https://huggingface.co/HauhauCS) supplies the
   [compact-vocabulary FastMTP format and original Qwen3.8 runtime patch](https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF).
   This branch retains that algorithm while adding explicit loader and graph validation.
@@ -453,7 +400,7 @@ producing a silently mismatched tree.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout f027c4f1b025e05d6a2fc3b741047bda07b85ef7
+git checkout 0df017d6dd246edb1d06577976c759cf7a3c50d6
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
