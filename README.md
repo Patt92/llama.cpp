@@ -19,7 +19,7 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`42f0225fea945b24e92a0ce716e59b7c13e9b819`](https://github.com/ggml-org/llama.cpp/commit/42f0225fea945b24e92a0ce716e59b7c13e9b819).
+Based on upstream llama.cpp commit [`95ef7fc16054e63b427a3ef00188e055ef7586d8`](https://github.com/ggml-org/llama.cpp/commit/95ef7fc16054e63b427a3ef00188e055ef7586d8).
 
 This branch is rebased directly on the current upstream `llama.cpp` master and intentionally keeps upstream ROCm, fusion, Qwen, and Ornith code paths intact. Its HIP/RPC changes are limited to scoped hipCUB argsort support and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 
@@ -40,7 +40,7 @@ The port is architecture-gated: it does not alter the Qwen3.5/Ornith or DeepSeek
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 42f0225fea945b24e92a0ce716e59b7c13e9b819
+git checkout 95ef7fc16054e63b427a3ef00188e055ef7586d8
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
