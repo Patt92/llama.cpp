@@ -26,7 +26,7 @@ This branch is rebased directly on the current upstream `llama.cpp` master and i
 - Adds isolated `glm5next` / GLM-5.3-Flash text inference, including its hybrid KDA/MLA memory layout and NextN/MTP draft context.
 - Keeps completed GLM indexer pool keys in a persistent cache instead of rebuilding the entire context on every pass.
 - Ranks GLM indexer pools before expanding the selected pools to cells, removing several context-by-ubatch intermediates from the graph.
-- Keeps both mathematically equivalent GLM indexer scorers. HIP defaults to the regular GPU matmul graph because llama.cpp currently has no rocWMMA Lightning Indexer implementation and its generic vector kernel regresses gfx1151 throughput; set `LLAMA_GLM5NEXT_FUSED_LID=1` for an explicit A/B test. Other backends retain the normal fused selection.
+- Keeps both mathematically equivalent GLM indexer scorers and defaults to the fused one. The CUDA Lightning Indexer has no WMMA kernel on HIP and falls back to its vector kernel, which is why the fused path was once assumed to lose on gfx1151. Measured, it wins by a wide margin: **150 t/s peak prefill unfused against 200 t/s fused**. The unfused chain has to materialize the per-head score, `[n_pool, n_head_idx, n_tokens]` F32 - 1.9 GB per layer at 29k context with a 2048-token ubatch - and then walk it again for the ReLU, a permuted copy, the weighting and the row sum, roughly 169 GB of traffic per ubatch across the full-attention layers. `LLAMA_GLM5NEXT_FUSED_LID=0` restores the unfused chain.
 - Adds GLM-5.3-Flash MMProj support, including its vision-specific clamped SwiGLU tower.
 - The GLM-specific hyper-connection fused nodes are retained because they keep GLM graph reservation tractable; no global fusion policy or backend dispatcher is replaced.
 - Adds `ggml_flash_attn_ext_add_top_k`, an explicit-index counterpart to upstream's mask-derived `ggml_flash_attn_ext_set_n_kv_max`. Upstream's sparse selection is CUDA-only - `ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse` returns false on HIP and MUSA - so on those backends attention reads every KV column even where the caller already knows which few matter. The new call takes the indices directly, on `src[5]` and op_params slot 5, both previously unused; the two APIs are independent and one graph may carry both. No backend reads it yet, so this is API and graph plumbing only and changes nothing on its own.
@@ -34,6 +34,36 @@ This branch is rebased directly on the current upstream `llama.cpp` master and i
 - Keeps multi-backend graph split boundaries fixed across requests to avoid growing RPC compute-buffer peaks under pipeline parallelism.
 
 The port is architecture-gated: it does not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
+
+### Measured on gfx1151
+
+All figures from AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), ROCm 7.15, 124 GB unified memory
+per node. Prefill and generation are quoted with the KV depth they were taken at, because both
+fall with context and a number without one is meaningless.
+
+**Ornith-1.5-35B-A3B Q8_0, one node, `ctx 32768`, `ubatch 2048`:**
+
+| context | prefill | tg |
+|---|---|---|
+| 1 | 33.8 t/s | 46.6 t/s |
+| 4096 | 1356 t/s | 45.9 t/s |
+| 16384 | 1166 t/s | 43.6 t/s |
+
+**The same model split across two nodes over RPC costs 20% of tg and 23% of prefill** (36.5 t/s
+and 1050 t/s at 4096). Its weights are 37.8 GB and a single node has 124 GB, so routing it through
+RPC buys nothing. Only models that genuinely exceed one node - GLM-5.3-Flash at ~154 GB - should
+be split.
+
+**GLM-5.3-Flash Q3_K_M, two nodes over RPC, `ctx 131072`:** prefill decomposes into a fixed cost
+per ubatch and a term proportional to KV depth. At `ubatch 2048` that is roughly 9.2 s fixed per
+ubatch plus 0.5 ms per KV unit, so 4k context is 82% fixed cost while 20k is roughly half and
+half. Raising the ubatch to 4096 does **not** help - measured 117 t/s against 125 t/s at 2048
+around 32k - because the fixed part is already amortized at 2048.
+
+The dominant remaining cost at depth is that flash attention reads every KV column although the
+DSA indexer selected 2052 of them: 9.7x the necessary work at 20k and 14.3x at 29k, plus two
+full-width masks that make a larger ubatch expensive in VRAM. That is what
+`ggml_flash_attn_ext_add_top_k` exists for; no backend consumes it yet.
 
 ### Applying the standalone patch
 
