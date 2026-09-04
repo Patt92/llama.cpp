@@ -1925,7 +1925,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+                // [TAG_MMVF_MMID_GUARD] mul_mat_vec_f asserts ncols % 2 == 0 and requires its
+                // strides to be aligned to 2*type_size. ggml_cuda_should_use_mmvf checks exactly
+                // that, but this AMD MUL_MAT_ID path used to call the kernel without asking, so a
+                // model carrying an odd-width float expert tensor aborted in launch_mul_mat_vec_f_cuda
+                // instead of falling through to MMQ or BLAS. Hit by DeepSeek-V4-Flash UD-Q8_K_XL,
+                // whose dense weights are BF16 rather than quantized.
+                if (GGML_CUDA_CC_IS_AMD(cc) &&
+                        ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne2)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
