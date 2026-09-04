@@ -856,7 +856,11 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_top_k(
         ggml_tensor * k_pool = ggml_view_4d(ctx0, cache_3d, d, 1, n_pool, ns,
                 cache_3d->nb[1], cache_3d->nb[1], cache_3d->nb[2], 0);
 
-        score = ggml_lightning_indexer(ctx0, q, k_pool, wts, inp->bias);
+        // the op wants the mask as [n_kv, n_batch, 1, n_stream]; inp->bias is 3D, so ns sits
+        // in ne[2] and trips GGML_ASSERT(mask->ne[2] == 1) as soon as there is more than
+        // one stream - which graph_reserve probes for even at --parallel 1
+        ggml_tensor * bias4 = ggml_reshape_4d(ctx0, inp->bias, n_pool, n_tps, 1, ns);
+        score = ggml_lightning_indexer(ctx0, q, k_pool, wts, bias4);
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     } else {
         // unfused fallback, kept for the same reason deepseek4 keeps one: the probe drops the
