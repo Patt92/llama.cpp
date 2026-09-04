@@ -1886,7 +1886,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+        } else if (GGML_CUDA_CC_IS_AMD(cc) &&
+                ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, dst->ne[2])) {
+            // [TAG_MMVF_MMID_GUARD] must mirror the dispatch exactly. This predicate decides up
+            // front whether HIP graphs are safe; claiming "no sync needed" here while the
+            // dispatch falls through to the sorted path aborts on
+            // GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc)) during graph capture.
             return false;
         }
     }
