@@ -19,9 +19,9 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`73a43d1f69345aee8bb186ef4b3172cef892f2e5`](https://github.com/ggml-org/llama.cpp/commit/73a43d1f69345aee8bb186ef4b3172cef892f2e5).
+Based on upstream llama.cpp commit [`3ad1ba7336986d98592d3e28cafd1a406715351f`](https://github.com/ggml-org/llama.cpp/commit/3ad1ba7336986d98592d3e28cafd1a406715351f).
 
-This branch is rebased directly on the current upstream `llama.cpp` master and intentionally keeps upstream ROCm, fusion, Qwen, and Ornith code paths intact. Its HIP/RPC changes are limited to scoped hipCUB argsort support and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
+This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 
 - Adds isolated `glm5next` / GLM-5.3-Flash text inference, including its hybrid KDA/MLA memory layout and NextN/MTP draft context.
 - Keeps completed GLM indexer pool keys in a persistent cache instead of rebuilding the entire context on every pass.
@@ -29,12 +29,30 @@ This branch is rebased directly on the current upstream `llama.cpp` master and i
 - Keeps both mathematically equivalent GLM indexer scorers and defaults to the fused one. The CUDA Lightning Indexer has no WMMA kernel on HIP and falls back to its vector kernel, which is why the fused path was once assumed to lose on gfx1151. Measured, it wins by a wide margin: **150 t/s peak prefill unfused against 200 t/s fused**. The unfused chain has to materialize the per-head score, `[n_pool, n_head_idx, n_tokens]` F32 - 1.9 GB per layer at 29k context with a 2048-token ubatch - and then walk it again for the ReLU, a permuted copy, the weighting and the row sum, roughly 169 GB of traffic per ubatch across the full-attention layers. `LLAMA_GLM5NEXT_FUSED_LID=0` restores the unfused chain.
 - Adds GLM-5.3-Flash MMProj support, including its vision-specific clamped SwiGLU tower.
 - The GLM-specific hyper-connection fused nodes are retained because they keep GLM graph reservation tractable; no global fusion policy or backend dispatcher is replaced.
+- Adds external NextN/MTP draft-head support for Qwen3.8-Flash-Next (`qwen4exp`). The target exports its four-stream hyper-connection state, while a self-contained MTP sidecar loads only the trailing NextN block and its own HC output mixer. The streams remain separate through `eh_proj`; averaging them first destroys draft acceptance. The draft block uses the correctness-first dense-attention path and does not enable the experimental sparse-FA transplant.
 - Adds `ggml_flash_attn_ext_add_top_k`, an explicit-index counterpart to upstream's mask-derived `ggml_flash_attn_ext_set_n_kv_max`. Upstream's sparse selection is CUDA-only - `ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse` returns false on HIP and MUSA - so on those backends attention reads every KV column even where the caller already knows which few matter. The new call takes the indices directly, on `src[5]` and op_params slot 5, both previously unused; the two APIs are independent and one graph may carry both. No backend reads it yet, so this is API and graph plumbing only and changes nothing on its own.
 - Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 - On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
+- Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
 - Keeps multi-backend graph split boundaries fixed across requests to avoid growing RPC compute-buffer peaks under pipeline parallelism.
 
-The port is architecture-gated: it does not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
+The model-specific ports are architecture-gated: they do not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
+
+### Qwen3.8-Flash-Next MTP
+
+Use a Qwen3.8-Flash-Next target together with its matching self-contained MTP sidecar. Start with two draft tokens; only raise it after checking the server's reported acceptance rate. The MTP head should stay on the controller GPU when the target is split over RPC.
+
+```sh
+--spec-type draft-mtp \
+--spec-draft-model /opt/models/Qwen3.8-Flash-Next-Uncensored/Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf \
+--spec-draft-device ROCm0 \
+--spec-draft-ngl all \
+--spec-draft-n-max 2 \
+--spec-draft-type-k f16 \
+--spec-draft-type-v f16
+```
+
+The implementation comes from [`ggml-org/llama.cpp#27836`](https://github.com/ggml-org/llama.cpp/pull/27836) by [@rmonsurate](https://github.com/rmonsurate). Draft-only sidecar loading follows [`unslothai/llama.cpp#144`](https://github.com/unslothai/llama.cpp/pull/144) by [@danielhanchen](https://github.com/danielhanchen). The loader guard and the CPU/ROCm regression coverage are maintained here by [@Patt92](https://github.com/Patt92).
 
 ### Measured on gfx1151
 
@@ -71,7 +89,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 73a43d1f69345aee8bb186ef4b3172cef892f2e5
+git checkout 3ad1ba7336986d98592d3e28cafd1a406715351f
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
