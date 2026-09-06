@@ -45,11 +45,39 @@ This branch tracks the current upstream `llama.cpp` master and intentionally kee
 
 The seven items above are ported from [myhacsint/llama.cpp `production/strix-halo-qwen4exp-b10685`](https://github.com/myhacsint/llama.cpp/tree/production/strix-halo-qwen4exp-b10685). That branch is Vulkan-first and states that its ROCm paths are not claimed to be validated there, so each was re-verified here: the full `test-backend-ops` suite passes 14747/14747 on gfx1151, and coverage was added for the two shapes upstream does not exercise -- `concat` with a transposed `src1`, and `gated_delta_net` at 2048 tokens. The `MUL_MAT_ID` pair and the q8_1 cache only engage in a real MoE graph, which single-op tests cannot reach.
 
+#### When these engage
+
+The gates carry the original author's measured thresholds and were not widened. Read them against
+the model's own metadata before expecting a change, because several are narrower than they look:
+
+| tune | engages when | Qwen3.8-Flash-Next Q5_K_M |
+| --- | --- | --- |
+| `gated_delta_net` warp grid | `ssm.time_step_rank` is 32, or 64 and above | **no** -- the model has 48 |
+| AMD WMMA lightning indexer | `attention.indexer.head_count` is 32 or 64, indexer K is f16, batch >= 16 | **no** -- the model has 4 |
+| transposed-`src1` `concat` | dim-0 concat of a 2-D tensor with a transposed operand | no -- DeepSeek-V4 shape |
+| RDNA3.5 MMVQ table | MXFP4/Q4_K/Q5_K/Q6_K/Q8_0 at one output column | yes, but token generation on this model is bandwidth-bound, so the warp count is not what limits it |
+| `MUL_MAT_ID` pair | two adjacent `MUL_MAT_ID` over one activation, prefill | yes |
+| `MUL_MAT_ID` auto J | RDNA3.5; Q5_K/Q6_K with 256 or more experts, or Q8_0 | yes -- 512 experts, so J is forced to 64 |
+| q8_1 activation cache | RDNA3.5 MoE decode outside a HIP graph | yes |
+
+Widening the first two is mechanical -- 48 heads divide evenly into the sixteen-warp path, and the
+indexer kernel is templated on head count -- but the thresholds above are where the original author
+measured, so anything wider needs its own measurement rather than an assumption.
+
 The model-specific ports are architecture-gated: they do not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
 
 ### Qwen3.8-Flash-Next MTP
 
-Use a Qwen3.8-Flash-Next target together with its matching self-contained MTP sidecar. Start with two draft tokens; only raise it after checking the server's reported acceptance rate. The MTP head should stay on the controller GPU when the target is split over RPC.
+Use a Qwen3.8-Flash-Next target together with its matching self-contained MTP sidecar. Start with two
+draft tokens and raise them against the server's reported acceptance rate; measured on a 125 GB
+Q5_K_M target this branch reaches `draft acceptance = 0.899, mean len = 3.70` at
+`--spec-draft-n-max 3`, which is 92% of the theoretical maximum for that setting and means the draft
+length, not the draft quality, is the binding constraint.
+
+**Pass `--spec-draft-device` whenever the target is split over RPC.** Without it the draft model's
+device list is empty, so it inherits the target's `--split-mode` and `--tensor-split` and is spread
+across the same devices -- including the remote one. Every draft step then crosses the network, and
+raising `--spec-draft-n-max` buys more round trips instead of more tokens.
 
 ```sh
 --spec-type draft-mtp \
@@ -60,6 +88,59 @@ Use a Qwen3.8-Flash-Next target together with its matching self-contained MTP si
 --spec-draft-type-k f16 \
 --spec-draft-type-v f16
 ```
+
+#### Worked example: 125 GB Q5_K_M target across two Strix Halo nodes
+
+The target does not fit in one node's 124 GB, so the layer split is mandatory rather than a choice.
+A second model (Ornith Q8_0) is resident alongside it, which is what constrains the split ratio.
+
+```sh
+llama-server \
+  --model /opt/models/Qwen3.8-Flash-Next-Uncensored/Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf \
+  --alias qwen3.8-flash-next --host 127.0.0.1 --port 5807 \
+  --gpu-layers all --fit off --load-mode none \
+  --ctx-size 262144 --parallel 1 \
+  --rpc 10.44.0.2:50053 --split-mode layer --tensor-split 30,100 \
+  --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 \
+  --batch-size 8192 --ubatch-size 2048 --cont-batching \
+  --jinja --reasoning on --reasoning-format deepseek --reasoning-effort medium \
+  --temp 0.7 --top-p 0.95 --top-k 20 --repeat-penalty 1.05 \
+  --mmproj /opt/models/Qwen3.8-Flash-Next-Uncensored/mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf \
+  --spec-type draft-mtp \
+  --model-draft /opt/models/Qwen3.8-Flash-Next-Uncensored/Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf \
+  --spec-draft-device ROCm0 --spec-draft-ngl all \
+  --spec-draft-n-max 6 --spec-draft-n-min 0 --spec-draft-p-min 0.2 \
+  --spec-draft-type-k f16 --spec-draft-type-v f16
+```
+
+Why each non-obvious value is what it is:
+
+- **`--spec-draft-device ROCm0 --spec-draft-ngl all`** keeps the 4.1 GB sidecar off the remote node.
+  This is the one line in the block that is a correctness-of-placement issue rather than a tuning
+  preference, and it should go in first and on its own.
+- **`--spec-draft-n-max 6`** follows from the 0.899 acceptance rate; at that rate a round is
+  expected to emit roughly 5.1 tokens instead of the 3.70 measured at `n-max 3`. Raise it only
+  after the draft is pinned locally, otherwise the extra steps are extra network round trips.
+- **`--temp 0.7 --top-k 20`** replaces `--temp 1.0`. A flatter target distribution makes the draft
+  and the target disagree more often, so a high temperature costs acceptance on top of costing
+  coding quality. 0.7/0.95/20 is close to the vendor's own thinking-mode recommendation.
+- **`--batch-size 8192`** with an unchanged `--ubatch-size 2048` puts four ubatches in flight
+  instead of two, which is what gives the two-node layer split something to pipeline.
+- **`--parallel 1`** is deliberate: two slots cost roughly a third of token generation on this
+  hardware, because `n_stream` is computed for both even when only one is active.
+- **`--ctx-size 262144` costs almost nothing.** With `full_attention_interval` 4, only 12 of 48
+  layers hold a KV cache; at `head_count_kv` 2 and a key/value length of 256 in q8_0 that is
+  13.1 KB per token, so the full 256k context is about 3.4 GB. Shortening the context to save
+  memory is the obvious move here and it is the wrong one.
+- **`--tensor-split 30,100`** gives the controller 23% of the layers. That is set by what the
+  co-resident model leaves free, not by what is best for throughput -- a more even split lets the
+  prefill pipeline overlap better, so move toward `50,100` if memory allows and confirm with
+  `free -g` on both nodes after the load.
+
+Baseline to compare against, same host, 52k of context, before any of the tuning values above:
+prompt processing 231-253 t/s, generation 30.7-30.9 t/s, `draft acceptance = 0.899, mean len = 3.70`.
+The server prints all four, so every change in this block is a before/after with no separate
+benchmark run.
 
 The implementation comes from [`ggml-org/llama.cpp#27836`](https://github.com/ggml-org/llama.cpp/pull/27836) by [@rmonsurate](https://github.com/rmonsurate). Draft-only sidecar loading follows [`unslothai/llama.cpp#144`](https://github.com/unslothai/llama.cpp/pull/144) by [@danielhanchen](https://github.com/danielhanchen). The loader guard and the CPU/ROCm regression coverage are maintained here by [@Patt92](https://github.com/Patt92).
 
