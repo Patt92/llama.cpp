@@ -19,7 +19,7 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`3ad1ba7336986d98592d3e28cafd1a406715351f`](https://github.com/ggml-org/llama.cpp/commit/3ad1ba7336986d98592d3e28cafd1a406715351f).
+Based on upstream llama.cpp commit [`465e49b9cea78a68b9c244ffb48d0ee24a82873d`](https://github.com/ggml-org/llama.cpp/commit/465e49b9cea78a68b9c244ffb48d0ee24a82873d).
 
 This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 
@@ -89,7 +89,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 3ad1ba7336986d98592d3e28cafd1a406715351f
+git checkout 465e49b9cea78a68b9c244ffb48d0ee24a82873d
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
