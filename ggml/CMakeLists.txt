@@ -4,7 +4,7 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 22)
+set(GGML_VERSION_MINOR 23)
 set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
@@ -404,10 +404,6 @@ write_basic_package_version_file(
     VERSION ${GGML_INSTALL_VERSION}
     COMPATIBILITY SameMajorVersion)
 
-target_compile_definitions(ggml-base PRIVATE
-    GGML_VERSION="${GGML_INSTALL_VERSION}"
-    GGML_COMMIT="${GGML_BUILD_COMMIT}"
-)
 message(STATUS "ggml version: ${GGML_INSTALL_VERSION}")
 message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 
