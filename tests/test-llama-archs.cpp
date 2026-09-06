@@ -111,6 +111,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        n_embd = 128;
+        n_head = 1;
+        n_ff   = 192;
+        // Two full-attention layers exercise reuse of the persistent indexer pool-key cache.
+        n_layer = 4;
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
@@ -215,6 +221,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             }
             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
         }
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        // GLM5Next uses MLA without RoPE.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(512));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(0));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(128));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
@@ -309,15 +322,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
     }
 
-    if (arch == LLM_ARCH_DEEPSEEK4) {
-        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
-        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           uint32_t(32));
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,            std::vector<uint32_t>({0, 0, 4, 128}));
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    160000.0f);
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT) {
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      uint32_t(8));
+            ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        uint32_t(32));
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,         std::vector<uint32_t>({0, 0, 4, 128}));
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, 160000.0f);
+            ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                  uint32_t(0));
+        }
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
-        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                      uint32_t(0));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
@@ -420,6 +435,51 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     return std::make_pair(std::move(model), std::move(lctx));
 }
 
+// [TAG_KPOOL_KEY_CACHE] decode the same tokens as two consecutive batches. Causal attention
+// makes the result identical to the single-shot run, so any state that is carried between
+// passes and goes stale - such as the glm5next pool-key cache - shows up as a logits mismatch.
+// A one-shot decode cannot catch it: on the first pass every cached value is (re)computed.
+static std::vector<float> get_logits_chunked(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_ctx    = llama_n_ctx(lctx);
+    const uint32_t n_tokens = tokens.size();
+
+    GGML_ASSERT(n_tokens <= n_ctx && n_tokens >= 2);
+
+    std::vector<float> ret;
+    ret.reserve((size_t) n_tokens*n_vocab);
+
+    const uint32_t split = n_tokens/2;
+
+    uint32_t pos = 0;
+    for (uint32_t chunk = 0; chunk < 2; ++chunk) {
+        const uint32_t n_chunk = chunk == 0 ? split : n_tokens - split;
+
+        llama_batch batch = llama_batch_init(n_ctx, 0, 1);
+        for (uint32_t i = 0; i < n_chunk; ++i, ++pos) {
+            common_batch_add(batch, tokens[pos], pos, {0}, true);
+        }
+        batch.n_tokens = n_chunk;
+
+        if (llama_decode(lctx, batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("failed to decode chunk");
+        }
+
+        for (uint32_t i = 0; i < n_chunk; ++i) {
+            const float * logits_ith = llama_get_logits_ith(lctx, i);
+            for (uint32_t j = 0; j < n_vocab; ++j) {
+                ret.push_back(logits_ith[j]);
+            }
+        }
+
+        llama_batch_free(batch);
+    }
+
+    return ret;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -476,6 +536,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_BAILINGMOE:
         case LLM_ARCH_BAILINGMOE2:
@@ -758,6 +819,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+
+                        // [TAG_KPOOL_KEY_CACHE] glm5next carries pool keys across passes
+                        if (arch == LLM_ARCH_GLM5NEXT && !encode) {
+                            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                            const std::vector<float> logits_chunked =
+                                get_logits_chunked(mc.first.get(), mc.second.get(), tokens);
+                            const double nmse_chunked = nmse(logits_cpu, logits_chunked);
+                            // a correct run is bit-identical here (measured 0.0); starving the
+                            // pool-key refresh of a later pass moves it to 6.9e-10, so the usual
+                            // 1e-4 device threshold would not notice. Keep this one tight.
+                            if (nmse_chunked > 1e-12) {
+                                all_ok = false;
+                                printf("\n\033[1;31mFAIL\033[0m: %s chunked decode differs from single-shot, NMSE = %.2e\n",
+                                        llm_arch_name(arch), nmse_chunked);
+                            }
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
