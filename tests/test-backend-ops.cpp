@@ -6216,7 +6216,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim))
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: transposed b)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -6251,7 +6251,15 @@ struct test_concat : public test_case {
             ggml_set_name(a, "a");
         }
         ggml_tensor * b;
-        if (v & 2) {
+        if (v & 16) {
+            // [TAG_CONCAT_TRANSPOSED_SRC1] exercises the coalesced dim-0 fast path
+            std::swap(ne_b[0], ne_b[1]);
+            b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transposed_b");
+        } else if (v & 2) {
             auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
             b = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(b, "b");
@@ -10112,6 +10120,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // inplace with an offset
         test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
     }
+
+    // [TAG_CONCAT_TRANSPOSED_SRC1] dim-0 concat with a transposed src1, as DeepSeek-V4 builds it
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {17, 35, 1, 1}, 67, 0, 16));
 
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
