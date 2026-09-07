@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..a85f80514 100644
+index aae3bcd35..83cc948c5 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,184 @@
+@@ -17,6 +17,209 @@
  
  </div>
  
@@ -68,16 +68,24 @@ index aae3bcd35..a85f80514 100644
 +
 +### Qwen3.8-Flash-Next MTP
 +
-+Use a Qwen3.8-Flash-Next target together with its matching self-contained MTP sidecar. Start with two
-+draft tokens and raise them against the server's reported acceptance rate; measured on a 125 GB
-+Q5_K_M target this branch reaches `draft acceptance = 0.899, mean len = 3.70` at
-+`--spec-draft-n-max 3`, which is 92% of the theoretical maximum for that setting and means the draft
-+length, not the draft quality, is the binding constraint.
++Use a Qwen3.8-Flash-Next target together with its matching self-contained MTP sidecar. Two or three
++draft tokens is the working range; measured on a 125 GB Q5_K_M target this branch reaches
++`draft acceptance = 0.70-0.90, mean len = 3.1-3.7` at `--spec-draft-n-max 3`.
 +
-+**Pass `--spec-draft-device` whenever the target is split over RPC.** Without it the draft model's
-+device list is empty, so it inherits the target's `--split-mode` and `--tensor-split` and is spread
-+across the same devices -- including the remote one. Every draft step then crosses the network, and
-+raising `--spec-draft-n-max` buys more round trips instead of more tokens.
++**A high acceptance rate is not a reason to draft deeper.** These sidecars carry a single NextN
++block that is applied recursively, so from the second draft token onward the head conditions on its
++own guess instead of on a verified token. Raising `--spec-draft-n-max` from 3 to 6 on this model
++took acceptance from 0.899 to 0.286 and halved token generation; accepted tokens per round fell
++from 2.70 to 1.70 while the drafted count doubled. Any acceptance figure is an average over the
++depths that were actually drafted and does not extrapolate past them.
++
++**Know where the draft model lands when the target is split over RPC.** Without
++`--spec-draft-device` the draft's device list is empty, so it inherits the target's `--split-mode`
++and `--tensor-split` and is spread across the same devices, remote one included. Pinning it to the
++controller with `--spec-draft-device ROCm0 --spec-draft-ngl all` is worth testing but is not a
++guaranteed win: with a layer split the target's last layers are the remote ones and the MTP head
++consumes their hidden state, so pinning the head locally can add a round trip per draft step rather
++than remove one. Measure it as a single change.
 +
 +```sh
 +--spec-type draft-mtp \
@@ -109,21 +117,32 @@ index aae3bcd35..a85f80514 100644
 +  --spec-type draft-mtp \
 +  --model-draft /opt/models/Qwen3.8-Flash-Next-Uncensored/Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf \
 +  --spec-draft-device ROCm0 --spec-draft-ngl all \
-+  --spec-draft-n-max 6 --spec-draft-n-min 0 --spec-draft-p-min 0.2 \
++  --spec-draft-n-max 3 --spec-draft-n-min 0 --spec-draft-p-min 0.2 \
 +  --spec-draft-type-k f16 --spec-draft-type-v f16
 +```
 +
 +Why each non-obvious value is what it is:
 +
-+- **`--spec-draft-device ROCm0 --spec-draft-ngl all`** keeps the 4.1 GB sidecar off the remote node.
-+  This is the one line in the block that is a correctness-of-placement issue rather than a tuning
-+  preference, and it should go in first and on its own.
-+- **`--spec-draft-n-max 6`** follows from the 0.899 acceptance rate; at that rate a round is
-+  expected to emit roughly 5.1 tokens instead of the 3.70 measured at `n-max 3`. Raise it only
-+  after the draft is pinned locally, otherwise the extra steps are extra network round trips.
-+- **`--temp 0.7 --top-k 20`** replaces `--temp 1.0`. A flatter target distribution makes the draft
-+  and the target disagree more often, so a high temperature costs acceptance on top of costing
-+  coding quality. 0.7/0.95/20 is close to the vendor's own thinking-mode recommendation.
++- **`--spec-draft-n-max 3`, and do not raise it on an acceptance rate alone.** A measured 0.899
++  acceptance at `n-max 3` looks like room for a deeper draft, and it is not: raising it to 6 on
++  this model collapsed acceptance to 0.286 and cut token generation in half, from 30.9 to 15.5 t/s.
++  Accepted tokens per round went *down*, from 2.70 to 1.70, while the draft work doubled. The
++  reason is that a sidecar with a single NextN block is applied recursively, so from step two
++  onward the head conditions on its own guess rather than on a verified token and the error
++  compounds. An acceptance figure measured at depth 3 is an average over depths 1-3 and says
++  nothing about depth 6. Move this value one step at a time and read `draft acceptance` and
++  `mean len` after each.
++- **`--spec-draft-device ROCm0 --spec-draft-ngl all` is a placement question worth testing, not a
++  settled win.** Without it the draft's device list is empty, so it inherits the target's
++  `--tensor-split` and lands partly on the remote node. Against that: with a layer split the
++  target's *last* layers are the remote ones, and the MTP head consumes their hidden state, so
++  pinning the head locally can add a round trip per draft step instead of removing one. Which way
++  it falls depends on the split ratio. Measure it on its own.
++- **`--temp 0.7 --top-k 20`** is primarily an output-quality choice, close to the vendor's
++  thinking-mode recommendation. Its effect on speculative decoding is not one-directional: a lower
++  temperature sharpens the target distribution and helps agreement, but `--top-k` truncates that
++  distribution, and every draft token outside the surviving set is rejected outright. If token
++  generation matters more than sampling behaviour here, test `--top-k` on its own.
 +- **`--batch-size 8192`** with an unchanged `--ubatch-size 2048` puts four ubatches in flight
 +  instead of two, which is what gives the two-node layer split something to pipeline.
 +- **`--parallel 1`** is deliberate: two slots cost roughly a third of token generation on this
@@ -137,10 +156,16 @@ index aae3bcd35..a85f80514 100644
 +  prefill pipeline overlap better, so move toward `50,100` if memory allows and confirm with
 +  `free -g` on both nodes after the load.
 +
-+Baseline to compare against, same host, 52k of context, before any of the tuning values above:
-+prompt processing 231-253 t/s, generation 30.7-30.9 t/s, `draft acceptance = 0.899, mean len = 3.70`.
-+The server prints all four, so every change in this block is a before/after with no separate
-+benchmark run.
++Baseline to compare against, same host, 52k of context: prompt processing 231-253 t/s, generation
++30.7-30.9 t/s, `draft acceptance = 0.899, mean len = 3.70`. The server prints all of these, so every
++change in this block is a before/after with no separate benchmark run.
++
++Two cautions when reading them. The `eval time` rate is cumulative and includes the ramp: on one
++run here it read 18.7 t/s at 100 generated tokens and 31.4 t/s at 739, so a short generation is not
++comparable to a long one -- use `tg_3s`, or compare runs of similar length. And token generation
++falls with context depth, so a figure without the KV depth it was taken at means nothing. Change
++one flag at a time; `draft acceptance` is the leading indicator for anything speculative, with the
++generation rate only its consequence.
 +
 +The implementation comes from [`ggml-org/llama.cpp#27836`](https://github.com/ggml-org/llama.cpp/pull/27836) by [@rmonsurate](https://github.com/rmonsurate). Draft-only sidecar loading follows [`unslothai/llama.cpp#144`](https://github.com/unslothai/llama.cpp/pull/144) by [@danielhanchen](https://github.com/danielhanchen). The loader guard and the CPU/ROCm regression coverage are maintained here by [@Patt92](https://github.com/Patt92).
 +
