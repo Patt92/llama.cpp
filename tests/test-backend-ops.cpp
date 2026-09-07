@@ -11098,6 +11098,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // [TAG_FATTN_TILE_SPARSE] GLM-5.3-Flash prefill: absorbed MLA is 512 wide, gqa 8 picks
+    // ncols2 = 8 and a 2048-token ubatch picks ncols1 = 4, which is the only shape the tile
+    // kernel's row compaction engages for. The perf set had no 512-wide sparse case above one
+    // token, so the path could not be measured.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {8, 1}, 32768, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 576, }) {
             const int  hsv    = hs == 576 ? 512 : hs;
