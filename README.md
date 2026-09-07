@@ -19,7 +19,7 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`465e49b9cea78a68b9c244ffb48d0ee24a82873d`](https://github.com/ggml-org/llama.cpp/commit/465e49b9cea78a68b9c244ffb48d0ee24a82873d).
+Based on upstream llama.cpp commit [`67672dc5b76f8bc17785a19d3dc6d1463fc2902c`](https://github.com/ggml-org/llama.cpp/commit/67672dc5b76f8bc17785a19d3dc6d1463fc2902c).
 
 This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 
@@ -34,7 +34,6 @@ This branch tracks the current upstream `llama.cpp` master and intentionally kee
 - Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 - On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 - Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
-- Keeps multi-backend graph split boundaries fixed across requests to avoid growing RPC compute-buffer peaks under pipeline parallelism.
 - Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
 - Adds an AMD WMMA kernel for the lightning indexer, used when the indexer K cache is f16 and the batch is at least 16 rows. The indexer is the `n_kv`-proportional term of DeepSeek-V4 and GLM prefill and previously ran the scalar float4 kernel on HIP, one warp per KV row with every head re-reading global memory. Decode and quantized indexer caches keep the old path.
 - Adds a coalesced dim-0 `concat` for a transposed `src1`, the shape DeepSeek-V4 builds when it joins its SWA-bounded `raw_k` to the narrowed `csa_k`. The generic kernel reads one element per row stride; the new one stages a 32x32 tile through shared memory.
@@ -63,6 +62,18 @@ the model's own metadata before expecting a change, because several are narrower
 Widening the first two is mechanical -- 48 heads divide evenly into the sixteen-warp path, and the
 indexer kernel is templated on head count -- but the thresholds above are where the original author
 measured, so anything wider needs its own measurement rather than an assumption.
+
+Upstream reached the same conclusion about MoE tile sizing independently in
+[`#24546`](https://github.com/ggml-org/llama.cpp/pull/24546), which sized routed-MoE MMQ N-tiles
+from typical expert width, and then reverted it in
+[`#28551`](https://github.com/ggml-org/llama.cpp/pull/28551). The revert was about where the logic
+lives, not about whether it works: the objection was that it changed kernel configurations when the
+choice belongs entirely on the host side, and the suggested shape is an `ncols_opt` field on
+`mmq_args` decided in `ggml_cuda_mul_mat_q`. The version carried here is already host-side -- it
+only overrides the J that `mul_mat_q_switch_J` would have picked -- and it is gated to RDNA3.5,
+which that PR explicitly excluded. Its measurements are still the best evidence available for the
+idea on this hardware: at a typical expert width of 16 on gfx1151, `+21.7%` for Q4_K and `+7.5%`
+for Q5_K at the operator level, with width-64 negative controls flat.
 
 The model-specific ports are architecture-gated: they do not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
 
@@ -179,7 +190,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 465e49b9cea78a68b9c244ffb48d0ee24a82873d
+git checkout 67672dc5b76f8bc17785a19d3dc6d1463fc2902c
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
