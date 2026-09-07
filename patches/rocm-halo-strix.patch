@@ -1,14 +1,14 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..cf8bdc096 100644
+index aae3bcd35..a85f80514 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,173 @@
+@@ -17,6 +17,184 @@
  
  </div>
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`465e49b9cea78a68b9c244ffb48d0ee24a82873d`](https://github.com/ggml-org/llama.cpp/commit/465e49b9cea78a68b9c244ffb48d0ee24a82873d).
++Based on upstream llama.cpp commit [`67672dc5b76f8bc17785a19d3dc6d1463fc2902c`](https://github.com/ggml-org/llama.cpp/commit/67672dc5b76f8bc17785a19d3dc6d1463fc2902c).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -23,7 +23,6 @@ index aae3bcd35..cf8bdc096 100644
 +- Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 +- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 +- Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
-+- Keeps multi-backend graph split boundaries fixed across requests to avoid growing RPC compute-buffer peaks under pipeline parallelism.
 +- Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
 +- Adds an AMD WMMA kernel for the lightning indexer, used when the indexer K cache is f16 and the batch is at least 16 rows. The indexer is the `n_kv`-proportional term of DeepSeek-V4 and GLM prefill and previously ran the scalar float4 kernel on HIP, one warp per KV row with every head re-reading global memory. Decode and quantized indexer caches keep the old path.
 +- Adds a coalesced dim-0 `concat` for a transposed `src1`, the shape DeepSeek-V4 builds when it joins its SWA-bounded `raw_k` to the narrowed `csa_k`. The generic kernel reads one element per row stride; the new one stages a 32x32 tile through shared memory.
@@ -52,6 +51,18 @@ index aae3bcd35..cf8bdc096 100644
 +Widening the first two is mechanical -- 48 heads divide evenly into the sixteen-warp path, and the
 +indexer kernel is templated on head count -- but the thresholds above are where the original author
 +measured, so anything wider needs its own measurement rather than an assumption.
++
++Upstream reached the same conclusion about MoE tile sizing independently in
++[`#24546`](https://github.com/ggml-org/llama.cpp/pull/24546), which sized routed-MoE MMQ N-tiles
++from typical expert width, and then reverted it in
++[`#28551`](https://github.com/ggml-org/llama.cpp/pull/28551). The revert was about where the logic
++lives, not about whether it works: the objection was that it changed kernel configurations when the
++choice belongs entirely on the host side, and the suggested shape is an `ncols_opt` field on
++`mmq_args` decided in `ggml_cuda_mul_mat_q`. The version carried here is already host-side -- it
++only overrides the J that `mul_mat_q_switch_J` would have picked -- and it is gated to RDNA3.5,
++which that PR explicitly excluded. Its measurements are still the best evidence available for the
++idea on this hardware: at a typical expert width of 16 on gfx1151, `+21.7%` for Q4_K and `+7.5%`
++for Q5_K at the operator level, with width-64 negative controls flat.
 +
 +The model-specific ports are architecture-gated: they do not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
 +
@@ -168,7 +179,7 @@ index aae3bcd35..cf8bdc096 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 465e49b9cea78a68b9c244ffb48d0ee24a82873d
++git checkout 67672dc5b76f8bc17785a19d3dc6d1463fc2902c
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -313,20 +324,6 @@ index b88b7e54a..fee4d7851 100644
      GGML_API void ggml_flash_attn_ext_add_sinks(
              struct ggml_tensor * a,
              struct ggml_tensor * sinks);
-diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 6862128e6..65174d4f5 100644
---- a/ggml/src/ggml-backend.cpp
-+++ b/ggml/src/ggml-backend.cpp
-@@ -1340,7 +1340,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
-                     }
-                     // check if the split has too many inputs
-                     // FIXME: count the number of inputs instead of only checking when full
--                    if (split->n_inputs >= split->inputs_capacity) {
-+                    // inputs_capacity persists across graphs. Do not let split boundaries grow with it.
-+                    if (split->n_inputs >= GGML_SCHED_MAX_SPLIT_INPUTS) {
-                         const size_t id = hash_id(src);
-                         int src_backend_id = sched->hv_tensor_backend_ids[id];
-                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
 index 26af90025..b2f462a21 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
@@ -399,10 +396,10 @@ index 3abb6448a..5e5d5af4c 100644
                                    int *           dst,
                                    const int       ncols,
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index ed0ea60bd..a700f963f 100644
+index 7d14ce906..43ca9f269 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1235,6 +1235,32 @@ struct ggml_tensor_extra_gpu {
+@@ -1262,6 +1262,32 @@ struct ggml_tensor_extra_gpu {
  #define USE_CUDA_GRAPH
  #endif
  
@@ -435,7 +432,7 @@ index ed0ea60bd..a700f963f 100644
  struct ggml_cuda_graph {
  #ifdef USE_CUDA_GRAPH
      ~ggml_cuda_graph() {
-@@ -1537,6 +1563,54 @@ struct ggml_backend_cuda_context {
+@@ -1564,6 +1590,54 @@ struct ggml_backend_cuda_context {
      ggml_cuda_pool & pool() {
          return pool(device);
      }
@@ -766,10 +763,10 @@ index 1b431a724..55c946f4f 100644
                  n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                  sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 45e9537f0..5dd519433 100644
+index 0e6601f03..e5bded09a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1886,7 +1886,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -1887,7 +1887,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
              if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                  return false;
              }
@@ -783,7 +780,7 @@ index 45e9537f0..5dd519433 100644
              return false;
          }
      }
-@@ -1925,7 +1930,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1926,7 +1931,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
                      return;
                  }
              } else {
@@ -799,7 +796,7 @@ index 45e9537f0..5dd519433 100644
                      ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                      return;
                  }
-@@ -3627,6 +3639,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3628,6 +3640,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -837,7 +834,7 @@ index 45e9537f0..5dd519433 100644
      bool fused_mul_mat_vec = false;
      int  fused_node_count  = 0;
  
-@@ -4275,6 +4318,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4276,6 +4319,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -853,7 +850,7 @@ index 45e9537f0..5dd519433 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (is_concurrent_event_active) {
-@@ -4354,7 +4406,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4355,7 +4407,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
@@ -866,7 +863,7 @@ index 45e9537f0..5dd519433 100644
              }
          }
  
-@@ -5458,7 +5514,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5459,7 +5515,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->ne[0] <= 1024;
  #endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
          case GGML_OP_ARGSORT:
@@ -1431,7 +1428,7 @@ index 4d1c398fc..e7a36df5c 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 7fb440148..781668de2 100644
+index 9beff0d9b..cb792a298 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -82,6 +82,118 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
@@ -1735,10 +1732,10 @@ index b4a747720..bdfaa3fc1 100644
 +
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index f65e0fbcd..128c795a9 100644
+index 6305230b1..f88d18be6 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -70,6 +70,7 @@ enum mmvq_parameter_table_id {
+@@ -99,6 +99,7 @@ enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GCN,
      MMVQ_PARAMETERS_RDNA2,
      MMVQ_PARAMETERS_RDNA3_0,
@@ -1746,7 +1743,7 @@ index f65e0fbcd..128c795a9 100644
      MMVQ_PARAMETERS_RDNA4,
      MMVQ_PARAMETERS_GB10
  };
-@@ -77,9 +78,11 @@ enum mmvq_parameter_table_id {
+@@ -106,9 +107,11 @@ enum mmvq_parameter_table_id {
  static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
  #if defined(RDNA4)
      return MMVQ_PARAMETERS_RDNA4;
@@ -1759,7 +1756,7 @@ index f65e0fbcd..128c795a9 100644
      return MMVQ_PARAMETERS_RDNA2;
  #elif defined(GCN) || defined(CDNA)
      return MMVQ_PARAMETERS_GCN;
-@@ -96,10 +99,13 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+@@ -125,10 +128,13 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA4(cc)) {
          return MMVQ_PARAMETERS_RDNA4;
      }
@@ -1774,7 +1771,7 @@ index f65e0fbcd..128c795a9 100644
          return MMVQ_PARAMETERS_RDNA2;
      }
      if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
-@@ -482,6 +488,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -509,6 +515,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
          }
          return 1;
      }
@@ -1799,7 +1796,7 @@ index f65e0fbcd..128c795a9 100644
      if (table_id == MMVQ_PARAMETERS_TURING) {
          if (ncols_dst == 1) {
              switch (type) {
-@@ -1435,12 +1459,24 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1482,12 +1506,24 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -1827,7 +1824,7 @@ index f65e0fbcd..128c795a9 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1466,7 +1502,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1513,7 +1549,7 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -1837,7 +1834,7 @@ index f65e0fbcd..128c795a9 100644
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index ec117c57d..26724a98f 100644
+index f2a6f2009..a0fbf1e62 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -240,7 +240,13 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
@@ -1855,7 +1852,7 @@ index ec117c57d..26724a98f 100644
  
  template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
-index 9aa558f3f..82ecbb252 100644
+index 2fc0fe9fd..f22674336 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
 +++ b/ggml/src/ggml-cuda/vendors/hip.h
 @@ -10,6 +10,21 @@
@@ -1939,10 +1936,10 @@ index 6257cdbe5..9ff725d1f 100644
          struct ggml_tensor * a,
          struct ggml_tensor * sinks) {
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index d51e459dd..1f582e139 100644
+index d3a639f37..40bae295d 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
-@@ -1183,6 +1183,11 @@ class MODEL_TENSOR(IntEnum):
+@@ -1184,6 +1184,11 @@ class MODEL_TENSOR(IntEnum):
      NEXTN_HNORM            = auto()
      NEXTN_SHARED_HEAD_HEAD = auto()
      NEXTN_SHARED_HEAD_NORM = auto()
@@ -1954,7 +1951,7 @@ index d51e459dd..1f582e139 100644
      # eagle3
      FC                     = auto()  # feature fusion layer
      D2T                    = auto()  # draft to target vocabulary mapping
-@@ -1966,6 +1971,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+@@ -1967,6 +1972,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
      MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
      MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
      MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
@@ -1964,7 +1961,7 @@ index d51e459dd..1f582e139 100644
      MODEL_TENSOR.FC:                        "fc",
      MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
      MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
-@@ -2950,6 +2958,15 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+@@ -2951,6 +2959,15 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
          MODEL_TENSOR.PLE_NORM_QUERY,
          MODEL_TENSOR.PLE_NORM_CONV,
          MODEL_TENSOR.PLE_CONV1D,
@@ -1981,10 +1978,10 @@ index d51e459dd..1f582e139 100644
      MODEL_ARCH.PLAMO: [
          MODEL_TENSOR.TOKEN_EMBD,
 diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
-index d644d502e..a8b3f7554 100644
+index d2dfeece5..eed2ffd60 100644
 --- a/gguf-py/gguf/tensor_mapping.py
 +++ b/gguf-py/gguf/tensor_mapping.py
-@@ -2765,6 +2765,16 @@ class TensorNameMap:
+@@ -2803,6 +2803,16 @@ class TensorNameMap:
              MODEL_TENSOR.HC_HEAD_UP: (
                  "model.hyper_connection_mixer.input_mix_weight_up",
              ),
@@ -5126,10 +5123,10 @@ index 8ace95f73..f3c998e7c 100644
                  ggml_tensor * input,
                          int   il) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c93e41b2e..a9b65d481 100644
+index 3342253d0..8f2056449 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6216,7 +6216,7 @@ struct test_concat : public test_case {
+@@ -6277,7 +6277,7 @@ struct test_concat : public test_case {
      const std::array<int64_t, 4> ne_a;
      const int64_t ne_b_d;
      const int dim;
@@ -5138,7 +5135,7 @@ index c93e41b2e..a9b65d481 100644
  
      std::string vars() override {
          return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
-@@ -6251,7 +6251,15 @@ struct test_concat : public test_case {
+@@ -6312,7 +6312,15 @@ struct test_concat : public test_case {
              ggml_set_name(a, "a");
          }
          ggml_tensor * b;
@@ -5155,7 +5152,7 @@ index c93e41b2e..a9b65d481 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -10113,6 +10121,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10251,6 +10259,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -5165,7 +5162,7 @@ index c93e41b2e..a9b65d481 100644
      for (int v : { 0, 1, 2, 3 }) {
          for (int dim : { 0, 1, 2, 3, }) {
              test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
-@@ -10643,6 +10654,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10781,6 +10792,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
