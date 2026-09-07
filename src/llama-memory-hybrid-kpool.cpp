@@ -178,8 +178,22 @@ llama_memory_hybrid_kpool::llama_memory_hybrid_kpool(
             throw std::runtime_error("failed to create ggml context for the k-pool key cache");
         }
 
+        // [TAG_KPOOL_F16] F16, not F32, and it costs nothing to say so: a pool key is a
+        // softmax-weighted mean of r indexer keys that are themselves stored F16 above, so
+        // holding the mean at F32 preserves precision the inputs never had. The score built
+        // from it is ReLU'd, summed over the heads and used only to rank pools for top-k, and
+        // the attention it selects for reads a q8_0 KV cache.
+        //
+        // What it buys: ggml_cuda_lightning_indexer only takes the AMD WMMA kernel when K is
+        // F16, so at F32 gfx1151 ran the scalar float4 kernel - one warp per KV row, every head
+        // re-reading global memory. Measured on gfx1151 at this model's shape (hsk=128, nh=32):
+        // ubatch 2048 5472 -> 1570 us, ubatch 512 1121 -> 319 us, so 3.5x on the term that
+        // scales with n_kv. Decode does not reach the kernel (it needs n_batch >= 16) and pays
+        // 4% more on the scalar path, which is +29 us per token across the 12 full-attention
+        // layers, or 0.04% of a 77 ms token. The cache also halves.
+        //
         // + 1 row per stream: the scratch slot that absorbs padded refresh writes
-        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, idx_head, (int64_t)(n_pool_max + 1)*n_stream);
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, idx_head, (int64_t)(n_pool_max + 1)*n_stream);
         ggml_format_name(t, "cache_kpool_l%d", il);
         pool_k_l[il] = t;
     }
