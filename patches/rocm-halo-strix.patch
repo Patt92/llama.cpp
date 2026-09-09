@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..30441be2a 100644
+index aae3bcd35..7a66ae2f5 100644
 --- a/README.md
 +++ b/README.md
 @@ -17,6 +17,211 @@
@@ -8,7 +8,7 @@ index aae3bcd35..30441be2a 100644
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`67672dc5b76f8bc17785a19d3dc6d1463fc2902c`](https://github.com/ggml-org/llama.cpp/commit/67672dc5b76f8bc17785a19d3dc6d1463fc2902c).
++Based on upstream llama.cpp commit [`b31b71f3a076bfc4278daad442203a9c51c6e676`](https://github.com/ggml-org/llama.cpp/commit/b31b71f3a076bfc4278daad442203a9c51c6e676).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -206,7 +206,7 @@ index aae3bcd35..30441be2a 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 67672dc5b76f8bc17785a19d3dc6d1463fc2902c
++git checkout b31b71f3a076bfc4278daad442203a9c51c6e676
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -320,10 +320,10 @@ index 168796d61..5de299346 100644
          self.gguf_writer.add_ple_layers(ple_layers)
          self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index b88b7e54a..fee4d7851 100644
+index 85a1ae7ae..a0abf8839 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -2459,6 +2459,27 @@ extern "C" {
+@@ -2508,6 +2508,27 @@ extern "C" {
              struct ggml_tensor * a,
              int32_t              n_kv_max);
  
@@ -1576,10 +1576,10 @@ index 1b431a724..55c946f4f 100644
                  n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                  sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0e6601f03..e5bded09a 100644
+index 38bd4c9a0..6a8074fb2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1887,7 +1887,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -1883,7 +1883,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
              if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                  return false;
              }
@@ -1593,7 +1593,7 @@ index 0e6601f03..e5bded09a 100644
              return false;
          }
      }
-@@ -1926,7 +1931,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1922,7 +1927,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
                      return;
                  }
              } else {
@@ -1609,7 +1609,7 @@ index 0e6601f03..e5bded09a 100644
                      ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                      return;
                  }
-@@ -3628,6 +3640,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3624,6 +3636,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -1647,7 +1647,7 @@ index 0e6601f03..e5bded09a 100644
      bool fused_mul_mat_vec = false;
      int  fused_node_count  = 0;
  
-@@ -4276,6 +4319,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4272,6 +4315,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -1663,7 +1663,7 @@ index 0e6601f03..e5bded09a 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (is_concurrent_event_active) {
-@@ -4355,7 +4407,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4351,7 +4403,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
@@ -1676,7 +1676,7 @@ index 0e6601f03..e5bded09a 100644
              }
          }
  
-@@ -5459,7 +5515,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5455,7 +5511,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->ne[0] <= 1024;
  #endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
          case GGML_OP_ARGSORT:
@@ -2701,10 +2701,10 @@ index 2fc0fe9fd..f22674336 100644
  #define cudaStream_t hipStream_t
  #define cudaSuccess hipSuccess
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 6257cdbe5..9ff725d1f 100644
+index 5ef03e190..21008f898 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5516,6 +5516,43 @@ void ggml_flash_attn_ext_set_n_kv_max(
+@@ -5567,6 +5567,43 @@ void ggml_flash_attn_ext_set_n_kv_max(
      ggml_set_op_params_i32(a, 4, n_kv_max);
  }
  
@@ -2824,7 +2824,7 @@ index 221e14f7f..8fb144fd7 100644
              llama-mmap.cpp
              llama-model-loader.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 15f651919..4a7702131 100644
+index b5efb7206..76a0b6ad0 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -84,6 +84,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -2871,7 +2871,7 @@ index 15f651919..4a7702131 100644
              return true;
          default:
              return false;
-@@ -1136,6 +1145,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1137,6 +1146,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_HY_V4:
          case LLM_ARCH_DOTS3NOTE:
          case LLM_ARCH_GLM_DSA:
@@ -2912,7 +2912,7 @@ index f1d173a57..ea962fd7c 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 4cbd5fe21..7630637ce 100644
+index 5855393ef..332841a12 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -13,6 +13,7 @@
@@ -2970,7 +2970,7 @@ index 4cbd5fe21..7630637ce 100644
      const bool v_trans = v->nb[1] > v->nb[2];
  
      // split the batch into streams if needed
-@@ -2636,6 +2668,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -2636,6 +2668,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_flash_attn_ext_add_sinks(cur, sinks);
          GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
          ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
@@ -2982,10 +2982,11 @@ index 4cbd5fe21..7630637ce 100644
 +            ggml_flash_attn_ext_add_top_k(cur, top_k, n_kv_raw);
 +        }
 +
-         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
++        // upstream #26675 renamed ggml_flash_attn_ext_set_prec to the generic ggml_prec_set_acc
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
  
          if (v_mla) {
-@@ -3605,6 +3645,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
+@@ -3605,6 +3646,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
      return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
  }
  
@@ -3002,10 +3003,10 @@ index 4cbd5fe21..7630637ce 100644
      const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
  
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index b486578c1..55626c5a5 100644
+index cc4110639..24ae78642 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -30,6 +30,7 @@ class llama_kv_cache_dsv4_context;
+@@ -31,6 +31,7 @@ class llama_kv_cache_dsv4_context;
  class llama_kv_cache_iswa_context;
  class llama_memory_recurrent_context;
  class llama_memory_hybrid_context;
@@ -3013,7 +3014,7 @@ index b486578c1..55626c5a5 100644
  class llama_memory_hybrid_iswa_context;
  
  // certain models (typically multi-modal) can produce different types of graphs
-@@ -713,6 +714,31 @@ public:
+@@ -714,6 +715,31 @@ public:
      const llama_memory_hybrid_context * mctx;
  };
  
@@ -3045,7 +3046,7 @@ index b486578c1..55626c5a5 100644
  class llm_graph_input_mem_hybrid_iswa : public llm_graph_input_i {
  public:
      llm_graph_input_mem_hybrid_iswa(
-@@ -1186,7 +1212,9 @@ struct llm_graph_context {
+@@ -1187,7 +1213,9 @@ struct llm_graph_context {
              ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                  int64_t   n_kv_max,
                    float   kq_scale,
@@ -3056,7 +3057,7 @@ index b486578c1..55626c5a5 100644
  
      llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
  
-@@ -1355,6 +1383,7 @@ struct llm_graph_context {
+@@ -1356,6 +1384,7 @@ struct llm_graph_context {
  
      llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
      llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
@@ -4076,7 +4077,7 @@ index 000000000..afb823fd5
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index ffedf89e6..6dda44d14 100644
+index 0adc07449..9dde391af 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
@@ -4096,7 +4097,7 @@ index ffedf89e6..6dda44d14 100644
          case LLM_ARCH_MISTRAL4:
              return new llama_model_mistral4(params);
          case LLM_ARCH_CHATGLM:
-@@ -2463,6 +2466,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2475,6 +2478,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              nullptr);
                  }
              } break;
@@ -4136,7 +4137,7 @@ index ffedf89e6..6dda44d14 100644
          case LLM_ARCH_DFLASH:
              {
                  // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
-@@ -2497,7 +2533,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2509,7 +2545,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                  const bool mtp_on_hybrid_qwen =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                      (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
@@ -4145,7 +4146,7 @@ index ffedf89e6..6dda44d14 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -2881,6 +2917,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -2893,6 +2929,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_NEMOTRON_H_MOE:
          case LLM_ARCH_KIMI_LINEAR:
          case LLM_ARCH_KIMI_K3:
@@ -5950,10 +5951,10 @@ index 8ace95f73..f3c998e7c 100644
                  ggml_tensor * input,
                          int   il) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 3342253d0..e216e0a0a 100644
+index 8030186fb..cf321a16e 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6277,7 +6277,7 @@ struct test_concat : public test_case {
+@@ -6305,7 +6305,7 @@ struct test_concat : public test_case {
      const std::array<int64_t, 4> ne_a;
      const int64_t ne_b_d;
      const int dim;
@@ -5962,7 +5963,7 @@ index 3342253d0..e216e0a0a 100644
  
      std::string vars() override {
          return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
-@@ -6312,7 +6312,15 @@ struct test_concat : public test_case {
+@@ -6340,7 +6340,15 @@ struct test_concat : public test_case {
              ggml_set_name(a, "a");
          }
          ggml_tensor * b;
@@ -5979,7 +5980,7 @@ index 3342253d0..e216e0a0a 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -10251,6 +10259,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10282,6 +10290,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -5989,7 +5990,7 @@ index 3342253d0..e216e0a0a 100644
      for (int v : { 0, 1, 2, 3 }) {
          for (int dim : { 0, 1, 2, 3, }) {
              test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
-@@ -10781,6 +10792,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10812,6 +10823,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -6001,7 +6002,7 @@ index 3342253d0..e216e0a0a 100644
  #if 0
      // these tests are disabled to save execution time, sbut they can be handy for debugging
      test_cases.emplace_back(new test_llama(2, true));
-@@ -11082,6 +11098,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11118,6 +11134,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
@@ -6330,7 +6331,7 @@ index f737ccc24..196390a28 100644
  
      float eps = 1e-6;
 diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
-index 74f4e2b5a..5c23868eb 100644
+index cd6421def..36c017e98 100644
 --- a/tools/mtmd/clip.cpp
 +++ b/tools/mtmd/clip.cpp
 @@ -684,6 +684,14 @@ ggml_tensor * clip_graph::build_ffn(
