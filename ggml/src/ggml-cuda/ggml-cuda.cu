@@ -335,6 +335,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                       device_vmm ? "yes" : "no", prop.warpSize,
                       device_vram_mib);
+
+        // [TAG_RDNA35_INTEGRATED] upstream d4389a4dd (#28604) reverted prop.integrated on HIP over
+        // the corrupted output in #15034. Restore it for RDNA3.5 only, which is why this sits here
+        // rather than next to the assignment above: cc is not parsed until a few lines up.
+        //
+        // gfx1151 has no VRAM carveout worth the name - mem_info_vram_total reports 0.5 GB and the
+        // whole model lives in GTT - so with integrated == false,
+        // ggml_backend_cuda_device_supports_buft refuses host buffers and the scheduler keeps a
+        // device copy of memory the GPU could have used in place. Measured with GLM and Qwen3.8
+        // co-resident on a 124 GB node: 82 GB used before the revert, 119 GB plus 8 GB of swap
+        // after, and prefill fell to 12-90 t/s on the ubatches that touched swapped pages.
+        //
+        // This branch carried prop.integrated from upstream c7d872292 (2026-07-16) through b10907
+        // with no corrupted output on gfx1151 across GLM, Qwen3.8, DeepSeek-V4 and Ornith. The
+        // flag stays false on every other architecture, so #15034 is not reopened where it was
+        // actually reported.
+        if (GGML_CUDA_CC_IS_RDNA3_5(info.devices[id].cc)) {
+            info.devices[id].integrated = prop.integrated;
+        }
 #elif defined(GGML_USE_MUSA)
         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
         info.devices[id].warp_size = 32;
