@@ -183,13 +183,22 @@ static void ggml_cuda_mul_mat_q_id(
         const int64_t s1 = dst_i->nb[1] / ts_dst;
         const int64_t s2 = dst_i->nb[2] / ts_dst;
         const int64_t s3 = dst_i->nb[3] / ts_dst;
+        // Each expert only sees ne12*n_expert_used/ne02 tokens on average, so the tile size should
+        // be picked against that rather than against the token count. Upstream d4abd573f (#28552)
+        // added ncols_opt for exactly this and gated it to RDNA3.0/RDNA4; RDNA3.5 is added here,
+        // and it replaces the hand-tuned J thresholds this branch used to carry.
+        int64_t ncols_opt = n_tokens;
+        if (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            ncols_opt = (ne_get_rows + src0_i->ne[2] - 1) / src0_i->ne[2];
+        }
+
         const mmq_args args = {
             (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
             src1_scale.ptr,
             src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
             src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
             src0_i->ne[3], src1->ne[3], s03, s13_q, s3,
-            n_tokens};
+            n_tokens, ncols_opt};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     }
 }
@@ -283,7 +292,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }

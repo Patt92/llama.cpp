@@ -1384,6 +1384,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1484,27 +1485,11 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    // [TAG_MMQ_ID_AUTO_J] the generic search below minimises the tile count, which on gfx1151
-    // picks J tiles that leave the CUs idle for MUL_MAT_ID. Taken from myhacsint/llama.cpp
-    // production/strix-halo-qwen4exp-b10685. Override with GGML_CUDA_MMQ_ID_J=<J> or =auto.
-    static const char * mmq_id_j_env = getenv("GGML_CUDA_MMQ_ID_J");
-    int J_forced = args.ids_dst && mmq_id_j_env ? atoi(mmq_id_j_env) : 0;
-    const bool auto_j = args.ids_dst && (!mmq_id_j_env || strcmp(mmq_id_j_env, "auto") == 0) && GGML_CUDA_CC_IS_RDNA3_5(cc);
-    if (auto_j) {
-        if ((type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) && args.nchannels_y >= 256) {
-            J_forced = 64;
-        } else if (type == GGML_TYPE_Q8_0) {
-            const int ncols_avg = (args.ncols_dst + args.nchannels_y - 1)/args.nchannels_y;
-            J_forced = ncols_avg <= 24 ? 16 : ncols_avg <= 32 ? 32 : ncols_avg <= 48 ? 48 : ncols_avg <= 64 ? 96 : 0;
-        }
-    }
-    if (J_forced > 0) {
-        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_forced, fallback, cc);
-        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
-            J_best = J_forced;
-            ntiles_J_best = 1;
-        }
-    }
+    // [TAG_MMQ_ID_AUTO_J] retired. This used to force J from hand-measured thresholds on
+    // RDNA3.5, because the search below minimises the tile count against the token count rather
+    // than against what an expert actually sees. Upstream d4abd573f (#28552) solved the same
+    // problem properly, by carrying ncols_opt in mmq_args and optimising against that; mmq.cu
+    // extends its gate to RDNA3.5. GGML_CUDA_MMQ_ID_J is gone with it - use the upstream path.
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
@@ -1516,7 +1501,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
