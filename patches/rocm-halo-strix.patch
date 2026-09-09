@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..7a66ae2f5 100644
+index aae3bcd35..b840a78ee 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,211 @@
+@@ -17,6 +17,212 @@
  
  </div>
  
@@ -24,6 +24,7 @@ index aae3bcd35..7a66ae2f5 100644
 +- Adds `ggml_flash_attn_ext_add_top_k`, an explicit-index counterpart to upstream's mask-derived `ggml_flash_attn_ext_set_n_kv_max`. Upstream's sparse selection is CUDA-only - `ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse` returns false on HIP and MUSA - so on those backends attention reads every KV column even where the caller already knows which few matter. The new call takes the indices directly, on `src[5]` and op_params slot 5, both previously unused; the two APIs are independent and one graph may carry both. No backend reads it yet, so this is API and graph plumbing only and changes nothing on its own.
 +- Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 +- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
++- Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
 +- Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
 +- Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
 +- Adds an AMD WMMA kernel for the lightning indexer, used when the indexer K cache is f16 and the batch is at least 16 rows. The indexer is the `n_kv`-proportional term of DeepSeek-V4 and GLM prefill and previously ran the scalar float4 kernel on HIP, one warp per KV row with every head re-reading global memory. Decode and quantized indexer caches keep the old path.
@@ -1576,10 +1577,36 @@ index 1b431a724..55c946f4f 100644
                  n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                  sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 38bd4c9a0..6a8074fb2 100644
+index 38bd4c9a0..23d2e2d69 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1883,7 +1883,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -335,6 +335,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
+                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
+                       device_vmm ? "yes" : "no", prop.warpSize,
+                       device_vram_mib);
++
++        // [TAG_RDNA35_INTEGRATED] upstream d4389a4dd (#28604) reverted prop.integrated on HIP over
++        // the corrupted output in #15034. Restore it for RDNA3.5 only, which is why this sits here
++        // rather than next to the assignment above: cc is not parsed until a few lines up.
++        //
++        // gfx1151 has no VRAM carveout worth the name - mem_info_vram_total reports 0.5 GB and the
++        // whole model lives in GTT - so with integrated == false,
++        // ggml_backend_cuda_device_supports_buft refuses host buffers and the scheduler keeps a
++        // device copy of memory the GPU could have used in place. Measured with GLM and Qwen3.8
++        // co-resident on a 124 GB node: 82 GB used before the revert, 119 GB plus 8 GB of swap
++        // after, and prefill fell to 12-90 t/s on the ubatches that touched swapped pages.
++        //
++        // This branch carried prop.integrated from upstream c7d872292 (2026-07-16) through b10907
++        // with no corrupted output on gfx1151 across GLM, Qwen3.8, DeepSeek-V4 and Ornith. The
++        // flag stays false on every other architecture, so #15034 is not reopened where it was
++        // actually reported.
++        if (GGML_CUDA_CC_IS_RDNA3_5(info.devices[id].cc)) {
++            info.devices[id].integrated = prop.integrated;
++        }
+ #elif defined(GGML_USE_MUSA)
+         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
+         info.devices[id].warp_size = 32;
+@@ -1883,7 +1902,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
              if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                  return false;
              }
@@ -1593,7 +1620,7 @@ index 38bd4c9a0..6a8074fb2 100644
              return false;
          }
      }
-@@ -1922,7 +1927,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1922,7 +1946,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
                      return;
                  }
              } else {
@@ -1609,7 +1636,7 @@ index 38bd4c9a0..6a8074fb2 100644
                      ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                      return;
                  }
-@@ -3624,6 +3636,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3624,6 +3655,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -1647,7 +1674,7 @@ index 38bd4c9a0..6a8074fb2 100644
      bool fused_mul_mat_vec = false;
      int  fused_node_count  = 0;
  
-@@ -4272,6 +4315,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4272,6 +4334,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -1663,7 +1690,7 @@ index 38bd4c9a0..6a8074fb2 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (is_concurrent_event_active) {
-@@ -4351,7 +4403,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4351,7 +4422,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
@@ -1676,7 +1703,7 @@ index 38bd4c9a0..6a8074fb2 100644
              }
          }
  
-@@ -5455,7 +5511,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5455,7 +5530,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->ne[0] <= 1024;
  #endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
          case GGML_OP_ARGSORT:
