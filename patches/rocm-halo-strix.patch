@@ -1,14 +1,14 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..cc49a21cc 100644
+index aae3bcd35..a48d7d028 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,212 @@
+@@ -17,6 +17,213 @@
  
  </div>
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`434ddbbc0e30522e897670681e503b797c12b7c1`](https://github.com/ggml-org/llama.cpp/commit/434ddbbc0e30522e897670681e503b797c12b7c1).
++Based on upstream llama.cpp commit [`52d42686560a9e8f441f9b9780c8890c37d2802d`](https://github.com/ggml-org/llama.cpp/commit/52d42686560a9e8f441f9b9780c8890c37d2802d).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -24,6 +24,7 @@ index aae3bcd35..cc49a21cc 100644
 +- Adds `ggml_flash_attn_ext_add_top_k`, an explicit-index counterpart to upstream's mask-derived `ggml_flash_attn_ext_set_n_kv_max`. Upstream's sparse selection is CUDA-only - `ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse` returns false on HIP and MUSA - so on those backends attention reads every KV column even where the caller already knows which few matter. The new call takes the indices directly, on `src[5]` and op_params slot 5, both previously unused; the two APIs are independent and one graph may carry both. No backend reads it yet, so this is API and graph plumbing only and changes nothing on its own.
 +- Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 +- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
++- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
 +- Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
 +- Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
 +- Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
@@ -207,7 +208,7 @@ index aae3bcd35..cc49a21cc 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 434ddbbc0e30522e897670681e503b797c12b7c1
++git checkout 52d42686560a9e8f441f9b9780c8890c37d2802d
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -2939,7 +2940,7 @@ index f1d173a57..ea962fd7c 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5855393ef..332841a12 100644
+index 5855393ef..374525d7f 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -13,6 +13,7 @@
@@ -2950,7 +2951,19 @@ index 5855393ef..332841a12 100644
  #include "llama-memory-hybrid-iswa.h"
  #include "llama-memory-recurrent.h"
  
-@@ -1179,6 +1180,35 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+@@ -111,6 +112,11 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
+         GGML_ASSERT(n_embd == h->ne[0]);
+ 
+         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
++    } else {
++        // [TAG_MTP_H_ZERO] a token-only ubatch never writes h, so the DECODER_MTP graph would
++        // consume whatever the compute buffer happened to hold. Taken from
++        // Nathanw1014/llama.cpp 4f597b553; upstream master has the same gap.
++        ggml_backend_tensor_memset(h, 0, 0, ggml_nbytes(h));
+     }
+ }
+ 
+@@ -1179,6 +1185,35 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
      return res;
  }
  
@@ -2986,7 +2999,7 @@ index 5855393ef..332841a12 100644
  void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
      const auto * attn_ctx = mctx->get_attn();
  
-@@ -2598,7 +2628,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -2598,7 +2633,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
           ggml_tensor * v_mla,
               int64_t   n_kv_max,
                 float   kq_scale,
@@ -2997,7 +3010,7 @@ index 5855393ef..332841a12 100644
      const bool v_trans = v->nb[1] > v->nb[2];
  
      // split the batch into streams if needed
-@@ -2636,6 +2668,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -2636,6 +2673,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_flash_attn_ext_add_sinks(cur, sinks);
          GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
          ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
@@ -3013,7 +3026,7 @@ index 5855393ef..332841a12 100644
          ggml_prec_set_acc(cur, GGML_PREC_F32);
  
          if (v_mla) {
-@@ -3605,6 +3646,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
+@@ -3605,6 +3651,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
      return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
  }
  
@@ -4104,7 +4117,7 @@ index 000000000..afb823fd5
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 54009b369..35e0ecb53 100644
+index d10b60afd..b9022f643 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
@@ -4124,7 +4137,7 @@ index 54009b369..35e0ecb53 100644
          case LLM_ARCH_MISTRAL4:
              return new llama_model_mistral4(params);
          case LLM_ARCH_CHATGLM:
-@@ -2476,6 +2479,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2478,6 +2481,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              nullptr);
                  }
              } break;
@@ -4164,7 +4177,7 @@ index 54009b369..35e0ecb53 100644
          case LLM_ARCH_DFLASH:
              {
                  // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
-@@ -2510,7 +2546,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2512,7 +2548,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                  const bool mtp_on_hybrid_qwen =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                      (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
@@ -4173,7 +4186,7 @@ index 54009b369..35e0ecb53 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -2894,6 +2930,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -2896,6 +2932,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_NEMOTRON_H_MOE:
          case LLM_ARCH_KIMI_LINEAR:
          case LLM_ARCH_KIMI_K3:
@@ -4182,10 +4195,10 @@ index 54009b369..35e0ecb53 100644
  
          // use what we call a normal RoPE, operating on pairs of consecutive head values
 diff --git a/src/llama-model.h b/src/llama-model.h
-index c0cc40655..531bfad9a 100644
+index a02b30ca7..5beda9135 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -229,6 +229,12 @@ struct llama_layer_nextn {
+@@ -231,6 +231,12 @@ struct llama_layer_nextn {
      struct ggml_tensor * shared_head_head_s    = nullptr;
      struct ggml_tensor * shared_head_head_in_s = nullptr;
      struct ggml_tensor * shared_head_norm      = nullptr;
@@ -5978,10 +5991,10 @@ index 8ace95f73..f3c998e7c 100644
                  ggml_tensor * input,
                          int   il) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 2deb90f6a..2c28bad79 100644
+index 0a6516e61..309a62a48 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6305,7 +6305,7 @@ struct test_concat : public test_case {
+@@ -6222,7 +6222,7 @@ struct test_concat : public test_case {
      const std::array<int64_t, 4> ne_a;
      const int64_t ne_b_d;
      const int dim;
@@ -5990,7 +6003,7 @@ index 2deb90f6a..2c28bad79 100644
  
      std::string vars() override {
          return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
-@@ -6340,7 +6340,15 @@ struct test_concat : public test_case {
+@@ -6257,7 +6257,15 @@ struct test_concat : public test_case {
              ggml_set_name(a, "a");
          }
          ggml_tensor * b;
@@ -6007,7 +6020,7 @@ index 2deb90f6a..2c28bad79 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -10282,6 +10290,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10190,6 +10198,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -6016,7 +6029,7 @@ index 2deb90f6a..2c28bad79 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10818,6 +10828,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10726,6 +10736,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -6028,7 +6041,7 @@ index 2deb90f6a..2c28bad79 100644
  #if 0
      // these tests are disabled to save execution time, sbut they can be handy for debugging
      test_cases.emplace_back(new test_llama(2, true));
-@@ -11124,6 +11139,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11023,6 +11038,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
