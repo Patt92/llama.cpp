@@ -186,7 +186,7 @@ The implementation comes from [`ggml-org/llama.cpp#27836`](https://github.com/gg
 
 ### Measured on gfx1151
 
-All figures from AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), ROCm 7.15, 124 GB unified memory
+All figures from AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), ROCm 10.0.0, 124 GB unified memory
 per node. Prefill and generation are quoted with the KV depth they were taken at, because both
 fall with context and a number without one is meaningless.
 
