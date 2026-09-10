@@ -112,6 +112,11 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+    } else {
+        // [TAG_MTP_H_ZERO] a token-only ubatch never writes h, so the DECODER_MTP graph would
+        // consume whatever the compute buffer happened to hold. Taken from
+        // Nathanw1014/llama.cpp 4f597b553; upstream master has the same gap.
+        ggml_backend_tensor_memset(h, 0, 0, ggml_nbytes(h));
     }
 }
 
