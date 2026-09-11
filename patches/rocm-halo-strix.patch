@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..4b2a28007 100644
+index aae3bcd35..4afc2551f 100644
 --- a/README.md
 +++ b/README.md
 @@ -17,6 +17,214 @@
@@ -8,7 +8,7 @@ index aae3bcd35..4b2a28007 100644
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`df03399b885831b2a1603b3abb0d8c156808e363`](https://github.com/ggml-org/llama.cpp/commit/df03399b885831b2a1603b3abb0d8c156808e363).
++Based on upstream llama.cpp commit [`5cdd3d1dad5cbb7107b3e9f6d23239ba88ac0123`](https://github.com/ggml-org/llama.cpp/commit/5cdd3d1dad5cbb7107b3e9f6d23239ba88ac0123).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -209,7 +209,7 @@ index aae3bcd35..4b2a28007 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout df03399b885831b2a1603b3abb0d8c156808e363
++git checkout 5cdd3d1dad5cbb7107b3e9f6d23239ba88ac0123
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -4131,7 +4131,7 @@ index 000000000..afb823fd5
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index d10b60afd..b9022f643 100644
+index f9e9a8bcb..671a2d795 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
@@ -6185,7 +6185,7 @@ index 8ace95f73..7240622ed 100644
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 3428629fd..e9e130092 100644
+index ef4fc30ce..f3bd43491 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6222,7 +6222,7 @@ struct test_concat : public test_case {
@@ -6223,7 +6223,7 @@ index 3428629fd..e9e130092 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10734,6 +10744,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10741,6 +10751,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -6235,19 +6235,18 @@ index 3428629fd..e9e130092 100644
  #if 0
      // these tests are disabled to save execution time, sbut they can be handy for debugging
      test_cases.emplace_back(new test_llama(2, true));
-@@ -11031,6 +11046,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
-     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
- 
+@@ -11046,6 +11061,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 +    // [TAG_FATTN_TILE_SPARSE] GLM-5.3-Flash prefill: absorbed MLA is 512 wide, gqa 8 picks
 +    // ncols2 = 8 and a 2048-token ubatch picks ncols1 = 4, which is the only shape the tile
 +    // kernel's row compaction engages for. The perf set had no 512-wide sparse case above one
 +    // token, so the path could not be measured.
 +    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {8, 1}, 32768, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
-+
+ 
      for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
          for (int hs : { 64, 128, 256, 576, }) {
-             const int  hsv    = hs == 576 ? 512 : hs;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
 index dbed9846f..a8e4b78bc 100644
 --- a/tests/test-llama-archs.cpp
