@@ -331,6 +331,13 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
+    // [TAG_QWEN4EXP_SHARED_MTP] a draft export has no trunk. Loaded on its own it would build the
+    // trunk graph over null tensors and segfault in graph_reserve (reproduced with Unsloth's
+    // shared sidecar); loaded through -md only the MTP graph above is ever built.
+    if (hc_head_norm == nullptr) {
+        throw std::runtime_error("this model is an MTP draft head without a trunk; "
+                                 "load it as a draft of its target model (-md), not on its own");
+    }
     return std::make_unique<graph>(*this, params);
 }
 
