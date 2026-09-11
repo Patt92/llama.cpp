@@ -1,14 +1,14 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..4b2a28007 100644
+index aae3bcd35..a48d7d028 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,214 @@
+@@ -17,6 +17,213 @@
  
  </div>
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`df03399b885831b2a1603b3abb0d8c156808e363`](https://github.com/ggml-org/llama.cpp/commit/df03399b885831b2a1603b3abb0d8c156808e363).
++Based on upstream llama.cpp commit [`52d42686560a9e8f441f9b9780c8890c37d2802d`](https://github.com/ggml-org/llama.cpp/commit/52d42686560a9e8f441f9b9780c8890c37d2802d).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -25,7 +25,6 @@ index aae3bcd35..4b2a28007 100644
 +- Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 +- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 +- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
-+- Gathers the QSA-selected keys and values into a compact buffer for single-token decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken unchanged from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213); its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Decode only, engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
 +- Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
 +- Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
 +- Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
@@ -176,7 +175,7 @@ index aae3bcd35..4b2a28007 100644
 +
 +### Measured on gfx1151
 +
-+All figures from AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), ROCm 10.0.0, 124 GB unified memory
++All figures from AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), ROCm 7.15, 124 GB unified memory
 +per node. Prefill and generation are quoted with the KV depth they were taken at, because both
 +fall with context and a number without one is meaningless.
 +
@@ -209,7 +208,7 @@ index aae3bcd35..4b2a28007 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout df03399b885831b2a1603b3abb0d8c156808e363
++git checkout 52d42686560a9e8f441f9b9780c8890c37d2802d
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -2941,7 +2940,7 @@ index f1d173a57..ea962fd7c 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5855393ef..a6d82efae 100644
+index 5855393ef..374525d7f 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -13,6 +13,7 @@
@@ -2964,20 +2963,7 @@ index 5855393ef..a6d82efae 100644
      }
  }
  
-@@ -1090,7 +1096,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
- 
--    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
-+    // qwen4exp's QSA gather graphs never reference the mask, so it has no buffer;
-+    // the same guard the other attention inputs carry
-+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
-+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
-+    }
- 
-     if (inp_attn->self_k_rot) {
-         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-@@ -1179,6 +1189,35 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+@@ -1179,6 +1185,35 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
      return res;
  }
  
@@ -3013,7 +2999,7 @@ index 5855393ef..a6d82efae 100644
  void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
      const auto * attn_ctx = mctx->get_attn();
  
-@@ -2598,7 +2637,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -2598,7 +2633,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
           ggml_tensor * v_mla,
               int64_t   n_kv_max,
                 float   kq_scale,
@@ -3024,7 +3010,7 @@ index 5855393ef..a6d82efae 100644
      const bool v_trans = v->nb[1] > v->nb[2];
  
      // split the batch into streams if needed
-@@ -2636,6 +2677,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -2636,6 +2673,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_flash_attn_ext_add_sinks(cur, sinks);
          GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
          ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
@@ -3040,7 +3026,7 @@ index 5855393ef..a6d82efae 100644
          ggml_prec_set_acc(cur, GGML_PREC_F32);
  
          if (v_mla) {
-@@ -3605,6 +3655,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
+@@ -3605,6 +3651,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
      return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
  }
  
@@ -5502,7 +5488,7 @@ index 000000000..6a07e7901
 +    ggml_build_forward_expand(gf, cur);
 +}
 diff --git a/src/models/models.h b/src/models/models.h
-index 87195fddd..7c4c8b7a8 100644
+index 87195fddd..e6123f5a9 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -1341,6 +1341,44 @@ struct llama_model_glm_dsa : public llama_model_base {
@@ -5564,29 +5550,7 @@ index 87195fddd..7c4c8b7a8 100644
          // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
          ggml_tensor * build_hc_mix(
                      ggml_tensor * x,
-@@ -2387,8 +2430,10 @@ struct llama_model_qwen4exp : public llama_model_base {
-                     ggml_tensor * k_cur,
-                     ggml_tensor * v_cur,
-                     ggml_tensor * top_k,
-+                    ggml_tensor * qsa_bias,
-                           float   kq_scale,
--                            int   il);
-+                            int   il,
-+                           bool   gather = false);
- 
-         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-         // so the layers sharing a ratio share one input set
-@@ -2401,7 +2446,8 @@ struct llama_model_qwen4exp : public llama_model_base {
-                     ggml_tensor * inp_pos,
-                     ggml_tensor * kq_mask,
-                             int * sections,
--                            int   il);
-+                            int   il,
-+                           bool   gather = false);
- 
-         ggml_tensor * build_layer_attn_linear(
-              llm_graph_input_rs * inp,
-@@ -2447,6 +2493,11 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2447,6 +2490,11 @@ struct llama_model_qwen4exp : public llama_model_base {
          const llama_model & model;
      };
  
@@ -5599,7 +5563,7 @@ index 87195fddd..7c4c8b7a8 100644
  };
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..7240622ed 100644
+index 8ace95f73..f3c998e7c 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -24,6 +24,12 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
@@ -5755,15 +5719,15 @@ index 8ace95f73..7240622ed 100644
 +        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
 +        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
 +        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
-+
-+        if (il < n_layer) {
-+            continue;
-+        }
  
 -        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
 -        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
++        if (il < n_layer) {
++            continue;
++        }
++
 +        // NextN/MTP head. enorm/hnorm gate the two inputs; eh_proj is the checkpoint's
 +        // fc_embedding and fc_hidden fused side by side, so one matmul over
 +        // concat(e, h) computes fc_embedding@e + fc_hidden@h.
@@ -6026,166 +5990,8 @@ index 8ace95f73..7240622ed 100644
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                  ggml_tensor * input,
                          int   il) {
-@@ -528,7 +792,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-         ggml_tensor *                           inp_pos,
-         ggml_tensor *                           kq_mask,
-         int *                                   sections,
--        int                                     il) {
-+        int                                     il,
-+        bool                                    gather) {
-     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
- 
-     const int64_t idx_dim  = hparams.indexer_head_size;
-@@ -549,7 +814,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
-     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
-     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
--    const bool blk_bias = kq_mask != nullptr &&
-+    // the gather path needs the per-cell bias: it carries the full visibility of every
-+    // cell (foreign, future, unpooled, tail), so the gathered cells' bias values can
-+    // serve directly as the attention mask over the gathered set
-+    const bool blk_bias = !gather && kq_mask != nullptr &&
-         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
-         cparams.causal_attn && !hparams.use_alibi;
- 
-@@ -662,7 +930,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-     cb(expanded, "indexer_score_tokens", il);
- 
-     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
--    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
-+    // the gather path pads the width to a multiple of 256 so the gathered K/V satisfy flash
-+    // attention's padding without extra ops; surplus cells arrive with a -inf bias and are
-+    // masked out of the gathered attention
-+    const int64_t width = gather
-+        ? std::min<int64_t>(n_kv, GGML_PAD((int64_t) hparams.indexer_top_k + r - 1, 256))
-+        : std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
- 
-     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
- 
-@@ -681,8 +954,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
-         ggml_tensor *             k_cur,
-         ggml_tensor *             v_cur,
-         ggml_tensor *             top_k,
-+        ggml_tensor *             qsa_bias,
-         float                     kq_scale,
--        int                       il) {
-+        int                       il,
-+        bool                      gather) {
-     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
-     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
-     if (inp->self_k_rot) {
-@@ -712,6 +987,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
-         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-     }
- 
-+    // decode-time sparse gather: instead of masking the full cache (which makes flash
-+    // attention scan all n_kv cells to use only indexer_top_k of them), copy the selected
-+    // cells out of the cache and attend densely over just those. this bounds the per-token
-+    // attention cost by the top-k width instead of the context depth.
-+    // restricted to single-token-per-stream ubatches (decode), where every stream carries
-+    // exactly one top-k list, so the gathered K/V stay one tensor per stream.
-+    if (gather) {
-+        ggml_tensor * kf = mctx_cur->get_k(ctx0, il); // [hd_k, n_head_kv, n_kv, ns]
-+        ggml_tensor * vf = mctx_cur->get_v(ctx0, il); // [hd_v, n_head_kv, n_kv, ns]
-+
-+        const int64_t hd_k   = kf->ne[0];
-+        const int64_t hd_v   = vf->ne[0];
-+        const int64_t n_h_kv = kf->ne[1];
-+        const int64_t n_kv   = kf->ne[2];
-+        const int64_t ns     = kf->ne[3];
-+        const int64_t n_topk = top_k->ne[0];
-+
-+        GGML_ASSERT(top_k->ne[1] == 1 && "QSA gather requires single-token-per-stream ubatches");
-+        GGML_ASSERT(qsa_bias != nullptr && qsa_bias->ne[0] == n_kv && "QSA gather requires the per-cell bias");
-+
-+        // the heads of a cell are contiguous in the cache, so a cell can be gathered as one row
-+        GGML_ASSERT(kf->nb[2] == ggml_row_size(kf->type, hd_k*n_h_kv));
-+        GGML_ASSERT(vf->nb[2] == ggml_row_size(vf->type, hd_v*n_h_kv));
-+
-+        ggml_tensor * k_cells = ggml_view_4d(ctx0, kf, hd_k*n_h_kv, n_kv, 1, ns,
-+                kf->nb[2], kf->nb[2]*n_kv, kf->nb[3], 0);
-+        ggml_tensor * v_cells = ggml_view_4d(ctx0, vf, hd_v*n_h_kv, n_kv, 1, ns,
-+                vf->nb[2], vf->nb[2]*n_kv, vf->nb[3], 0);
-+
-+        // top_k [n_topk, 1, 1, ns] -> the index layout ggml_get_rows expects: [n_topk, 1, ns, 1]
-+        ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk, 1, ns, 1);
-+
-+        // get_rows dequantizes the cells to F32; build_attn_mha casts to F16 for flash attention
-+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk, 1, ns]
-+        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk, 1, ns]
-+
-+        k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, ns);
-+        v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, ns);
-+        cb(k_g, "qsa_k_gathered", il);
-+        cb(v_g, "qsa_v_gathered", il);
-+
-+        // the gathered cells' bias values already encode visibility: 0 for a selected block
-+        // member, 1e9 for the always-visible tail, -inf for anything the padded top-k width
-+        // pulled in that the query must not see. clamping to (-inf, 0] turns that into the
-+        // attention mask over the gathered set.
-+        ggml_tensor * b1 = ggml_view_4d(ctx0, qsa_bias, 1, n_kv, 1, ns,
-+                qsa_bias->nb[0], qsa_bias->nb[1], qsa_bias->nb[3], 0);
-+        ggml_tensor * m_g = ggml_get_rows(ctx0, b1, idx);            // F32 [1, n_topk, 1, ns]
-+        m_g = ggml_reshape_4d(ctx0, m_g, n_topk, 1, 1, ns);
-+        m_g = ggml_clamp(ctx0, m_g, -INFINITY, 0.0f);
-+        m_g = ggml_cast(ctx0, m_g, GGML_TYPE_F16);                   // FA wants contiguous F16
-+        cb(m_g, "qsa_mask_gathered", il);
-+
-+        ggml_tensor * cur = build_attn_mha(q_cur, k_g, v_g, nullptr, m_g, nullptr, nullptr, 0, kq_scale, il);
-+        cb(cur, "kqv_out", il);
-+
-+        // the rotation is its own inverse, so undo it on the value side of the output
-+        if (inp->self_v_rot) {
-+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-+        }
-+
-+        return cur;
-+    }
-+
-     ggml_tensor * kq_mask = inp->get_kq_mask();
- 
-     // prepare new kq mask - starts filled with -INFINITY
-@@ -771,7 +1110,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
-     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
- 
--    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
-+    // gather-based QSA decode: worth it once the cache is meaningfully deeper than the
-+    // top-k width; below that the masked path costs about the same. QWEN4EXP_QSA_GATHER=0
-+    // disables it (A/B lever, and an escape hatch).
-+    static const bool gather_enabled = [] {
-+        const char * e = getenv("QWEN4EXP_QSA_GATHER");
-+        return e == nullptr || atoi(e) != 0;
-+    }();
-+
-+    bool gather = false;
-+    if (qsa && gather_enabled) {
-+        const int64_t r     = hparams.dsv4_compress_ratios[il];
-+        const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
-+        const int64_t width = GGML_PAD((int64_t) hparams.indexer_top_k + r - 1, 256);
-+
-+        const int64_t n_stream = mctx_hyb->get_n_stream();
-+
-+        gather = n_tokens == n_stream && n_kv >= 4*width;
-+    }
-+
-+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, gather) : nullptr;
- 
-     // Qwen3Next uses a single Q projection that outputs query + gate
-     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -824,7 +1182,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
-     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
- 
-     if (top_k) {
--        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
-+        ggml_tensor * qsa_bias = gather ? qsa_inps.at((uint32_t) hparams.dsv4_compress_ratios[il])->bias : nullptr;
-+
-+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, qsa_bias, kq_scale, il, gather);
-     } else {
-         cur = build_attn(inp,
-                     nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 3428629fd..e9e130092 100644
+index 0a6516e61..309a62a48 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6222,7 +6222,7 @@ struct test_concat : public test_case {
@@ -6214,7 +6020,7 @@ index 3428629fd..e9e130092 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -10198,6 +10206,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10190,6 +10198,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -6223,7 +6029,7 @@ index 3428629fd..e9e130092 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10734,6 +10744,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10726,6 +10736,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -6235,7 +6041,7 @@ index 3428629fd..e9e130092 100644
  #if 0
      // these tests are disabled to save execution time, sbut they can be handy for debugging
      test_cases.emplace_back(new test_llama(2, true));
-@@ -11031,6 +11046,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11023,6 +11038,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
