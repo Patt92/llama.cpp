@@ -155,9 +155,48 @@ static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * u
     // sample: full read for small tensors, strided for large ones
     int64_t n_nan = 0;
     const int64_t step  = n <= (1 << 18) ? 1 : n / (1 << 18);
-    const int64_t first = llama_context_nan_scan(t, step, n_nan);
+    int64_t first = llama_context_nan_scan(t, step, n_nan);
+    bool inf_born = false;
     if (first < 0) {
-        return true;
+        // no NaN. an Inf that none of the sources carries is the birth of an overflow and is
+        // what turns into the NaN two ops later; masks and their sums legitimately hold -inf
+        const std::string name = ggml_get_name(t);
+        const bool view_like = t->op == GGML_OP_NONE || t->op == GGML_OP_CONT || t->op == GGML_OP_RESHAPE ||
+            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_CPY ||
+            t->op == GGML_OP_CONCAT || t->op == GGML_OP_REPEAT || t->op == GGML_OP_ADD || t->op == GGML_OP_SET_ROWS;
+        if (g_nan_hunt_n_inf == 0 || view_like ||
+            name.find("mask") != std::string::npos || name.find("kq") != std::string::npos ||
+            name.find("score") != std::string::npos || name.find("bias") != std::string::npos) {
+            return true;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = t->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) {
+                continue; // quantized weights and index tensors cannot hold an Inf
+            }
+            if (!ggml_is_contiguous(src) || src->data == nullptr) {
+                return true; // cannot prove the birth, stay silent
+            }
+            int64_t s_nan = 0;
+            llama_context_nan_scan(src, 1, s_nan);
+            if (g_nan_hunt_n_inf > 0 || s_nan > 0) {
+                return true; // inherited, not born here
+            }
+        }
+        inf_born = true;
+        // locate the first inf for the report
+        std::vector<uint8_t> buf(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = t->type == GGML_TYPE_F32 ? ((const float *) buf.data())[i] : ggml_fp16_to_fp32(((const ggml_fp16_t *) buf.data())[i]);
+            if (std::isinf(v)) { first = i; break; }
+        }
+        if (first < 0) {
+            return true;
+        }
     }
 
     // suspect found: full scan of it and of its float sources, so an op that merely
@@ -167,7 +206,8 @@ static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * u
     const int64_t i1 = (first / t->ne[0]) % t->ne[1];
 
     g_nan_hunt_logged++;
-    LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " n_inf=%" PRId64 " first=(%" PRId64 ",%" PRId64 ")\n",
+    LLAMA_LOG_ERROR("[TAG_NAN_CHECK] %s tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " n_inf=%" PRId64 " first=(%" PRId64 ",%" PRId64 ")\n",
+            inf_born ? "Inf born in" : "NaN",
             ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3], n_nan, g_nan_hunt_n_inf, i0, i1);
 
     // which tokens sit in the NaN columns (ne[1] is the token dimension of a 2D activation)
