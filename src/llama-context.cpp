@@ -80,6 +80,60 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// [TAG_NAN_CHECK] eval callback used by LLAMA_NAN_CHECK=2, see the constructor
+static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+
+    static thread_local int64_t n_logged = 0;
+
+    if (ask) {
+        return true;
+    }
+
+    if (n_logged >= 16) {
+        return true;
+    }
+
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+        return true;
+    }
+
+    const int64_t n = ggml_nelements(t);
+    if (n == 0) {
+        return true;
+    }
+
+    // sample: full read for small tensors, strided for large ones
+    const int64_t step = n <= (1 << 18) ? 1 : n / (1 << 18);
+
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+
+    bool bad = false;
+    if (ggml_is_contiguous(t)) {
+        if (t->type == GGML_TYPE_F32) {
+            const float * d = (const float *) buf.data();
+            for (int64_t i = 0; i < n && !bad; i += step) {
+                bad = std::isnan(d[i]); // -inf is legitimate in masks and biased scores
+            }
+        } else {
+            const ggml_fp16_t * d = (const ggml_fp16_t *) buf.data();
+            for (int64_t i = 0; i < n && !bad; i += step) {
+                bad = std::isnan(ggml_fp16_to_fp32(d[i]));
+            }
+        }
+    }
+
+    if (bad) {
+        n_logged++;
+        LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0='%s' src1='%s'\n",
+                ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                t->src[0] ? ggml_get_name(t->src[0]) : "-", t->src[1] ? ggml_get_name(t->src[1]) : "-");
+    }
+
+    return true;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -139,6 +193,17 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // [TAG_NAN_CHECK] LLAMA_NAN_CHECK=2 hunts the first op that produces a non-finite value:
+    // every graph node is pulled to the host and sampled, and the first offender is logged
+    // with its name, op and shape. Slow (one sync per node, CUDA graphs off); diagnosis only.
+    if (cparams.cb_eval == nullptr) {
+        const char * e = getenv("LLAMA_NAN_CHECK");
+        if (e != nullptr && atoi(e) >= 2) {
+            cparams.cb_eval = llama_context_nan_hunt_cb;
+            cparams.cb_eval_user_data = this;
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
