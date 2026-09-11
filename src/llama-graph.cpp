@@ -3530,8 +3530,11 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
+    // [TAG_RS_ZERO_FILL] upstream clears with scale(0); a state that once held a NaN or an
+    // Inf then stays NaN forever (NaN*0 == NaN) and every sequence that is later assigned
+    // this cell starts poisoned. Write the zeros instead of multiplying towards them.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs

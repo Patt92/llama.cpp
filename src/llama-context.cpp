@@ -1985,6 +1985,49 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
+    // [TAG_NAN_CHECK] a NaN in the logits is silent: sampling turns it into a repeated token
+    // and a recurrent state that holds one is never cleared again by build_rs. Name the batch
+    // that first produced it, with the shape that matters (embd/image, positions, n_seq).
+    // LLAMA_NAN_CHECK=0 disables the scan.
+    static const bool nan_check = [] {
+        const char * e = getenv("LLAMA_NAN_CHECK");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    if (nan_check && logits.data && n_outputs_all > 0) {
+        synchronize();
+
+        const int64_t n_vocab = vocab.n_tokens();
+
+        for (int64_t i = 0; i < n_outputs_all; ++i) {
+            const float * row = logits.data + i*n_vocab;
+            bool bad = false;
+            for (int64_t j = 0; j < n_vocab; j += 97) {
+                if (!std::isfinite(row[j])) {
+                    bad = true;
+                    break;
+                }
+            }
+            if (!bad) {
+                continue;
+            }
+
+            llama_pos pos_min = std::numeric_limits<llama_pos>::max();
+            llama_pos pos_max = -1;
+            for (int32_t k = 0; k < batch_inp.n_tokens; ++k) {
+                pos_min = std::min(pos_min, balloc->get_batch().pos[k]);
+                pos_max = std::max(pos_max, balloc->get_batch().pos[k]);
+            }
+
+            LLAMA_LOG_ERROR("%s: [TAG_NAN_CHECK] non-finite logits in output row %" PRId64 " of %" PRId64
+                            ": batch n_tokens = %d, embd = %d, pos = [%d, %d], seq_id[0] = %d, ctx_type = %d, arch = %s\n",
+                            __func__, i, (int64_t) n_outputs_all, batch_inp.n_tokens, batch_inp.embd != nullptr,
+                            pos_min, pos_max, batch_inp.n_seq_id ? batch_inp.seq_id[0][0] : -1,
+                            (int) cparams.ctx_type, model.arch_name().c_str());
+            break;
+        }
+    }
+
     // set output mappings
     if (n_outputs > 0) {
         bool sorted_output = true;
