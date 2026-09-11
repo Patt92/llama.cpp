@@ -2826,7 +2826,7 @@ index 2fc0fe9fdbb71da709cb1e01f1f496d1f9425718..f226743368ae62a5e915677ad72bd321
  #define cudaStream_t hipStream_t
  #define cudaSuccess hipSuccess
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index cc7d7206933f39260e2db319627415019cb73a7d..9f32e5ddfbc3da5a1958c591d7d53f42c61848db 100644
+index cc7d7206933f39260e2db319627415019cb73a7d..9f94e719a1758b5df17d0f0e12503ddd792773f3 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -700,7 +700,14 @@ static void ggml_backend_rpc_buffer_memset_tensor(
@@ -2845,7 +2845,19 @@ index cc7d7206933f39260e2db319627415019cb73a7d..9f32e5ddfbc3da5a1958c591d7d53f42
          auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
          request->tensor = rpc_tensor;
          request->offset = offset;
-@@ -1435,15 +1442,34 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+@@ -1169,6 +1176,11 @@ private:
+ 
+     std::vector<ggml_backend_t> backends;
+     const char * cache_dir;
++    // [TAG_RPC_CACHE_ATOMIC] hash of the last SET_TENSOR_HASH that missed the cache. Only the
++    // SET_TENSOR that follows it (the client re-sending that very tensor) is worth saving:
++    // the client hashes weights only, so activations never reach the disk this way.
++    uint64_t pending_cache_hash = 0;
++    bool     pending_cache      = false;
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+     // store the last computed graph for each backend
+     std::vector<stored_graph> stored_graphs;
+@@ -1435,15 +1447,41 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
      }
  
      const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
@@ -2853,8 +2865,15 @@ index cc7d7206933f39260e2db319627415019cb73a7d..9f32e5ddfbc3da5a1958c591d7d53f42
 +    // [TAG_RPC_CACHE_ATOMIC] only whole tensors are cached, written to a temporary name and
 +    // renamed into place once the stream reports success; a short write (full disk) leaves no
 +    // file behind instead of a truncated one that set_tensor_hash would later serve as valid
-+    if (cache_dir && size > HASH_THRESHOLD && offset == 0 && size == ggml_nbytes(tensor)) {
++    const bool want_cache = cache_dir && pending_cache && size > HASH_THRESHOLD && offset == 0 && size == ggml_nbytes(tensor);
++    pending_cache = false;
++    if (want_cache) {
          uint64_t hash = fnv_hash((const uint8_t*)data, size);
++        if (hash != pending_cache_hash) {
++            // not the tensor the client just asked about
++            ggml_backend_tensor_set(tensor, data, offset, size);
++            return true;
++        }
          char hash_str[17];
          snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
          // save to cache_dir/hash_str
@@ -2884,7 +2903,16 @@ index cc7d7206933f39260e2db319627415019cb73a7d..9f32e5ddfbc3da5a1958c591d7d53f42
      }
      ggml_backend_tensor_set(tensor, data, offset, size);
      return true;
-@@ -1490,6 +1516,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+@@ -1473,6 +1511,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+ {
+     std::vector<uint8_t> cached_file;
+     if (!get_cached_file(request.hash, cached_file)) {
++        pending_cache_hash = request.hash;
++        pending_cache      = true;
+         response.result = 0;
+         return true;
+     }
+@@ -1490,6 +1530,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
          GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
          return false;
      }
@@ -7133,10 +7161,10 @@ index 3496f72e494995d65029f215e67bad28edebf677..8abd8891a991b06ab185b5b4f5e8de1b
                          status_nmse = "\033[1;32mOK\033[0m";
 diff --git a/tests/test-rpc-cache.cpp b/tests/test-rpc-cache.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..9c296f7dcb1cc3e6925192178b583ffbb98451f6
+index 0000000000000000000000000000000000000000..899e14cc11430211a37b1e869c35527b608d4611
 --- /dev/null
 +++ b/tests/test-rpc-cache.cpp
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,56 @@
 +// [TAG_RPC_CACHE_ATOMIC] exercise: a compute-buffer tensor above the hash threshold must not be
 +// cached; a weights tensor is; a truncated cache file must not be served.
 +#include "ggml.h"
@@ -7166,15 +7194,16 @@ index 0000000000000000000000000000000000000000..9c296f7dcb1cc3e6925192178b583ffb
 +    // 1. compute usage: nothing may be cached
 +    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 +    size_t c0 = count();
-+    ggml_backend_tensor_set(t_act, a.data(), 0, n*4);
-+    size_t c1 = count();
 +    std::vector<float> r(n);
++    ggml_backend_tensor_set(t_act, a.data(), 0, n*4);
 +    ggml_backend_tensor_get(t_act, r.data(), 0, n*4);
++    size_t c1 = count();
 +    bool ok1 = memcmp(r.data(), a.data(), n*4) == 0 && c1 == c0;
 +    printf("compute tensor: data ok=%d cache files before=%zu after=%zu -> %s\n", memcmp(r.data(), a.data(), n*4) == 0, c0, c1, ok1 ? "OK" : "FAIL");
 +    // 2. weights usage: cached once, second send hits the cache and data stays right
 +    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 +    ggml_backend_tensor_set(t_w, b.data(), 0, n*4);
++    ggml_backend_tensor_get(t_w, r.data(), 0, n*4); // SET_TENSOR has no reply: the round trip orders the count after it
 +    size_t c2 = count();
 +    ggml_backend_tensor_set(t_w, a.data(), 0, n*4); // different data, new entry
 +    ggml_backend_tensor_set(t_w, b.data(), 0, n*4); // back to b: served from cache
