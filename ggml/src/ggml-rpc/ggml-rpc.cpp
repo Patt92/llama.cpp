@@ -700,7 +700,14 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    // [TAG_RPC_HASH_WEIGHTS_ONLY] the hash cache exists so a model reload can skip re-sending its
+    // weights. Compute-buffer inputs (activations the scheduler moves between backends) used to
+    // take the same path: every prefill ubatch above the threshold was hashed, written to the
+    // server's cache directory and later served from there. On a full disk those files are
+    // truncated or empty, and set_tensor_hash then overwrote only part of the tensor and
+    // reported success - the source of non-deterministic Inf/NaN in layer 0 on the gfx1151
+    // cluster. Only weights are hashed now.
+    if (size > HASH_THRESHOLD && buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1435,15 +1442,34 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     }
 
     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
+    // [TAG_RPC_CACHE_ATOMIC] only whole tensors are cached, written to a temporary name and
+    // renamed into place once the stream reports success; a short write (full disk) leaves no
+    // file behind instead of a truncated one that set_tensor_hash would later serve as valid
+    if (cache_dir && size > HASH_THRESHOLD && offset == 0 && size == ggml_nbytes(tensor)) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
         // save to cache_dir/hash_str
         fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
-        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        fs::path tmp_file   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp");
+        bool ok = false;
+        {
+            std::ofstream ofs(tmp_file, std::ios::binary | std::ios::trunc);
+            ofs.write((const char *)data, size);
+            ofs.flush();
+            ok = ofs.good();
+        }
+        std::error_code ec;
+        if (ok && fs::file_size(tmp_file, ec) == size && !ec) {
+            fs::rename(tmp_file, cache_file, ec);
+            ok = !ec;
+        }
+        if (ok) {
+            GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        } else {
+            fs::remove(tmp_file, ec);
+            GGML_LOG_WARN("[%s] could not save '%s' (%zu bytes), cache entry dropped\n", __func__, cache_file.string().c_str(), size);
+        }
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
@@ -1489,6 +1515,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
+    }
+
+    // [TAG_RPC_CACHE_ATOMIC] the request carries no size, so the only proof that a cache file
+    // is complete is that it covers the tensor from the offset to its end. A truncated or empty
+    // file (full disk while it was written) used to be copied as far as it went and then
+    // reported as "the server has the same data", leaving the rest of the tensor stale.
+    if (size <= HASH_THRESHOLD || request.offset + size != ggml_nbytes(tensor)) {
+        GGML_LOG_WARN("[%s] cache entry %016" PRIx64 " has %zu bytes, tensor needs %zu from offset %" PRIu64 " - ignoring it\n",
+                      __func__, request.hash, size, ggml_nbytes(tensor), request.offset);
+        response.result = 0;
+        return true;
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
