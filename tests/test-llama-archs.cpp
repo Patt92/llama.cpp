@@ -487,64 +487,6 @@ static void test_qwen4exp_mtp(
     llama_batch_free(batch);
 }
 
-// [TAG_QSA_GATHER_VERIFY] the QSA gather path batches several tokens per stream (speculative
-// verification). With indexer_top_k = 8 the padded gather width (256) covers this whole cache,
-// so every gathered query attends to all of its visible cells, exactly like eight single-token
-// gathers do. Any error in how the per-token top-k lists, gathered K/V and masks line up in the
-// batch dimension shows up as a logits mismatch between the two.
-static void test_qwen4exp_qsa_gather(
-        struct gguf_context * gguf_ctx, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode, const std::vector<llama_token> & tokens) {
-    const uint32_t n_prefill = 120;
-    const uint32_t n_verify  = 8;
-    GGML_ASSERT(tokens.size() >= n_prefill + n_verify);
-
-    setenv("QWEN4EXP_QSA_GATHER", "2", 1);
-
-    auto decode_range = [&](llama_context * lctx, uint32_t pos0, uint32_t n, bool one_by_one, std::vector<float> * out) {
-        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
-        const uint32_t step = one_by_one ? 1 : n;
-        for (uint32_t pos = pos0; pos < pos0 + n; pos += step) {
-            llama_batch batch = llama_batch_init(step, 0, 1);
-            for (uint32_t i = 0; i < step; ++i) {
-                common_batch_add(batch, tokens[pos + i], pos + i, {0}, out != nullptr);
-            }
-            if (llama_decode(lctx, batch)) {
-                llama_batch_free(batch);
-                throw std::runtime_error("qwen4exp QSA gather decode failed");
-            }
-            if (out) {
-                for (uint32_t i = 0; i < step; ++i) {
-                    const float * l = llama_get_logits_ith(lctx, i);
-                    out->insert(out->end(), l, l + n_vocab);
-                }
-            }
-            llama_batch_free(batch);
-        }
-    };
-
-    std::vector<float> logits_batched;
-    std::vector<float> logits_single;
-    {
-        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, devs, split_mode, false);
-        decode_range(mc.second.get(), 0, n_prefill, false, nullptr);
-        decode_range(mc.second.get(), n_prefill, n_verify, false, &logits_batched);
-    }
-    {
-        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, devs, split_mode, false);
-        decode_range(mc.second.get(), 0, n_prefill, false, nullptr);
-        decode_range(mc.second.get(), n_prefill, n_verify, true, &logits_single);
-    }
-
-    unsetenv("QWEN4EXP_QSA_GATHER");
-
-    const double nmse_val = nmse(logits_single, logits_batched);
-    if (!(nmse_val < 1e-4)) {
-        throw std::runtime_error(string_format("qwen4exp QSA gather: batched verify differs from single-token, NMSE = %.2e", nmse_val));
-    }
-    printf("qwen4exp QSA gather: %u-token verify batch vs single-token gathers, NMSE = %.2e\n", n_verify, nmse_val);
-}
-
 // [TAG_KPOOL_KEY_CACHE] decode the same tokens as two consecutive batches. Causal attention
 // makes the result identical to the single-shot run, so any state that is carried between
 // passes and goes stale - such as the glm5next pool-key cache - shows up as a logits mismatch.
@@ -952,7 +894,6 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         if (arch == LLM_ARCH_QWEN4EXP) {
                             auto gguf_ctx_mtp = get_gguf_ctx(arch, moe, true);
                             test_qwen4exp_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
-                            test_qwen4exp_qsa_gather(gguf_ctx.get(), seed, dc.devs, dc.split_mode, tokens);
                         }
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

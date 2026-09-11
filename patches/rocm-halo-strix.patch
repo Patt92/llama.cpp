@@ -1,14 +1,14 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..b83c9b1ec 100644
+index aae3bcd35..4b2a28007 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,216 @@
+@@ -17,6 +17,214 @@
  
  </div>
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`5cdd3d1dad5cbb7107b3e9f6d23239ba88ac0123`](https://github.com/ggml-org/llama.cpp/commit/5cdd3d1dad5cbb7107b3e9f6d23239ba88ac0123).
++Based on upstream llama.cpp commit [`df03399b885831b2a1603b3abb0d8c156808e363`](https://github.com/ggml-org/llama.cpp/commit/df03399b885831b2a1603b3abb0d8c156808e363).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -25,9 +25,7 @@ index aae3bcd35..b83c9b1ec 100644
 +- Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 +- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 +- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
-+- Lets a shared MTP draft borrow `token_embd` and `output` from its target. Unsloth's `mtp-Qwen3.8-Flash-Next-shared-*.gguf` ships the NextN block alone; the loader required `token_embd` unconditionally and failed with `check_tensor_dims: tensor 'token_embd.weight' not found`. Both are now optional when the trunk is absent and are resolved through `ctx_other` at graph time, with a shape check against the target. Only usable as a draft (`-md`), never standalone.
-+- Treats only `gemma4-assistant` as memory-shared in speculative decoding. The flag skips the catch-up decode and places every draft token at the same position, which is the Gemma4-assistant convention; it was being applied to every MTP draft that pointed at its target, including Qwen3.8-Flash-Next, whose NextN head keeps its own KV and needs sequential positions. Follows [`#28243`](https://github.com/ggml-org/llama.cpp/pull/28243), whose author reports 1.3-2x faster MTP from this; not yet measured here.
-+- Gathers the QSA-selected keys and values into a compact buffer for decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213), which limited it to one token per stream; its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Extended here to ubatches of up to 8 tokens per stream, because speculative verification hands the target `n-max + 1` tokens per pass and the one-token gate sent every such pass down the masked path -- with `--spec-draft-n-max 2` the gather never engaged at all, which is why Qwen3.8-Flash-Next decoded at 30 t/s at 15k but 20 t/s past 50k. Each token carries its own top-k list and becomes one entry of the attention batch; `test-llama-archs --arch qwen4exp` checks an 8-token verify batch against eight single-token gathers (NMSE 0 on gfx1151). Engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it, `=2` forces it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
++- Gathers the QSA-selected keys and values into a compact buffer for single-token decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken unchanged from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213); its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Decode only, engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
 +- Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
 +- Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
 +- Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
@@ -211,7 +209,7 @@ index aae3bcd35..b83c9b1ec 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 5cdd3d1dad5cbb7107b3e9f6d23239ba88ac0123
++git checkout df03399b885831b2a1603b3abb0d8c156808e363
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -219,27 +217,6 @@ index aae3bcd35..b83c9b1ec 100644
  ## Quick start
  
  A few options to get `llama.cpp` installed on your machine:
-diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 7c8a06365..354047fac 100644
---- a/common/speculative.cpp
-+++ b/common/speculative.cpp
-@@ -1420,7 +1420,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
- 
--        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
-+        // [TAG_MTP_MEM_SHARED_GEMMA_ONLY] sharing the target context is not the same thing as the
-+        // Gemma4-assistant memory model. Every MTP draft here sets ctx_other = ctx_tgt, but only
-+        // gemma4-assistant shares the target KV and wants every draft token at the same position
-+        // (see the is_mem_shared branch in draft()). qwen4exp's NextN head keeps its own KV and
-+        // needs pos0 + i + 1, and the catch-up decode below must run for it. Follows upstream
-+        // PR 28243.
-+        char arch[64] = {0};
-+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
-+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
-         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
- 
-         if (chain_heads) {
 diff --git a/conversion/qwen4exp.py b/conversion/qwen4exp.py
 index 168796d61..5de299346 100644
 --- a/conversion/qwen4exp.py
@@ -2963,21 +2940,6 @@ index f1d173a57..ea962fd7c 100644
      LLM_TENSOR_MASKED_EMBD_CENTROIDS,
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
-diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 21501574a..fa1b5a729 100644
---- a/src/llama-context.cpp
-+++ b/src/llama-context.cpp
-@@ -152,7 +152,9 @@ llama_context::llama_context(
-         cparams.ctx_other = params.ctx_other;
-     }
- 
--    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
-+    // [TAG_QWEN4EXP_SHARED_MTP] a shared qwen4exp draft borrows token_embd / output from its
-+    // target through ctx_other, the same way EAGLE3 and DFLASH drafts do. Follows PR 28243.
-+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
-         if (model.tok_embd == nullptr || model.output == nullptr) {
-             if (params.ctx_other == nullptr) {
-                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 5855393ef..a6d82efae 100644
 --- a/src/llama-graph.cpp
@@ -4169,7 +4131,7 @@ index 000000000..afb823fd5
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f9e9a8bcb..671a2d795 100644
+index d10b60afd..b9022f643 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
@@ -5637,34 +5599,10 @@ index 87195fddd..7c4c8b7a8 100644
  };
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..25f9c8048 100644
+index 8ace95f73..7240622ed 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -4,6 +4,23 @@
- #include "llama-memory-recurrent.h"
- 
- #include <algorithm>
-+
-+// [TAG_QSA_GATHER_VERIFY] largest tokens-per-stream ubatch that still takes the gather path
-+static constexpr int64_t QSA_GATHER_MAX_TPS = 8;
-+
-+// [TAG_QWEN4EXP_SHARED_MTP] a shared draft head has no token_embd / output of its own; it is only
-+// usable as the draft of its target (-md), whose context arrives here as cparams.ctx_other.
-+static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams, const llama_model & model, const char * name) {
-+    if (cparams.ctx_other == nullptr) {
-+        throw std::runtime_error(format("QWEN4EXP MTP: this draft head has no '%s' of its own; "
-+                                        "load it as a draft of its target model (-md), not on its own", name));
-+    }
-+    const llama_model & other = *llama_get_model(cparams.ctx_other);
-+    if (other.hparams.n_embd != model.hparams.n_embd || other.vocab.n_tokens() != model.vocab.n_tokens()) {
-+        throw std::runtime_error(format("QWEN4EXP MTP: draft and target disagree on the shape of '%s'", name));
-+    }
-+    return other;
-+}
- #include <cinttypes>
- 
- // bad metadata must be catchable: GGML_ASSERT aborts the whole process
-@@ -24,6 +41,12 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
+@@ -24,6 +24,12 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
  }
  
  void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
@@ -5677,27 +5615,21 @@ index 8ace95f73..25f9c8048 100644
      ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
      ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
      ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-@@ -154,15 +177,28 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -154,12 +160,18 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
      const int64_t hc_dim = hc * n_embd;
      const int64_t hc_lr  = hparams.hc_low_rank;
  
--    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 +    // a draft-only export declares the full block count but ships the MTP block alone,
 +    // so the trunk is described and absent. same probe as qwen35.
 +    const bool mtp_only    = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
 +    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
++
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
  
 -    // there is no output_norm: the final hyper-connection mixer carries it
 -    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, 0);
 -    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
 -    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
-+    // [TAG_QWEN4EXP_SHARED_MTP] a *shared* draft export (Unsloth's mtp-*-shared-*.gguf) borrows
-+    // token_embd and output from its target instead of carrying its own copies. Make them
-+    // optional whenever the trunk is absent; the MTP graph resolves them through cparams.ctx_other
-+    // below. Follows upstream PR 28243, which does the same thing on top of a loader that is
-+    // otherwise laid out differently from this one.
-+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
-+
 +    // there is no output_norm: the final hyper-connection mixer carries it. the MTP head
 +    // has its own in nextn.hc_head_*, so a draft-only file does not carry these
 +    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, trunk_flags);
@@ -5705,14 +5637,8 @@ index 8ace95f73..25f9c8048 100644
 +    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
  
      output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
--    if (output == NULL) {
-+    // tie_word_embeddings is false for this family: never tie to a token_embd that a borrowing
-+    // draft does not have. A shared draft leaves both null and borrows them at graph time.
-+    if (output == NULL && tok_embd != NULL) {
-         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
-     }
- 
-@@ -188,10 +224,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     if (output == NULL) {
+@@ -188,10 +200,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                             { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
      }
  
@@ -5740,7 +5666,7 @@ index 8ace95f73..25f9c8048 100644
          const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
  
          const int64_t head_k_dim = hparams.ssm_d_state;
-@@ -203,61 +254,93 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -203,61 +230,86 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
          const int64_t conv_dim   = key_dim * 2 + value_dim;
  
          // two HC modules per layer: before the token mixer, before the MoE
@@ -5829,15 +5755,15 @@ index 8ace95f73..25f9c8048 100644
 +        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
 +        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
 +        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
++
++        if (il < n_layer) {
++            continue;
++        }
  
 -        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
 -        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
-+        if (il < n_layer) {
-+            continue;
-+        }
-+
 +        // NextN/MTP head. enorm/hnorm gate the two inputs; eh_proj is the checkpoint's
 +        // fc_embedding and fc_hidden fused side by side, so one matmul over
 +        // concat(e, h) computes fc_embedding@e + fc_hidden@h.
@@ -5862,17 +5788,10 @@ index 8ace95f73..25f9c8048 100644
 +    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
 +        return std::make_unique<graph_mtp>(*this, params);
 +    }
-+    // [TAG_QWEN4EXP_SHARED_MTP] a draft export has no trunk. Loaded on its own it would build the
-+    // trunk graph over null tensors and segfault in graph_reserve (reproduced with Unsloth's
-+    // shared sidecar); loaded through -md only the MTP graph above is ever built.
-+    if (hc_head_norm == nullptr) {
-+        throw std::runtime_error("this model is an MTP draft head without a trunk; "
-+                                 "load it as a draft of its target model (-md), not on its own");
-+    }
      return std::make_unique<graph>(*this, params);
  }
  
-@@ -397,7 +480,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -397,7 +449,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
@@ -5885,7 +5804,7 @@ index 8ace95f73..25f9c8048 100644
              // everything below is per token, so drop the rows that produce no output
              cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
              inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-@@ -425,6 +512,23 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -425,6 +481,23 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
          cb(res_hc, "l_last", il);
      }
  
@@ -5909,7 +5828,7 @@ index 8ace95f73..25f9c8048 100644
      // the final mixer is the output norm: there is no separate one
      ggml_tensor * cur = build_hc_mix(res_hc,
              model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-@@ -440,6 +544,207 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -440,6 +513,197 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  
@@ -5958,10 +5877,6 @@ index 8ace95f73..25f9c8048 100644
 +    ggml_set_name(inp->h, "mtp_h_input");
 +
 +    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-+    if (tok_embd_w == nullptr) {
-+        // [TAG_QWEN4EXP_SHARED_MTP] shared draft: borrow the target's embedding
-+        tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
-+    }
 +    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
 +    cb(tok_embd, "mtp_tok_embd", il);
 +
@@ -6099,13 +6014,7 @@ index 8ace95f73..25f9c8048 100644
 +
 +    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
 +    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-+    if (head_w == nullptr) {
-+        // [TAG_QWEN4EXP_SHARED_MTP] shared draft: borrow the target's LM head
-+        const llama_model & other = qwen4exp_shared_model(cparams, model, "output.weight");
-+        head_w = other.output;
-+        head_s = other.output_s;
-+    }
-+    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head, model.output, or the target's output)");
++    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 +
 +    cur = build_lora_mm(head_w, cur, head_s);
 +    cb(cur, "result_output", -1);
@@ -6117,7 +6026,7 @@ index 8ace95f73..25f9c8048 100644
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                  ggml_tensor * input,
                          int   il) {
-@@ -528,7 +833,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -528,7 +792,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_tensor *                           inp_pos,
          ggml_tensor *                           kq_mask,
          int *                                   sections,
@@ -6127,7 +6036,7 @@ index 8ace95f73..25f9c8048 100644
      const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
  
      const int64_t idx_dim  = hparams.indexer_head_size;
-@@ -549,7 +855,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -549,7 +814,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -6139,7 +6048,7 @@ index 8ace95f73..25f9c8048 100644
          kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
          cparams.causal_attn && !hparams.use_alibi;
  
-@@ -662,7 +971,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -662,7 +930,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      cb(expanded, "indexer_score_tokens", il);
  
      // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
@@ -6153,7 +6062,7 @@ index 8ace95f73..25f9c8048 100644
  
      ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
  
-@@ -681,8 +995,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -681,8 +954,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_tensor *             k_cur,
          ggml_tensor *             v_cur,
          ggml_tensor *             top_k,
@@ -6165,7 +6074,7 @@ index 8ace95f73..25f9c8048 100644
      // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
      // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
      if (inp->self_k_rot) {
-@@ -712,6 +1028,79 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -712,6 +987,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -6185,11 +6094,9 @@ index 8ace95f73..25f9c8048 100644
 +        const int64_t n_kv   = kf->ne[2];
 +        const int64_t ns     = kf->ne[3];
 +        const int64_t n_topk = top_k->ne[0];
-+        const int64_t n_tps  = top_k->ne[1]; // tokens per stream, each with its own top-k list
-+        const int64_t nb_all = n_tps*ns;     // gathered batch: entry s*n_tps + i is token i of stream s
 +
-+        GGML_ASSERT(n_tps <= QSA_GATHER_MAX_TPS && "QSA gather: ubatch larger than the gate allows");
-+        GGML_ASSERT(qsa_bias != nullptr && qsa_bias->ne[0] == n_kv && qsa_bias->ne[1] == n_tps && "QSA gather requires the per-cell bias");
++        GGML_ASSERT(top_k->ne[1] == 1 && "QSA gather requires single-token-per-stream ubatches");
++        GGML_ASSERT(qsa_bias != nullptr && qsa_bias->ne[0] == n_kv && "QSA gather requires the per-cell bias");
 +
 +        // the heads of a cell are contiguous in the cache, so a cell can be gathered as one row
 +        GGML_ASSERT(kf->nb[2] == ggml_row_size(kf->type, hd_k*n_h_kv));
@@ -6200,17 +6107,15 @@ index 8ace95f73..25f9c8048 100644
 +        ggml_tensor * v_cells = ggml_view_4d(ctx0, vf, hd_v*n_h_kv, n_kv, 1, ns,
 +                vf->nb[2], vf->nb[2]*n_kv, vf->nb[3], 0);
 +
-+        // top_k [n_topk, n_tps, 1, ns] -> the index layout ggml_get_rows expects. the cells of
-+        // one stream are shared by its tokens, so all of a stream's lists gather from the same
-+        // rows: [n_topk*n_tps, 1, ns, 1], token-major within the stream
-+        ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk*n_tps, 1, ns, 1);
++        // top_k [n_topk, 1, 1, ns] -> the index layout ggml_get_rows expects: [n_topk, 1, ns, 1]
++        ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk, 1, ns, 1);
 +
 +        // get_rows dequantizes the cells to F32; build_attn_mha casts to F16 for flash attention
-+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk*n_tps, 1, ns]
-+        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk*n_tps, 1, ns]
++        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk, 1, ns]
++        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk, 1, ns]
 +
-+        k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, nb_all);
-+        v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, nb_all);
++        k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, ns);
++        v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, ns);
 +        cb(k_g, "qsa_k_gathered", il);
 +        cb(v_g, "qsa_v_gathered", il);
 +
@@ -6218,19 +6123,14 @@ index 8ace95f73..25f9c8048 100644
 +        // member, 1e9 for the always-visible tail, -inf for anything the padded top-k width
 +        // pulled in that the query must not see. clamping to (-inf, 0] turns that into the
 +        // attention mask over the gathered set.
-+        // bias [n_kv, n_tps, ns] read as rows of one cell: [1, n_kv, n_tps, ns]. the stream
-+        // stride is nb[2]; the earlier nb[3] read past the tensor for the second stream
-+        ggml_tensor * b1 = ggml_view_4d(ctx0, qsa_bias, 1, n_kv, n_tps, ns,
-+                qsa_bias->nb[0], qsa_bias->nb[1], qsa_bias->nb[2], 0);
-+        ggml_tensor * idx_b = ggml_reshape_4d(ctx0, top_k, n_topk, n_tps, ns, 1);
-+        ggml_tensor * m_g = ggml_get_rows(ctx0, b1, idx_b);          // F32 [1, n_topk, n_tps, ns]
-+        m_g = ggml_reshape_4d(ctx0, m_g, n_topk, 1, 1, nb_all);
++        ggml_tensor * b1 = ggml_view_4d(ctx0, qsa_bias, 1, n_kv, 1, ns,
++                qsa_bias->nb[0], qsa_bias->nb[1], qsa_bias->nb[3], 0);
++        ggml_tensor * m_g = ggml_get_rows(ctx0, b1, idx);            // F32 [1, n_topk, 1, ns]
++        m_g = ggml_reshape_4d(ctx0, m_g, n_topk, 1, 1, ns);
 +        m_g = ggml_clamp(ctx0, m_g, -INFINITY, 0.0f);
 +        m_g = ggml_cast(ctx0, m_g, GGML_TYPE_F16);                   // FA wants contiguous F16
 +        cb(m_g, "qsa_mask_gathered", il);
 +
-+        // build_attn_mha splits q [hd, n_head, n_tokens] by k->ne[3] = nb_all into one query per
-+        // batch entry, in the same s*n_tps + i order the ubatch lays its tokens out in
 +        ggml_tensor * cur = build_attn_mha(q_cur, k_g, v_g, nullptr, m_g, nullptr, nullptr, 0, kq_scale, il);
 +        cb(cur, "kqv_out", il);
 +
@@ -6245,45 +6145,35 @@ index 8ace95f73..25f9c8048 100644
      ggml_tensor * kq_mask = inp->get_kq_mask();
  
      // prepare new kq mask - starts filled with -INFINITY
-@@ -771,7 +1160,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -771,7 +1110,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      // indexer reads the same block input as q/k/v; no cache or no ratio means dense
      const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
  
 -    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 +    // gather-based QSA decode: worth it once the cache is meaningfully deeper than the
 +    // top-k width; below that the masked path costs about the same. QWEN4EXP_QSA_GATHER=0
-+    // disables it (A/B lever, and an escape hatch); =2 forces it regardless of the depth, which
-+    // is what test-llama-archs uses on a 256-cell cache. read per graph build, not once, so a
-+    // test can flip it between contexts.
-+    const int gather_mode = [] {
++    // disables it (A/B lever, and an escape hatch).
++    static const bool gather_enabled = [] {
 +        const char * e = getenv("QWEN4EXP_QSA_GATHER");
-+        return e == nullptr ? 1 : atoi(e);
++        return e == nullptr || atoi(e) != 0;
 +    }();
 +
 +    bool gather = false;
-+    if (qsa && gather_mode != 0) {
++    if (qsa && gather_enabled) {
 +        const int64_t r     = hparams.dsv4_compress_ratios[il];
 +        const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
 +        const int64_t width = GGML_PAD((int64_t) hparams.indexer_top_k + r - 1, 256);
 +
 +        const int64_t n_stream = mctx_hyb->get_n_stream();
 +
-+        // [TAG_QSA_GATHER_VERIFY] speculative decoding verifies n_max+1 tokens per stream in one
-+        // pass. the original gate (one token per stream) sent every such pass down the masked
-+        // path, where flash attention scans the whole cache to use top-k cells of it; at 57k
-+        // context that was +46 ms per round on gfx1151. each token has its own top-k list, so
-+        // the gather generalises: every (stream, token) becomes one entry of the batch dim.
-+        // the cap keeps the gathered K/V (2 * width * row * 4 B per token) small.
-+        const int64_t n_tps = n_tokens / n_stream;
-+
-+        gather = n_tokens % n_stream == 0 && n_tps <= QSA_GATHER_MAX_TPS && (n_kv >= 4*width || gather_mode == 2);
++        gather = n_tokens == n_stream && n_kv >= 4*width;
 +    }
 +
 +    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, gather) : nullptr;
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -824,7 +1242,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -824,7 +1182,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  
      if (top_k) {
@@ -6295,7 +6185,7 @@ index 8ace95f73..25f9c8048 100644
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index ef4fc30ce..f3bd43491 100644
+index 3428629fd..e9e130092 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6222,7 +6222,7 @@ struct test_concat : public test_case {
@@ -6333,7 +6223,7 @@ index ef4fc30ce..f3bd43491 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10741,6 +10751,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10734,6 +10744,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -6345,20 +6235,21 @@ index ef4fc30ce..f3bd43491 100644
  #if 0
      // these tests are disabled to save execution time, sbut they can be handy for debugging
      test_cases.emplace_back(new test_llama(2, true));
-@@ -11046,6 +11061,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
-     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+@@ -11031,6 +11046,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
 +    // [TAG_FATTN_TILE_SPARSE] GLM-5.3-Flash prefill: absorbed MLA is 512 wide, gqa 8 picks
 +    // ncols2 = 8 and a 2048-token ubatch picks ncols1 = 4, which is the only shape the tile
 +    // kernel's row compaction engages for. The perf set had no 512-wide sparse case above one
 +    // token, so the path could not be measured.
 +    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {8, 1}, 32768, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
- 
++
      for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
          for (int hs : { 64, 128, 256, 576, }) {
+             const int  hsv    = hs == 576 ? 512 : hs;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index dbed9846f..352732ca6 100644
+index dbed9846f..a8e4b78bc 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -12,7 +12,9 @@
@@ -6480,7 +6371,7 @@ index dbed9846f..352732ca6 100644
      if (!encode) {
          ctx_params.n_ubatch = 64;
      }
-@@ -420,6 +447,149 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -420,6 +447,91 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
      return std::make_pair(std::move(model), std::move(lctx));
  }
  
@@ -6522,64 +6413,6 @@ index dbed9846f..352732ca6 100644
 +    }
 +
 +    llama_batch_free(batch);
-+}
-+
-+// [TAG_QSA_GATHER_VERIFY] the QSA gather path batches several tokens per stream (speculative
-+// verification). With indexer_top_k = 8 the padded gather width (256) covers this whole cache,
-+// so every gathered query attends to all of its visible cells, exactly like eight single-token
-+// gathers do. Any error in how the per-token top-k lists, gathered K/V and masks line up in the
-+// batch dimension shows up as a logits mismatch between the two.
-+static void test_qwen4exp_qsa_gather(
-+        struct gguf_context * gguf_ctx, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-+        const llama_split_mode split_mode, const std::vector<llama_token> & tokens) {
-+    const uint32_t n_prefill = 120;
-+    const uint32_t n_verify  = 8;
-+    GGML_ASSERT(tokens.size() >= n_prefill + n_verify);
-+
-+    setenv("QWEN4EXP_QSA_GATHER", "2", 1);
-+
-+    auto decode_range = [&](llama_context * lctx, uint32_t pos0, uint32_t n, bool one_by_one, std::vector<float> * out) {
-+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
-+        const uint32_t step = one_by_one ? 1 : n;
-+        for (uint32_t pos = pos0; pos < pos0 + n; pos += step) {
-+            llama_batch batch = llama_batch_init(step, 0, 1);
-+            for (uint32_t i = 0; i < step; ++i) {
-+                common_batch_add(batch, tokens[pos + i], pos + i, {0}, out != nullptr);
-+            }
-+            if (llama_decode(lctx, batch)) {
-+                llama_batch_free(batch);
-+                throw std::runtime_error("qwen4exp QSA gather decode failed");
-+            }
-+            if (out) {
-+                for (uint32_t i = 0; i < step; ++i) {
-+                    const float * l = llama_get_logits_ith(lctx, i);
-+                    out->insert(out->end(), l, l + n_vocab);
-+                }
-+            }
-+            llama_batch_free(batch);
-+        }
-+    };
-+
-+    std::vector<float> logits_batched;
-+    std::vector<float> logits_single;
-+    {
-+        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, devs, split_mode, false);
-+        decode_range(mc.second.get(), 0, n_prefill, false, nullptr);
-+        decode_range(mc.second.get(), n_prefill, n_verify, false, &logits_batched);
-+    }
-+    {
-+        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, devs, split_mode, false);
-+        decode_range(mc.second.get(), 0, n_prefill, false, nullptr);
-+        decode_range(mc.second.get(), n_prefill, n_verify, true, &logits_single);
-+    }
-+
-+    unsetenv("QWEN4EXP_QSA_GATHER");
-+
-+    const double nmse_val = nmse(logits_single, logits_batched);
-+    if (!(nmse_val < 1e-4)) {
-+        throw std::runtime_error(string_format("qwen4exp QSA gather: batched verify differs from single-token, NMSE = %.2e", nmse_val));
-+    }
-+    printf("qwen4exp QSA gather: %u-token verify batch vs single-token gathers, NMSE = %.2e\n", n_verify, nmse_val);
 +}
 +
 +// [TAG_KPOOL_KEY_CACHE] decode the same tokens as two consecutive batches. Causal attention
@@ -6630,7 +6463,7 @@ index dbed9846f..352732ca6 100644
  static std::vector<float> get_logits(
          llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
      const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
-@@ -476,6 +646,7 @@ static bool moe_mandatory(const llm_arch arch) {
+@@ -476,6 +588,7 @@ static bool moe_mandatory(const llm_arch arch) {
          case LLM_ARCH_DEEPSEEK4:
          case LLM_ARCH_GLM4_MOE:
          case LLM_ARCH_GLM_DSA:
@@ -6638,7 +6471,7 @@ index dbed9846f..352732ca6 100644
          case LLM_ARCH_EXAONE_MOE:
          case LLM_ARCH_BAILINGMOE:
          case LLM_ARCH_BAILINGMOE2:
-@@ -758,10 +929,31 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -758,10 +871,30 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                      if (logits_cpu.empty()) {
                          model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                          logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
@@ -6665,7 +6498,6 @@ index dbed9846f..352732ca6 100644
 +                        if (arch == LLM_ARCH_QWEN4EXP) {
 +                            auto gguf_ctx_mtp = get_gguf_ctx(arch, moe, true);
 +                            test_qwen4exp_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
-+                            test_qwen4exp_qsa_gather(gguf_ctx.get(), seed, dc.devs, dc.split_mode, tokens);
 +                        }
                          const double nmse_val = nmse(logits_cpu, logits_dev);
                          snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

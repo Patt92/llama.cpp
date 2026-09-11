@@ -4,23 +4,6 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
-
-// [TAG_QSA_GATHER_VERIFY] largest tokens-per-stream ubatch that still takes the gather path
-static constexpr int64_t QSA_GATHER_MAX_TPS = 8;
-
-// [TAG_QWEN4EXP_SHARED_MTP] a shared draft head has no token_embd / output of its own; it is only
-// usable as the draft of its target (-md), whose context arrives here as cparams.ctx_other.
-static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams, const llama_model & model, const char * name) {
-    if (cparams.ctx_other == nullptr) {
-        throw std::runtime_error(format("QWEN4EXP MTP: this draft head has no '%s' of its own; "
-                                        "load it as a draft of its target model (-md), not on its own", name));
-    }
-    const llama_model & other = *llama_get_model(cparams.ctx_other);
-    if (other.hparams.n_embd != model.hparams.n_embd || other.vocab.n_tokens() != model.vocab.n_tokens()) {
-        throw std::runtime_error(format("QWEN4EXP MTP: draft and target disagree on the shape of '%s'", name));
-    }
-    return other;
-}
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -182,12 +165,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const bool mtp_only    = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
     const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
-    // [TAG_QWEN4EXP_SHARED_MTP] a *shared* draft export (Unsloth's mtp-*-shared-*.gguf) borrows
-    // token_embd and output from its target instead of carrying its own copies. Make them
-    // optional whenever the trunk is absent; the MTP graph resolves them through cparams.ctx_other
-    // below. Follows upstream PR 28243, which does the same thing on top of a loader that is
-    // otherwise laid out differently from this one.
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // there is no output_norm: the final hyper-connection mixer carries it. the MTP head
     // has its own in nextn.hc_head_*, so a draft-only file does not carry these
@@ -196,9 +174,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    // tie_word_embeddings is false for this family: never tie to a token_embd that a borrowing
-    // draft does not have. A shared draft leaves both null and borrows them at graph time.
-    if (output == NULL && tok_embd != NULL) {
+    if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -333,13 +309,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
-    }
-    // [TAG_QWEN4EXP_SHARED_MTP] a draft export has no trunk. Loaded on its own it would build the
-    // trunk graph over null tensors and segfault in graph_reserve (reproduced with Unsloth's
-    // shared sidecar); loaded through -md only the MTP graph above is ever built.
-    if (hc_head_norm == nullptr) {
-        throw std::runtime_error("this model is an MTP draft head without a trunk; "
-                                 "load it as a draft of its target model (-md), not on its own");
     }
     return std::make_unique<graph>(*this, params);
 }
@@ -589,10 +558,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_name(inp->h, "mtp_h_input");
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-    if (tok_embd_w == nullptr) {
-        // [TAG_QWEN4EXP_SHARED_MTP] shared draft: borrow the target's embedding
-        tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
-    }
     ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
@@ -730,13 +695,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    if (head_w == nullptr) {
-        // [TAG_QWEN4EXP_SHARED_MTP] shared draft: borrow the target's LM head
-        const llama_model & other = qwen4exp_shared_model(cparams, model, "output.weight");
-        head_w = other.output;
-        head_s = other.output_s;
-    }
-    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head, model.output, or the target's output)");
+    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
@@ -1044,11 +1003,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const int64_t n_kv   = kf->ne[2];
         const int64_t ns     = kf->ne[3];
         const int64_t n_topk = top_k->ne[0];
-        const int64_t n_tps  = top_k->ne[1]; // tokens per stream, each with its own top-k list
-        const int64_t nb_all = n_tps*ns;     // gathered batch: entry s*n_tps + i is token i of stream s
 
-        GGML_ASSERT(n_tps <= QSA_GATHER_MAX_TPS && "QSA gather: ubatch larger than the gate allows");
-        GGML_ASSERT(qsa_bias != nullptr && qsa_bias->ne[0] == n_kv && qsa_bias->ne[1] == n_tps && "QSA gather requires the per-cell bias");
+        GGML_ASSERT(top_k->ne[1] == 1 && "QSA gather requires single-token-per-stream ubatches");
+        GGML_ASSERT(qsa_bias != nullptr && qsa_bias->ne[0] == n_kv && "QSA gather requires the per-cell bias");
 
         // the heads of a cell are contiguous in the cache, so a cell can be gathered as one row
         GGML_ASSERT(kf->nb[2] == ggml_row_size(kf->type, hd_k*n_h_kv));
@@ -1059,17 +1016,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * v_cells = ggml_view_4d(ctx0, vf, hd_v*n_h_kv, n_kv, 1, ns,
                 vf->nb[2], vf->nb[2]*n_kv, vf->nb[3], 0);
 
-        // top_k [n_topk, n_tps, 1, ns] -> the index layout ggml_get_rows expects. the cells of
-        // one stream are shared by its tokens, so all of a stream's lists gather from the same
-        // rows: [n_topk*n_tps, 1, ns, 1], token-major within the stream
-        ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk*n_tps, 1, ns, 1);
+        // top_k [n_topk, 1, 1, ns] -> the index layout ggml_get_rows expects: [n_topk, 1, ns, 1]
+        ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk, 1, ns, 1);
 
         // get_rows dequantizes the cells to F32; build_attn_mha casts to F16 for flash attention
-        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk*n_tps, 1, ns]
-        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk*n_tps, 1, ns]
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk, 1, ns]
+        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk, 1, ns]
 
-        k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, nb_all);
-        v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, nb_all);
+        k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, ns);
+        v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, ns);
         cb(k_g, "qsa_k_gathered", il);
         cb(v_g, "qsa_v_gathered", il);
 
@@ -1077,19 +1032,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // member, 1e9 for the always-visible tail, -inf for anything the padded top-k width
         // pulled in that the query must not see. clamping to (-inf, 0] turns that into the
         // attention mask over the gathered set.
-        // bias [n_kv, n_tps, ns] read as rows of one cell: [1, n_kv, n_tps, ns]. the stream
-        // stride is nb[2]; the earlier nb[3] read past the tensor for the second stream
-        ggml_tensor * b1 = ggml_view_4d(ctx0, qsa_bias, 1, n_kv, n_tps, ns,
-                qsa_bias->nb[0], qsa_bias->nb[1], qsa_bias->nb[2], 0);
-        ggml_tensor * idx_b = ggml_reshape_4d(ctx0, top_k, n_topk, n_tps, ns, 1);
-        ggml_tensor * m_g = ggml_get_rows(ctx0, b1, idx_b);          // F32 [1, n_topk, n_tps, ns]
-        m_g = ggml_reshape_4d(ctx0, m_g, n_topk, 1, 1, nb_all);
+        ggml_tensor * b1 = ggml_view_4d(ctx0, qsa_bias, 1, n_kv, 1, ns,
+                qsa_bias->nb[0], qsa_bias->nb[1], qsa_bias->nb[3], 0);
+        ggml_tensor * m_g = ggml_get_rows(ctx0, b1, idx);            // F32 [1, n_topk, 1, ns]
+        m_g = ggml_reshape_4d(ctx0, m_g, n_topk, 1, 1, ns);
         m_g = ggml_clamp(ctx0, m_g, -INFINITY, 0.0f);
         m_g = ggml_cast(ctx0, m_g, GGML_TYPE_F16);                   // FA wants contiguous F16
         cb(m_g, "qsa_mask_gathered", il);
 
-        // build_attn_mha splits q [hd, n_head, n_tokens] by k->ne[3] = nb_all into one query per
-        // batch entry, in the same s*n_tps + i order the ubatch lays its tokens out in
         ggml_tensor * cur = build_attn_mha(q_cur, k_g, v_g, nullptr, m_g, nullptr, nullptr, 0, kq_scale, il);
         cb(cur, "kqv_out", il);
 
@@ -1162,31 +1112,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     // gather-based QSA decode: worth it once the cache is meaningfully deeper than the
     // top-k width; below that the masked path costs about the same. QWEN4EXP_QSA_GATHER=0
-    // disables it (A/B lever, and an escape hatch); =2 forces it regardless of the depth, which
-    // is what test-llama-archs uses on a 256-cell cache. read per graph build, not once, so a
-    // test can flip it between contexts.
-    const int gather_mode = [] {
+    // disables it (A/B lever, and an escape hatch).
+    static const bool gather_enabled = [] {
         const char * e = getenv("QWEN4EXP_QSA_GATHER");
-        return e == nullptr ? 1 : atoi(e);
+        return e == nullptr || atoi(e) != 0;
     }();
 
     bool gather = false;
-    if (qsa && gather_mode != 0) {
+    if (qsa && gather_enabled) {
         const int64_t r     = hparams.dsv4_compress_ratios[il];
         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width = GGML_PAD((int64_t) hparams.indexer_top_k + r - 1, 256);
 
         const int64_t n_stream = mctx_hyb->get_n_stream();
 
-        // [TAG_QSA_GATHER_VERIFY] speculative decoding verifies n_max+1 tokens per stream in one
-        // pass. the original gate (one token per stream) sent every such pass down the masked
-        // path, where flash attention scans the whole cache to use top-k cells of it; at 57k
-        // context that was +46 ms per round on gfx1151. each token has its own top-k list, so
-        // the gather generalises: every (stream, token) becomes one entry of the batch dim.
-        // the cap keeps the gathered K/V (2 * width * row * 4 B per token) small.
-        const int64_t n_tps = n_tokens / n_stream;
-
-        gather = n_tokens % n_stream == 0 && n_tps <= QSA_GATHER_MAX_TPS && (n_kv >= 4*width || gather_mode == 2);
+        gather = n_tokens == n_stream && n_kv >= 4*width;
     }
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, gather) : nullptr;
