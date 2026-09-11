@@ -81,10 +81,10 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false,
+        const uint32_t n_ctx = 256, const uint32_t indexer_top_k = 8) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 256;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -312,7 +312,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
 
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        indexer_top_k);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
@@ -486,6 +486,100 @@ static void test_qwen4exp_mtp(
     }
 
     llama_batch_free(batch);
+}
+
+// decode tokens[pos0, pos0+n) in batches of `step`, collecting logits of every token when `out` is set
+static void qwen4exp_decode_range(llama_context * lctx, const std::vector<llama_token> & tokens,
+        uint32_t pos0, uint32_t n, uint32_t step, std::vector<float> * out) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
+    GGML_ASSERT(n % step == 0 && pos0 + n <= tokens.size());
+    for (uint32_t pos = pos0; pos < pos0 + n; pos += step) {
+        llama_batch batch = llama_batch_init(step, 0, 1);
+        for (uint32_t i = 0; i < step; ++i) {
+            common_batch_add(batch, tokens[pos + i], pos + i, {0}, out != nullptr);
+        }
+        if (llama_decode(lctx, batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("qwen4exp QSA decode failed");
+        }
+        if (out) {
+            for (uint32_t i = 0; i < step; ++i) {
+                const float * l = llama_get_logits_ith(lctx, i);
+                out->insert(out->end(), l, l + n_vocab);
+            }
+        }
+        llama_batch_free(batch);
+    }
+}
+
+// [TAG_QSA_GATHER_VERIFY] the QSA gather path batches several tokens per stream (speculative
+// verification). With indexer_top_k = 8 the padded gather width (256) covers this whole cache,
+// so every gathered query attends to all of its visible cells, exactly like eight single-token
+// gathers do. Any error in how the per-token top-k lists, gathered K/V and masks line up in the
+// batch dimension shows up as a logits mismatch between the two.
+static void test_qwen4exp_qsa_gather(
+        struct gguf_context * gguf_ctx, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        const llama_split_mode split_mode, const std::vector<llama_token> & tokens) {
+    const uint32_t n_prefill = 120;
+    const uint32_t n_verify  = 8;
+    GGML_ASSERT(tokens.size() >= n_prefill + n_verify);
+
+    setenv("QWEN4EXP_QSA_GATHER", "2", 1);
+
+    std::vector<float> logits_batched;
+    std::vector<float> logits_single;
+    {
+        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, devs, split_mode, false);
+        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
+        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, &logits_batched);
+    }
+    {
+        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, devs, split_mode, false);
+        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
+        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, 1, &logits_single);
+    }
+
+    unsetenv("QWEN4EXP_QSA_GATHER");
+
+    const double nmse_val = nmse(logits_single, logits_batched);
+    if (!(nmse_val < 1e-4)) {
+        throw std::runtime_error(string_format("qwen4exp QSA gather: batched verify differs from single-token, NMSE = %.2e", nmse_val));
+    }
+    printf("qwen4exp QSA gather: %u-token verify batch vs single-token gathers, NMSE = %.2e\n", n_verify, nmse_val);
+}
+
+// [TAG_QSA_GATHER_WIDTH] the check above cannot tell whether the gather picks the *right* cells:
+// with the width covering the whole cache every selection is the right one. This one uses a
+// 1024-cell cache and indexer_top_k = 253, so both paths select 253 + 4 - 1 = 256 cells out of
+// 768 valid ones, and the gather's padded width is the same 256. Gathered attention over those
+// cells and masked attention over the full cache must then agree to flash-attention precision.
+// This is what a real deployment does (2048 + 4 - 1 selected out of tens of thousands).
+static void test_qwen4exp_qsa_gather_vs_masked(
+        const bool moe, const size_t seed, const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode) {
+    const uint32_t n_ctx     = 1024;
+    const uint32_t n_top_k   = 253;
+    const uint32_t n_prefill = 640;
+    const uint32_t n_verify  = 8;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, moe, false, n_ctx, n_top_k);
+    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_verify, 128, seed + 1);
+
+    std::vector<float> logits_gather;
+    std::vector<float> logits_masked;
+    for (int mode = 0; mode < 2; ++mode) {
+        setenv("QWEN4EXP_QSA_GATHER", mode == 0 ? "2" : "0", 1);
+        auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
+        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
+        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_gather : &logits_masked);
+    }
+    unsetenv("QWEN4EXP_QSA_GATHER");
+
+    const double nmse_val = nmse(logits_masked, logits_gather);
+    if (!(nmse_val < 1e-4)) {
+        throw std::runtime_error(string_format("qwen4exp QSA gather: gathered attention differs from masked, NMSE = %.2e", nmse_val));
+    }
+    printf("qwen4exp QSA gather: %u-token verify batch, gathered vs masked over %u of %u cells, NMSE = %.2e\n",
+            n_verify, n_top_k + 3, n_prefill + n_verify, nmse_val);
 }
 
 // [TAG_KPOOL_KEY_CACHE] decode the same tokens as two consecutive batches. Causal attention
@@ -895,6 +989,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         if (arch == LLM_ARCH_QWEN4EXP) {
                             auto gguf_ctx_mtp = get_gguf_ctx(arch, moe, true);
                             test_qwen4exp_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
+                            test_qwen4exp_qsa_gather(gguf_ctx.get(), seed, dc.devs, dc.split_mode, tokens);
+                            test_qwen4exp_qsa_gather_vs_masked(moe, seed, dc.devs, dc.split_mode);
                         }
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

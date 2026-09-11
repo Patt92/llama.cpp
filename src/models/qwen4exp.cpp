@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <cinttypes>
 
+// [TAG_QSA_GATHER_VERIFY] largest tokens-per-stream ubatch that still takes the gather path
+static constexpr int64_t QSA_GATHER_MAX_TPS = 8;
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -1003,9 +1006,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const int64_t n_kv   = kf->ne[2];
         const int64_t ns     = kf->ne[3];
         const int64_t n_topk = top_k->ne[0];
+        const int64_t n_tps  = top_k->ne[1]; // tokens per stream, each with its own top-k list
+        const int64_t nb_all = n_tps*ns;     // gathered batch: entry s*n_tps + i is token i of stream s
 
-        GGML_ASSERT(top_k->ne[1] == 1 && "QSA gather requires single-token-per-stream ubatches");
-        GGML_ASSERT(qsa_bias != nullptr && qsa_bias->ne[0] == n_kv && "QSA gather requires the per-cell bias");
+        GGML_ASSERT(n_tps <= QSA_GATHER_MAX_TPS && "QSA gather: ubatch larger than the gate allows");
+        GGML_ASSERT(qsa_bias != nullptr && qsa_bias->ne[0] == n_kv && qsa_bias->ne[1] == n_tps && "QSA gather requires the per-cell bias");
 
         // the heads of a cell are contiguous in the cache, so a cell can be gathered as one row
         GGML_ASSERT(kf->nb[2] == ggml_row_size(kf->type, hd_k*n_h_kv));
@@ -1016,15 +1021,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * v_cells = ggml_view_4d(ctx0, vf, hd_v*n_h_kv, n_kv, 1, ns,
                 vf->nb[2], vf->nb[2]*n_kv, vf->nb[3], 0);
 
-        // top_k [n_topk, 1, 1, ns] -> the index layout ggml_get_rows expects: [n_topk, 1, ns, 1]
-        ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk, 1, ns, 1);
+        // top_k [n_topk, n_tps, 1, ns] -> the index layout ggml_get_rows expects. the cells of
+        // one stream are shared by its tokens, so all of a stream's lists gather from the same
+        // rows: [n_topk*n_tps, 1, ns, 1], token-major within the stream
+        ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk*n_tps, 1, ns, 1);
 
         // get_rows dequantizes the cells to F32; build_attn_mha casts to F16 for flash attention
-        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk, 1, ns]
-        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk, 1, ns]
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk*n_tps, 1, ns]
+        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk*n_tps, 1, ns]
 
-        k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, ns);
-        v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, ns);
+        k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, nb_all);
+        v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, nb_all);
         cb(k_g, "qsa_k_gathered", il);
         cb(v_g, "qsa_v_gathered", il);
 
@@ -1032,14 +1039,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // member, 1e9 for the always-visible tail, -inf for anything the padded top-k width
         // pulled in that the query must not see. clamping to (-inf, 0] turns that into the
         // attention mask over the gathered set.
-        ggml_tensor * b1 = ggml_view_4d(ctx0, qsa_bias, 1, n_kv, 1, ns,
-                qsa_bias->nb[0], qsa_bias->nb[1], qsa_bias->nb[3], 0);
-        ggml_tensor * m_g = ggml_get_rows(ctx0, b1, idx);            // F32 [1, n_topk, 1, ns]
-        m_g = ggml_reshape_4d(ctx0, m_g, n_topk, 1, 1, ns);
+        // bias [n_kv, n_tps, ns] read as rows of one cell: [1, n_kv, n_tps, ns]. the stream
+        // stride is nb[2]; the earlier nb[3] read past the tensor for the second stream
+        ggml_tensor * b1 = ggml_view_4d(ctx0, qsa_bias, 1, n_kv, n_tps, ns,
+                qsa_bias->nb[0], qsa_bias->nb[1], qsa_bias->nb[2], 0);
+        ggml_tensor * idx_b = ggml_reshape_4d(ctx0, top_k, n_topk, n_tps, ns, 1);
+        ggml_tensor * m_g = ggml_get_rows(ctx0, b1, idx_b);          // F32 [1, n_topk, n_tps, ns]
+        m_g = ggml_reshape_4d(ctx0, m_g, n_topk, 1, 1, nb_all);
         m_g = ggml_clamp(ctx0, m_g, -INFINITY, 0.0f);
         m_g = ggml_cast(ctx0, m_g, GGML_TYPE_F16);                   // FA wants contiguous F16
         cb(m_g, "qsa_mask_gathered", il);
 
+        // build_attn_mha splits q [hd, n_head, n_tokens] by k->ne[3] = nb_all into one query per
+        // batch entry, in the same s*n_tps + i order the ubatch lays its tokens out in
         ggml_tensor * cur = build_attn_mha(q_cur, k_g, v_g, nullptr, m_g, nullptr, nullptr, 0, kq_scale, il);
         cb(cur, "kqv_out", il);
 
@@ -1112,21 +1124,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     // gather-based QSA decode: worth it once the cache is meaningfully deeper than the
     // top-k width; below that the masked path costs about the same. QWEN4EXP_QSA_GATHER=0
-    // disables it (A/B lever, and an escape hatch).
-    static const bool gather_enabled = [] {
+    // disables it (A/B lever, and an escape hatch); =2 forces it regardless of the depth, which
+    // is what test-llama-archs uses on a 256-cell cache. read per graph build, not once, so a
+    // test can flip it between contexts.
+    const int gather_mode = [] {
         const char * e = getenv("QWEN4EXP_QSA_GATHER");
-        return e == nullptr || atoi(e) != 0;
+        return e == nullptr ? 1 : atoi(e);
     }();
 
     bool gather = false;
-    if (qsa && gather_enabled) {
+    if (qsa && gather_mode != 0) {
         const int64_t r     = hparams.dsv4_compress_ratios[il];
         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width = GGML_PAD((int64_t) hparams.indexer_top_k + r - 1, 256);
 
         const int64_t n_stream = mctx_hyb->get_n_stream();
 
-        gather = n_tokens == n_stream && n_kv >= 4*width;
+        // [TAG_QSA_GATHER_VERIFY] speculative decoding verifies n_max+1 tokens per stream in one
+        // pass. the original gate (one token per stream) sent every such pass down the masked
+        // path, where flash attention scans the whole cache to use top-k cells of it; at 57k
+        // context that was +46 ms per round on gfx1151. each token has its own top-k list, so
+        // the gather generalises: every (stream, token) becomes one entry of the batch dim.
+        // the cap keeps the gathered K/V (2 * width * row * 4 B per token) small.
+        const int64_t n_tps = n_tokens / n_stream;
+
+        gather = n_tokens % n_stream == 0 && n_tps <= QSA_GATHER_MAX_TPS && (n_kv >= 4*width || gather_mode == 2);
     }
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, gather) : nullptr;
