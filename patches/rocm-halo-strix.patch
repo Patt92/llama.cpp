@@ -3037,62 +3037,111 @@ index f1d173a5755690077251b65255a95749006304cb..ea962fd7c02705b5cbe501bee19bd09e
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6334f3ccab304749bbf7b51362dee7c9348771d7..58f7a8c4076d29d64426fa6d75393877b3dadc05 100644
+index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a62066534af5 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -80,6 +80,60 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+@@ -13,6 +13,7 @@
+ #include "llama-sampler.h"
+ #include "llama.h"
+ 
++#include <atomic>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -80,6 +81,101 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
 +// [TAG_NAN_CHECK] eval callback used by LLAMA_NAN_CHECK=2, see the constructor
++// counts the NaNs of a tensor; returns the flat index of the first one, -1 if none. full scan
++// for the tensor under suspicion and its sources, strided sampling everywhere else.
++static int64_t llama_context_nan_scan(const ggml_tensor * t, int64_t step, int64_t & n_nan) {
++    n_nan = 0;
++
++    if ((t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) || !ggml_is_contiguous(t)) {
++        return -1;
++    }
++
++    const int64_t n = ggml_nelements(t);
++    if (n == 0) {
++        return -1;
++    }
++
++    std::vector<uint8_t> buf(ggml_nbytes(t));
++    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
++
++    int64_t first = -1;
++    if (t->type == GGML_TYPE_F32) {
++        const float * d = (const float *) buf.data();
++        for (int64_t i = 0; i < n; i += step) {
++            if (std::isnan(d[i])) {
++                if (first < 0) { first = i; }
++                n_nan++;
++            }
++        }
++    } else {
++        const ggml_fp16_t * d = (const ggml_fp16_t *) buf.data();
++        for (int64_t i = 0; i < n; i += step) {
++            if (std::isnan(ggml_fp16_to_fp32(d[i]))) {
++                if (first < 0) { first = i; }
++                n_nan++;
++            }
++        }
++    }
++
++    return first;
++}
++
++// logged NaN tensors in the current decode call; reset by llama_context::decode
++static std::atomic<int> g_nan_hunt_logged{0};
++
 +static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 +    GGML_UNUSED(user_data);
 +
-+    static thread_local int64_t n_logged = 0;
 +
 +    if (ask) {
 +        return true;
 +    }
 +
-+    if (n_logged >= 16) {
-+        return true;
-+    }
-+
-+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
++    if (g_nan_hunt_logged.load() >= 6) {
 +        return true;
 +    }
 +
 +    const int64_t n = ggml_nelements(t);
-+    if (n == 0) {
++    if (n == 0 || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) || !ggml_is_contiguous(t)) {
 +        return true;
 +    }
 +
 +    // sample: full read for small tensors, strided for large ones
-+    const int64_t step = n <= (1 << 18) ? 1 : n / (1 << 18);
-+
-+    std::vector<uint8_t> buf(ggml_nbytes(t));
-+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
-+
-+    bool bad = false;
-+    if (ggml_is_contiguous(t)) {
-+        if (t->type == GGML_TYPE_F32) {
-+            const float * d = (const float *) buf.data();
-+            for (int64_t i = 0; i < n && !bad; i += step) {
-+                bad = std::isnan(d[i]); // -inf is legitimate in masks and biased scores
-+            }
-+        } else {
-+            const ggml_fp16_t * d = (const ggml_fp16_t *) buf.data();
-+            for (int64_t i = 0; i < n && !bad; i += step) {
-+                bad = std::isnan(ggml_fp16_to_fp32(d[i]));
-+            }
-+        }
++    int64_t n_nan = 0;
++    const int64_t step  = n <= (1 << 18) ? 1 : n / (1 << 18);
++    const int64_t first = llama_context_nan_scan(t, step, n_nan);
++    if (first < 0) {
++        return true;
 +    }
 +
-+    if (bad) {
-+        n_logged++;
-+        LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0='%s' src1='%s'\n",
-+                ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
-+                t->src[0] ? ggml_get_name(t->src[0]) : "-", t->src[1] ? ggml_get_name(t->src[1]) : "-");
++    // suspect found: full scan of it and of its float sources, so an op that merely
++    // propagates a NaN the sampling missed is not blamed for creating it
++    llama_context_nan_scan(t, 1, n_nan);
++    const int64_t i0 = first % t->ne[0];
++    const int64_t i1 = (first / t->ne[0]) % t->ne[1];
++
++    g_nan_hunt_logged++;
++    LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " first=(%" PRId64 ",%" PRId64 ")\n",
++            ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3], n_nan, i0, i1);
++
++    for (int j = 0; j < GGML_MAX_SRC; ++j) {
++        const ggml_tensor * src = t->src[j];
++        if (src == nullptr) {
++            continue;
++        }
++        int64_t s_nan = -2;
++        int64_t s_first = -1;
++        if ((src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) && ggml_is_contiguous(src) && src->data != nullptr) {
++            s_first = llama_context_nan_scan(src, 1, s_nan);
++        }
++        LLAMA_LOG_ERROR("[TAG_NAN_CHECK]   src%d '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " first=%" PRId64 "\n",
++                j, ggml_get_name(src), ggml_op_desc(src), ggml_type_name(src->type), src->ne[0], src->ne[1], src->ne[2], src->ne[3], s_nan, s_first);
 +    }
 +
 +    return true;
@@ -3101,7 +3150,7 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..58f7a8c4076d29d64426fa6d75393877
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -140,6 +194,17 @@ llama_context::llama_context(
+@@ -140,6 +236,17 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -3119,7 +3168,7 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..58f7a8c4076d29d64426fa6d75393877
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -1985,6 +2050,49 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1985,6 +2092,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
      // set to total number of outputs in the batch, for use in llama_get_logits_ith
      n_outputs = n_outputs_all;
  
@@ -3131,6 +3180,8 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..58f7a8c4076d29d64426fa6d75393877
 +        const char * e = getenv("LLAMA_NAN_CHECK");
 +        return e == nullptr || atoi(e) != 0;
 +    }();
++
++    g_nan_hunt_logged.store(0);
 +
 +    if (nan_check && logits.data && n_outputs_all > 0) {
 +        synchronize();
@@ -6456,7 +6507,7 @@ index 8ace95f73475537eda0fbb4933e65f38f19ce0e5..27d43adebfb654c42cbaf8a40fd6d1c2
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b63b3773eef8091386386425a347c77ea6bed66f..540638f4da081c3d50e590e8dad9188c8d89db3b 100644
+index b63b3773eef8091386386425a347c77ea6bed66f..bc56331d5894b6ccd9bd6e7ec40092a868bb6ebc 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6356,7 +6356,7 @@ struct test_concat : public test_case {
@@ -6485,7 +6536,32 @@ index b63b3773eef8091386386425a347c77ea6bed66f..540638f4da081c3d50e590e8dad9188c
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -10345,6 +10353,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9843,6 +9851,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ #endif
+ 
+ #if 1
++    // [TAG_MMQ_RDNA35_SHAPES] the gfx1151 MMQ configs this branch retunes (Q5_K/Q6_K at J=64,
++    // Q8_0 at J=96/128: 512 threads, I=128) with the shapes the live model hands them: the
++    // hyper-connection projections are only 320 rows wide (2.5 I-tiles) and prompt chunks stop
++    // at image boundaries, so n is not a tile multiple. Qwen3.8-Flash-Next layer 0 produced NaN
++    // in exactly hc_attn_down (Q5_K, k=10240, m=320) x 955 tokens. Repeated, because the failure
++    // was not deterministic.
++    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q4_K}) {
++        for (int64_t n : {955, 960, 1024, 2048, 64, 96, 128, 200}) {
++            for (int rep = 0; rep < 3; ++rep) {
++                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  320, n, 10240, {1, 1}, {1, 1}));
++            }
++            if (ggml_blck_size(type_a) <= 32) {
++                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
++            }
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, n, 10240, {1, 1}, {1, 1}));
++        }
++    }
++
+     for (ggml_type type_a : base_types) {
+         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+             std::vector<int> ks = { 256 };
+@@ -10345,6 +10371,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -6494,7 +6570,7 @@ index b63b3773eef8091386386425a347c77ea6bed66f..540638f4da081c3d50e590e8dad9188c
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10721,13 +10731,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10721,13 +10749,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                          GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      }
  
@@ -6508,7 +6584,7 @@ index b63b3773eef8091386386425a347c77ea6bed66f..540638f4da081c3d50e590e8dad9188c
      // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-@@ -10888,6 +10891,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10888,6 +10909,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -6520,7 +6596,7 @@ index b63b3773eef8091386386425a347c77ea6bed66f..540638f4da081c3d50e590e8dad9188c
      // gdn + cache cpy fusion (K > 1)
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
-@@ -11192,14 +11200,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11192,14 +11218,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
