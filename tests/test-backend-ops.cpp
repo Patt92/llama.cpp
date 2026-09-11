@@ -9851,6 +9851,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 #if 1
+    // [TAG_MMQ_RDNA35_SHAPES] the gfx1151 MMQ configs this branch retunes (Q5_K/Q6_K at J=64,
+    // Q8_0 at J=96/128: 512 threads, I=128) with the shapes the live model hands them: the
+    // hyper-connection projections are only 320 rows wide (2.5 I-tiles) and prompt chunks stop
+    // at image boundaries, so n is not a tile multiple. Qwen3.8-Flash-Next layer 0 produced NaN
+    // in exactly hc_attn_down (Q5_K, k=10240, m=320) x 955 tokens. Repeated, because the failure
+    // was not deterministic.
+    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q4_K}) {
+        for (int64_t n : {955, 960, 1024, 2048, 64, 96, 128, 200}) {
+            for (int rep = 0; rep < 3; ++rep) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  320, n, 10240, {1, 1}, {1, 1}));
+            }
+            if (ggml_blck_size(type_a) <= 32) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, n, 10240, {1, 1}, {1, 1}));
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             std::vector<int> ks = { 256 };

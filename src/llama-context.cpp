@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -81,54 +82,95 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 };
 
 // [TAG_NAN_CHECK] eval callback used by LLAMA_NAN_CHECK=2, see the constructor
+// counts the NaNs of a tensor; returns the flat index of the first one, -1 if none. full scan
+// for the tensor under suspicion and its sources, strided sampling everywhere else.
+static int64_t llama_context_nan_scan(const ggml_tensor * t, int64_t step, int64_t & n_nan) {
+    n_nan = 0;
+
+    if ((t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) || !ggml_is_contiguous(t)) {
+        return -1;
+    }
+
+    const int64_t n = ggml_nelements(t);
+    if (n == 0) {
+        return -1;
+    }
+
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+
+    int64_t first = -1;
+    if (t->type == GGML_TYPE_F32) {
+        const float * d = (const float *) buf.data();
+        for (int64_t i = 0; i < n; i += step) {
+            if (std::isnan(d[i])) {
+                if (first < 0) { first = i; }
+                n_nan++;
+            }
+        }
+    } else {
+        const ggml_fp16_t * d = (const ggml_fp16_t *) buf.data();
+        for (int64_t i = 0; i < n; i += step) {
+            if (std::isnan(ggml_fp16_to_fp32(d[i]))) {
+                if (first < 0) { first = i; }
+                n_nan++;
+            }
+        }
+    }
+
+    return first;
+}
+
+// logged NaN tensors in the current decode call; reset by llama_context::decode
+static std::atomic<int> g_nan_hunt_logged{0};
+
 static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
 
-    static thread_local int64_t n_logged = 0;
 
     if (ask) {
         return true;
     }
 
-    if (n_logged >= 16) {
-        return true;
-    }
-
-    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+    if (g_nan_hunt_logged.load() >= 6) {
         return true;
     }
 
     const int64_t n = ggml_nelements(t);
-    if (n == 0) {
+    if (n == 0 || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) || !ggml_is_contiguous(t)) {
         return true;
     }
 
     // sample: full read for small tensors, strided for large ones
-    const int64_t step = n <= (1 << 18) ? 1 : n / (1 << 18);
-
-    std::vector<uint8_t> buf(ggml_nbytes(t));
-    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
-
-    bool bad = false;
-    if (ggml_is_contiguous(t)) {
-        if (t->type == GGML_TYPE_F32) {
-            const float * d = (const float *) buf.data();
-            for (int64_t i = 0; i < n && !bad; i += step) {
-                bad = std::isnan(d[i]); // -inf is legitimate in masks and biased scores
-            }
-        } else {
-            const ggml_fp16_t * d = (const ggml_fp16_t *) buf.data();
-            for (int64_t i = 0; i < n && !bad; i += step) {
-                bad = std::isnan(ggml_fp16_to_fp32(d[i]));
-            }
-        }
+    int64_t n_nan = 0;
+    const int64_t step  = n <= (1 << 18) ? 1 : n / (1 << 18);
+    const int64_t first = llama_context_nan_scan(t, step, n_nan);
+    if (first < 0) {
+        return true;
     }
 
-    if (bad) {
-        n_logged++;
-        LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0='%s' src1='%s'\n",
-                ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
-                t->src[0] ? ggml_get_name(t->src[0]) : "-", t->src[1] ? ggml_get_name(t->src[1]) : "-");
+    // suspect found: full scan of it and of its float sources, so an op that merely
+    // propagates a NaN the sampling missed is not blamed for creating it
+    llama_context_nan_scan(t, 1, n_nan);
+    const int64_t i0 = first % t->ne[0];
+    const int64_t i1 = (first / t->ne[0]) % t->ne[1];
+
+    g_nan_hunt_logged++;
+    LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " first=(%" PRId64 ",%" PRId64 ")\n",
+            ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3], n_nan, i0, i1);
+
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = t->src[j];
+        if (src == nullptr) {
+            continue;
+        }
+        int64_t s_nan = -2;
+        int64_t s_first = -1;
+        if ((src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) && ggml_is_contiguous(src) && src->data != nullptr) {
+            s_first = llama_context_nan_scan(src, 1, s_nan);
+        }
+        LLAMA_LOG_ERROR("[TAG_NAN_CHECK]   src%d '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " first=%" PRId64 "\n",
+                j, ggml_get_name(src), ggml_op_desc(src), ggml_type_name(src->type), src->ne[0], src->ne[1], src->ne[2], src->ne[3], s_nan, s_first);
     }
 
     return true;
@@ -2058,6 +2100,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const char * e = getenv("LLAMA_NAN_CHECK");
         return e == nullptr || atoi(e) != 0;
     }();
+
+    g_nan_hunt_logged.store(0);
 
     if (nan_check && logits.data && n_outputs_all > 0) {
         synchronize();
