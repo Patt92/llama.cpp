@@ -19,7 +19,7 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`52d42686560a9e8f441f9b9780c8890c37d2802d`](https://github.com/ggml-org/llama.cpp/commit/52d42686560a9e8f441f9b9780c8890c37d2802d).
+Based on upstream llama.cpp commit [`df03399b885831b2a1603b3abb0d8c156808e363`](https://github.com/ggml-org/llama.cpp/commit/df03399b885831b2a1603b3abb0d8c156808e363).
 
 This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
 
@@ -36,6 +36,7 @@ This branch tracks the current upstream `llama.cpp` master and intentionally kee
 - Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 - On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 - Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
+- Gathers the QSA-selected keys and values into a compact buffer for single-token decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken unchanged from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213); its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Decode only, engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
 - Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
 - Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
 - Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
@@ -186,7 +187,7 @@ The implementation comes from [`ggml-org/llama.cpp#27836`](https://github.com/gg
 
 ### Measured on gfx1151
 
-All figures from AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), ROCm 7.15, 124 GB unified memory
+All figures from AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), ROCm 10.0.0, 124 GB unified memory
 per node. Prefill and generation are quoted with the KV depth they were taken at, because both
 fall with context and a number without one is meaningless.
 
@@ -219,7 +220,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 52d42686560a9e8f441f9b9780c8890c37d2802d
+git checkout df03399b885831b2a1603b3abb0d8c156808e363
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
