@@ -19,9 +19,9 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`df03399b885831b2a1603b3abb0d8c156808e363`](https://github.com/ggml-org/llama.cpp/commit/df03399b885831b2a1603b3abb0d8c156808e363).
+Based on upstream llama.cpp commit [`8172e6577ac2b35de1ec1e5d1c0aaad6c4a2129f`](https://github.com/ggml-org/llama.cpp/commit/8172e6577ac2b35de1ec1e5d1c0aaad6c4a2129f).
 
-This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, the AMD `MUL_MAT_ID` guard, and bounded multi-backend scheduler splits; `TOP_K` remains on the upstream HIP implementation.
+This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 
 - Adds isolated `glm5next` / GLM-5.3-Flash text inference, including its hybrid KDA/MLA memory layout and NextN/MTP draft context.
 - Keeps completed GLM indexer pool keys in a persistent cache instead of rebuilding the entire context on every pass.
@@ -220,7 +220,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout df03399b885831b2a1603b3abb0d8c156808e363
+git checkout 8172e6577ac2b35de1ec1e5d1c0aaad6c4a2129f
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
