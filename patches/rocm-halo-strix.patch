@@ -3037,7 +3037,7 @@ index f1d173a5755690077251b65255a95749006304cb..ea962fd7c02705b5cbe501bee19bd09e
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a62066534af5 100644
+index 6334f3ccab304749bbf7b51362dee7c9348771d7..8c152613a6700cfe2d5410f4a7b560e1a52c8a71 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -13,6 +13,7 @@
@@ -3048,15 +3048,18 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a620
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
-@@ -80,6 +81,101 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+@@ -80,6 +81,122 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
 +// [TAG_NAN_CHECK] eval callback used by LLAMA_NAN_CHECK=2, see the constructor
 +// counts the NaNs of a tensor; returns the flat index of the first one, -1 if none. full scan
 +// for the tensor under suspicion and its sources, strided sampling everywhere else.
++static int64_t g_nan_hunt_n_inf = 0; // Inf count of the last scan, reported next to the NaN count
++
 +static int64_t llama_context_nan_scan(const ggml_tensor * t, int64_t step, int64_t & n_nan) {
 +    n_nan = 0;
++    g_nan_hunt_n_inf = 0;
 +
 +    if ((t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) || !ggml_is_contiguous(t)) {
 +        return -1;
@@ -3077,14 +3080,19 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a620
 +            if (std::isnan(d[i])) {
 +                if (first < 0) { first = i; }
 +                n_nan++;
++            } else if (std::isinf(d[i])) {
++                g_nan_hunt_n_inf++;
 +            }
 +        }
 +    } else {
 +        const ggml_fp16_t * d = (const ggml_fp16_t *) buf.data();
 +        for (int64_t i = 0; i < n; i += step) {
-+            if (std::isnan(ggml_fp16_to_fp32(d[i]))) {
++            const float v = ggml_fp16_to_fp32(d[i]);
++            if (std::isnan(v)) {
 +                if (first < 0) { first = i; }
 +                n_nan++;
++            } else if (std::isinf(v)) {
++                g_nan_hunt_n_inf++;
 +            }
 +        }
 +    }
@@ -3094,6 +3102,9 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a620
 +
 +// logged NaN tensors in the current decode call; reset by llama_context::decode
 +static std::atomic<int> g_nan_hunt_logged{0};
++
++// the ubatch being computed, so a NaN column can be named by token id and position
++static const llama_ubatch * g_nan_hunt_ubatch = nullptr;
 +
 +static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 +    GGML_UNUSED(user_data);
@@ -3127,8 +3138,18 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a620
 +    const int64_t i1 = (first / t->ne[0]) % t->ne[1];
 +
 +    g_nan_hunt_logged++;
-+    LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " first=(%" PRId64 ",%" PRId64 ")\n",
-+            ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3], n_nan, i0, i1);
++    LLAMA_LOG_ERROR("[TAG_NAN_CHECK] NaN tensor: '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " n_inf=%" PRId64 " first=(%" PRId64 ",%" PRId64 ")\n",
++            ggml_get_name(t), ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3], n_nan, g_nan_hunt_n_inf, i0, i1);
++
++    // which tokens sit in the NaN columns (ne[1] is the token dimension of a 2D activation)
++    const llama_ubatch * ub = g_nan_hunt_ubatch;
++    if (ub != nullptr && ub->token != nullptr && t->ne[1] == (int64_t) ub->n_tokens && t->ne[2] == 1) {
++        std::string cols;
++        for (int64_t c = std::max<int64_t>(0, i1 - 2); c < std::min<int64_t>(ub->n_tokens, i1 + 8); ++c) {
++            cols += format(" [%" PRId64 "] tok=%d pos=%d", c, ub->token[c], ub->pos[c]);
++        }
++        LLAMA_LOG_ERROR("[TAG_NAN_CHECK]   columns around the first NaN:%s\n", cols.c_str());
++    }
 +
 +    for (int j = 0; j < GGML_MAX_SRC; ++j) {
 +        const ggml_tensor * src = t->src[j];
@@ -3140,8 +3161,8 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a620
 +        if ((src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) && ggml_is_contiguous(src) && src->data != nullptr) {
 +            s_first = llama_context_nan_scan(src, 1, s_nan);
 +        }
-+        LLAMA_LOG_ERROR("[TAG_NAN_CHECK]   src%d '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " first=%" PRId64 "\n",
-+                j, ggml_get_name(src), ggml_op_desc(src), ggml_type_name(src->type), src->ne[0], src->ne[1], src->ne[2], src->ne[3], s_nan, s_first);
++        LLAMA_LOG_ERROR("[TAG_NAN_CHECK]   src%d '%s' op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] n_nan=%" PRId64 " n_inf=%" PRId64 " first=%" PRId64 "\n",
++                j, ggml_get_name(src), ggml_op_desc(src), ggml_type_name(src->type), src->ne[0], src->ne[1], src->ne[2], src->ne[3], s_nan, s_nan >= 0 ? g_nan_hunt_n_inf : (int64_t) -2, s_first);
 +    }
 +
 +    return true;
@@ -3150,7 +3171,7 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a620
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -140,6 +236,17 @@ llama_context::llama_context(
+@@ -140,6 +257,17 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -3168,7 +3189,20 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..199ac5f53bf82a9d4aeedd8e5950a620
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -1985,6 +2092,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1826,8 +1954,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         ggml_status status;
+ 
++        g_nan_hunt_ubatch = &ubatch;
++
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+ 
++        g_nan_hunt_ubatch = nullptr;
++
+         if (!res) {
+             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+             llama_pos pos_min[LLAMA_MAX_SEQ];
+@@ -1985,6 +2117,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
      // set to total number of outputs in the batch, for use in llama_get_logits_ith
      n_outputs = n_outputs_all;
  
