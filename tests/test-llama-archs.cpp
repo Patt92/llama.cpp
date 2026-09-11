@@ -10,6 +10,8 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
+#include "../src/llama-ext.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -582,6 +584,131 @@ static void test_qwen4exp_qsa_gather_vs_masked(
             n_verify, n_top_k + 3, n_prefill + n_verify, nmse_val);
 }
 
+// [TAG_QWEN4EXP_SHARED_MTP] a shared MTP sidecar (Unsloth's mtp-*-shared-*.gguf) carries neither
+// token_embd nor output and borrows both from the target through ctx_other. The user-init loader
+// creates every tensor, so the export is emulated by nulling the head's own copies after the
+// load; the tensors of a model instance are seeded by name, so the target's copies hold the same
+// values as the draft's own would. The borrowed decode must therefore reproduce the
+// self-contained one exactly, and a draft without a target must fail to build a context
+// instead of crashing (that is what the memory-fitting pass does to it).
+static void test_qwen4exp_shared_mtp(
+        struct gguf_context * gguf_ctx, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        const llama_split_mode split_mode) {
+    const int32_t n_tokens = 4;
+
+    auto make_batch = [&](int32_t n_embd) {
+        llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
+        batch.token = (llama_token *) malloc(sizeof(llama_token)*n_tokens);
+        batch.n_tokens = n_tokens;
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            batch.token[i] = i + 1;
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = 1;
+            for (int32_t j = 0; j < n_embd; ++j) {
+                batch.embd[(size_t) i*n_embd + j] = 1.0e-3f*(float) ((i + j)%7 - 3);
+            }
+        }
+        return batch;
+    };
+
+    auto load_draft = [&](bool shared) {
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs_copy = devs;
+        devs_copy.push_back(nullptr);
+        model_params.devices = devs_copy.data();
+        model_params.split_mode = split_mode;
+        model_params.load_mtp = true;
+        size_t tmp = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params));
+        if (!model) {
+            throw std::runtime_error("qwen4exp shared MTP: failed to create draft model");
+        }
+        // both drafts go through the trunk's embedding and LM head rather than the block's own
+        auto & nextn = model->layers[model->hparams.n_layer()].nextn;
+        nextn.embed_tokens     = nullptr;
+        nextn.shared_head_head = nullptr;
+        if (shared) {
+            model->tok_embd = nullptr;
+            model->output   = nullptr;
+        }
+        return model;
+    };
+
+    auto ctx_params_mtp = [&]() {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 0;
+        cp.n_threads = 4;
+        cp.n_threads_batch = 4;
+        cp.n_ubatch = 64;
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        return cp;
+    };
+
+    auto decode_logits = [&](llama_context * lctx, llama_model * model) {
+        const int32_t n_embd  = llama_model_n_embd_out(model);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        llama_batch batch = make_batch(n_embd);
+        if (llama_decode(lctx, batch) != 0) {
+            llama_batch_free(batch);
+            throw std::runtime_error("qwen4exp shared MTP: decode failed");
+        }
+        std::vector<float> out;
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const float * l = llama_get_logits_ith(lctx, i);
+            out.insert(out.end(), l, l + n_vocab);
+        }
+        llama_batch_free(batch);
+        return out;
+    };
+
+    // the target: the same checkpoint loaded as a plain model
+    auto target = get_model_and_ctx(gguf_ctx, nullptr, seed, devs, split_mode, false, false);
+
+    // reference: a self-contained draft using its own token_embd / output
+    std::vector<float> logits_own;
+    {
+        auto model = load_draft(false);
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params_mtp()));
+        if (!lctx) {
+            throw std::runtime_error("qwen4exp shared MTP: failed to create the self-contained draft context");
+        }
+        logits_own = decode_logits(lctx.get(), model.get());
+    }
+
+    // the sidecar: no embeddings of its own
+    {
+        auto model = load_draft(true);
+
+        // on its own it must refuse, not crash: this is the memory-fitting measurement
+        {
+            llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params_mtp()));
+            if (lctx) {
+                throw std::runtime_error("qwen4exp shared MTP: a draft without a target built a context");
+            }
+        }
+
+        llama_context_params cp = ctx_params_mtp();
+        cp.ctx_other = target.second.get();
+        llama_context_ptr lctx(llama_init_from_model(model.get(), cp));
+        if (!lctx) {
+            throw std::runtime_error("qwen4exp shared MTP: failed to create the borrowing draft context");
+        }
+        if (llama_get_ctx_other(lctx.get()) != target.second.get()) {
+            throw std::runtime_error("qwen4exp shared MTP: ctx_other was not propagated to the draft context");
+        }
+        const std::vector<float> logits_shared = decode_logits(lctx.get(), model.get());
+
+        const double nmse_val = nmse(logits_own, logits_shared);
+        if (!(nmse_val < 1e-6)) {
+            throw std::runtime_error(string_format("qwen4exp shared MTP: borrowed head differs from own head, NMSE = %.2e", nmse_val));
+        }
+        printf("qwen4exp shared MTP: borrowed token_embd/output vs own, NMSE = %.2e\n", nmse_val);
+    }
+}
+
 // [TAG_KPOOL_KEY_CACHE] decode the same tokens as two consecutive batches. Causal attention
 // makes the result identical to the single-shot run, so any state that is carried between
 // passes and goes stale - such as the glm5next pool-key cache - shows up as a logits mismatch.
@@ -991,6 +1118,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                             test_qwen4exp_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
                             test_qwen4exp_qsa_gather(gguf_ctx.get(), seed, dc.devs, dc.split_mode, tokens);
                             test_qwen4exp_qsa_gather_vs_masked(moe, seed, dc.devs, dc.split_mode);
+                            test_qwen4exp_shared_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
                         }
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

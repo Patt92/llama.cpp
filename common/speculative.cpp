@@ -1420,7 +1420,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // [TAG_MTP_MEM_SHARED_GEMMA_ONLY] is_mem_shared encodes the Gemma4-assistant memory model:
+        // the draft shares the target KV, skips the catch-up decode in process() and places every
+        // draft token at pos0. llama_context stores ctx_other only for gemma4-assistant and for
+        // eagle3 / dflash / qwen4exp drafts without their own token_embd or output, so until now
+        // ctx_other == ctx_tgt was equivalent to "gemma4". A shared qwen4exp sidecar now also
+        // carries ctx_other (to borrow the embeddings) but keeps its own KV and needs the catch-up
+        // and sequential positions, exactly like the self-contained qwen4exp draft (ctx_other null).
+        // Gate on the architecture so the sidecar is driven like that draft. Same check as the
+        // open upstream PR 28243.
+        char arch_dft[64] = {0};
+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch_dft, sizeof(arch_dft));
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch_dft, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
