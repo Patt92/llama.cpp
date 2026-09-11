@@ -27,15 +27,16 @@ int main(int argc, char ** argv) {
     // 1. compute usage: nothing may be cached
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     size_t c0 = count();
-    ggml_backend_tensor_set(t_act, a.data(), 0, n*4);
-    size_t c1 = count();
     std::vector<float> r(n);
+    ggml_backend_tensor_set(t_act, a.data(), 0, n*4);
     ggml_backend_tensor_get(t_act, r.data(), 0, n*4);
+    size_t c1 = count();
     bool ok1 = memcmp(r.data(), a.data(), n*4) == 0 && c1 == c0;
     printf("compute tensor: data ok=%d cache files before=%zu after=%zu -> %s\n", memcmp(r.data(), a.data(), n*4) == 0, c0, c1, ok1 ? "OK" : "FAIL");
     // 2. weights usage: cached once, second send hits the cache and data stays right
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     ggml_backend_tensor_set(t_w, b.data(), 0, n*4);
+    ggml_backend_tensor_get(t_w, r.data(), 0, n*4); // SET_TENSOR has no reply: the round trip orders the count after it
     size_t c2 = count();
     ggml_backend_tensor_set(t_w, a.data(), 0, n*4); // different data, new entry
     ggml_backend_tensor_set(t_w, b.data(), 0, n*4); // back to b: served from cache
