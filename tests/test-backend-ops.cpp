@@ -4283,6 +4283,73 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// [TAG_HC_FUSED_OPS] GGML_OP_HC_GATE_MIX
+struct test_hc_gate_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const bool    view; // x and gate as views into a wider [hc*n_embd, n_tokens] buffer, as the graph builds them
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, hc, n_tokens, view);
+    }
+
+    test_hc_gate_mix(int64_t n_embd = 31, int64_t hc = 4, int64_t n_tokens = 17, bool view = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        ggml_tensor * gate;
+        if (view) {
+            ggml_tensor * xw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
+            ggml_set_name(xw, "x");
+            ggml_tensor * gw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
+            ggml_set_name(gw, "gate");
+            x    = ggml_reshape_3d(ctx, xw, n_embd, hc, n_tokens);
+            gate = ggml_reshape_3d(ctx, gw, n_embd, hc, n_tokens);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(x, "x");
+            gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(gate, "gate");
+        }
+
+        ggml_tensor * out = ggml_hc_gate_mix(ctx, x, gate);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_HC_COMBINE
+struct test_hc_combine : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, n_tokens);
+    }
+
+    test_hc_combine(int64_t n_embd = 31, int64_t hc = 4, int64_t n_tokens = 17)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "inject");
+
+        ggml_tensor * out = ggml_hc_combine(ctx, residual, x, inject, 1.0f / (float) hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -8956,6 +9023,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
 
+    // [TAG_HC_FUSED_OPS]
+    for (int64_t nt : {1, 3, 8, 257}) {
+        test_cases.emplace_back(new test_hc_gate_mix(2560, 4, nt, true));
+        test_cases.emplace_back(new test_hc_gate_mix(31, 4, nt, false));
+        test_cases.emplace_back(new test_hc_combine(2560, 4, nt));
+        test_cases.emplace_back(new test_hc_combine(31, 3, nt));
+    }
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -11164,6 +11239,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // [TAG_QWEN4EXP_MOE_SHAPES] Qwen3.8-Flash-Next: 512 experts, 10 routed, n_ff_exp 640; gate/up
+    // are Q5_K [2560 x 640], down is Q8_0 [640 x 2560]; the verify batch is 2..4 tokens
+    for (int bs : {1, 2, 3, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560, 1));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

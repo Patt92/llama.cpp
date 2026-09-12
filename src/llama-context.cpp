@@ -168,6 +168,7 @@ struct llama_op_profile_state {
 
 static int g_op_profile_max_tokens = 0;  // 0 = off
 static int g_op_profile_every      = 32; // graphs per report, LLAMA_OP_PROFILE_EVERY
+static int g_op_profile_names      = 48; // rows of the per-name table, LLAMA_OP_PROFILE_NAMES
 
 static llama_op_profile_state & llama_op_profile_get(const void * ctx) {
     static std::map<const void *, llama_op_profile_state> states;
@@ -181,22 +182,31 @@ static std::string llama_op_profile_fold_name(const char * name) {
 
 static void llama_op_profile_report(llama_op_profile_state & st) {
     using pr = std::pair<std::string, llama_op_profile_entry>;
-    auto dump = [&st](const char * title, const std::map<std::string, llama_op_profile_entry> & m, size_t limit) {
-        std::vector<pr> v(m.begin(), m.end());
+    // one table per backend: the per-node sync costs a few us on a local GPU and a round trip
+    // on RPC, so the backends are not comparable and are listed separately
+    std::map<std::string, std::vector<pr>> by_backend_op;
+    std::map<std::string, std::vector<pr>> by_backend_name;
+    for (const auto & e : st.by_op)   { by_backend_op  [e.first.substr(0, e.first.find('/'))].push_back(e); }
+    for (const auto & e : st.by_name) { by_backend_name[e.first.substr(0, e.first.find('/'))].push_back(e); }
+
+    auto dump = [&st](const char * title, std::vector<pr> & v, size_t limit) {
         std::sort(v.begin(), v.end(), [](const pr & a, const pr & b) { return a.second.t_us > b.second.t_us; });
-        double total = 0;
-        for (const auto & e : v) { total += e.second.t_us; }
-        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %s: %s over %d graphs, %.2f ms per graph\n", st.tag.c_str(), title, st.n_graphs, total/1000.0/st.n_graphs);
-        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9s %6s %8s %8s  %s\n", "ms/graph", "%", "n/graph", "us/node", "backend/op[/name]");
+        double  total = 0;
+        int64_t n     = 0;
+        for (const auto & e : v) { total += e.second.t_us; n += e.second.n; }
+        LLAMA_LOG_WARN("[TAG_OP_PROFILE] %s: %s over %d graphs: %.2f ms and %.0f nodes per graph\n", st.tag.c_str(), title, st.n_graphs, total/1000.0/st.n_graphs, (double) n/st.n_graphs);
+        LLAMA_LOG_WARN("[TAG_OP_PROFILE] %9s %6s %8s %8s  %s\n", "ms/graph", "%", "n/graph", "us/node", "backend/op[/name]");
         for (size_t i = 0; i < v.size() && i < limit; ++i) {
             const auto & e = v[i];
-            LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9.3f %6.1f %8.1f %8.1f  %s\n",
+            LLAMA_LOG_WARN("[TAG_OP_PROFILE] %9.3f %6.1f %8.1f %8.1f  %s\n",
                     e.second.t_us/1000.0/st.n_graphs, 100.0*e.second.t_us/total,
                     (double) e.second.n/st.n_graphs, e.second.t_us/e.second.n, e.first.c_str());
         }
     };
-    dump("per backend/op", st.by_op, 40);
-    dump("per node name (layer numbers folded)", st.by_name, 48);
+    for (auto & kv : by_backend_op) {
+        dump((kv.first + " per op").c_str(), kv.second, 40);
+        dump((kv.first + " per node name (layer numbers folded)").c_str(), by_backend_name[kv.first], g_op_profile_names);
+    }
 }
 
 static bool llama_context_op_profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -401,6 +411,7 @@ llama_context::llama_context(
         if (e != nullptr && atoi(e) > 0) {
             g_op_profile_max_tokens = atoi(e) == 1 ? 8 : atoi(e);
             if (const char * ev = getenv("LLAMA_OP_PROFILE_EVERY")) { g_op_profile_every = std::max(1, atoi(ev)); }
+            if (const char * ev = getenv("LLAMA_OP_PROFILE_NAMES")) { g_op_profile_names = std::max(1, atoi(ev)); }
             cparams.cb_eval = llama_context_op_profile_cb;
             cparams.cb_eval_user_data = this;
             llama_op_profile_get(this).tag = std::string(llm_arch_name(model.arch)) + "/" + std::to_string(model.hparams.n_layer_all) + "L";

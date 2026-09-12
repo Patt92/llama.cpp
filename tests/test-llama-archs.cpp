@@ -584,6 +584,32 @@ static void test_qwen4exp_qsa_gather_vs_masked(
             n_verify, n_top_k + 3, n_prefill + n_verify, nmse_val);
 }
 
+// [TAG_HC_FUSED_OPS] the fused hyper-connection tails must reproduce the elementwise chain
+static void test_qwen4exp_hc_fused(
+        const bool moe, const size_t seed, const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode) {
+    const uint32_t n_prefill = 24;
+    const uint32_t n_verify  = 3;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, moe, false);
+    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_verify, 128, seed + 2);
+
+    std::vector<float> logits_fused;
+    std::vector<float> logits_plain;
+    for (int mode = 0; mode < 2; ++mode) {
+        setenv("QWEN4EXP_HC_FUSED", mode == 0 ? "1" : "0", 1);
+        auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
+        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
+        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_fused : &logits_plain);
+    }
+    unsetenv("QWEN4EXP_HC_FUSED");
+
+    const double nmse_val = nmse(logits_plain, logits_fused);
+    if (!(nmse_val < 1e-6)) {
+        throw std::runtime_error(string_format("qwen4exp HC fused: fused hyper-connection tails differ from the elementwise chain, NMSE = %.2e", nmse_val));
+    }
+    printf("qwen4exp HC fused: fused vs elementwise hyper-connection tails, NMSE = %.2e\n", nmse_val);
+}
+
 // [TAG_QWEN4EXP_SHARED_MTP] a shared MTP sidecar (Unsloth's mtp-*-shared-*.gguf) carries neither
 // token_embd nor output and borrows both from the target through ctx_other. The user-init loader
 // creates every tensor, so the export is emulated by nulling the head's own copies after the
@@ -1119,6 +1145,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                             test_qwen4exp_qsa_gather(gguf_ctx.get(), seed, dc.devs, dc.split_mode, tokens);
                             test_qwen4exp_qsa_gather_vs_masked(moe, seed, dc.devs, dc.split_mode);
                             test_qwen4exp_shared_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
+                            test_qwen4exp_hc_fused(moe, seed, dc.devs, dc.split_mode);
                         }
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

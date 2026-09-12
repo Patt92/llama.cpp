@@ -585,6 +585,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_HC_GATE_MIX,
+        GGML_OP_HC_COMBINE,
 
         GGML_OP_UNARY,
 
@@ -2736,6 +2738,27 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // [TAG_HC_FUSED_OPS] Qwen3.8-Flash-Next (qwen4exp) hyper-connection tails, fused for decode.
+    //
+    // hc_gate_mix: x [n_embd, hc, n_tokens], gate [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = (1/hc) * sum_h x[i, h, t] * sigmoid(gate[i, h, t])
+    // replaces sigmoid, mul, the per-stream view adds and the 1/hc scale of the stream collapse.
+    GGML_API struct ggml_tensor * ggml_hc_gate_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate);
+
+    // hc_combine: residual [n_embd, hc, n_tokens], x [n_embd, n_tokens], inject [hc, n_tokens]
+    //             -> [n_embd, hc, n_tokens]
+    //   result[i, h, t] = residual[i, h, t] + x[i, t] * 2 * sigmoid(inject[h, t] * scale)
+    // replaces the scale, sigmoid, scale, repeat, mul and add of the stream scatter.
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * inject,
+            float                 scale);
 
     // custom operators
 
