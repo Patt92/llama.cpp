@@ -11240,6 +11240,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // [TAG_QWEN4EXP_DECODE_SHAPES] the dense matmuls of a Qwen3.8-Flash-Next verify step (1..4
+    // tokens): hyper-connection down/up/inject, attention q/qkv/out, GDN in/out projections,
+    // shared expert, and the Q6_K output head over the 248320-token vocabulary
+    for (int bs : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,    320, bs, 10240, {1, 1}, {1, 1})); // hc_ffn_down
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,    320, bs, 10240, {1, 1}, {1, 1})); // hc_attn_down
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_1, GGML_TYPE_F32,  10240, bs,   320, {1, 1}, {1, 1})); // hc_*_up
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,      4, bs, 10240, {1, 1}, {1, 1})); // hc_*_inject
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  12288, bs,  2560, {1, 1}, {1, 1})); // attn_q
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  10240, bs,  2560, {1, 1}, {1, 1})); // attn_qkv (GDN)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   6144, bs,  2560, {1, 1}, {1, 1})); // z / attn_gate
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   2560, bs,  6144, {1, 1}, {1, 1})); // ssm_out / attn_output
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,    640, bs,  2560, {1, 1}, {1, 1})); // shared expert gate/up
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   2560, bs,   640, {1, 1}, {1, 1})); // shared expert down
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 2560, {1, 1}, {1, 1})); // output head, draft step
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 3, 2560, {1, 1}, {1, 1})); // output head, verify
+
     // [TAG_QWEN4EXP_MOE_SHAPES] Qwen3.8-Flash-Next: 512 experts, 10 routed, n_ff_exp 640; gate/up
     // are Q5_K [2560 x 640], down is Q8_0 [640 x 2560]; the verify batch is 2..4 tokens
     for (int bs : {1, 2, 3, 4, 8}) {
