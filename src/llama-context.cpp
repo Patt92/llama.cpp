@@ -13,11 +13,15 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <regex>
 #include <stdexcept>
 #include <string>
 
@@ -138,6 +142,88 @@ static std::atomic<int> g_nan_hunt_logged{0};
 
 // the ubatch being computed, so a NaN column can be named by token id and position
 static const llama_ubatch * g_nan_hunt_ubatch = nullptr;
+
+// [TAG_OP_PROFILE] LLAMA_OP_PROFILE=1 times every graph node of the small (decode / verify)
+// ubatches: the scheduler synchronizes the backend after each node when a callback is set, so
+// the wall time between the ask and the observe call is the node's own time plus one sync.
+// Aggregated per op and per node name (layer numbers folded), printed every 32 decode graphs
+// (LLAMA_OP_PROFILE_EVERY) as a table sorted by time. Absolute numbers carry the per-node sync (about 10 us on HIP, a
+// round trip on RPC), so read them as a ranking; the totals say where the tokens go.
+// LLAMA_OP_PROFILE=<n> sets the n_tokens ceiling of the ubatches that are profiled (default 8).
+// Each llama_context (target, draft) keeps its own table, reported with its arch and layer count.
+struct llama_op_profile_entry {
+    double  t_us = 0;
+    int64_t n    = 0;
+};
+
+struct llama_op_profile_state {
+    bool active   = false; // set around process_ubatch for the ubatches under the ceiling
+    int  n_graphs = 0;
+    std::chrono::steady_clock::time_point t0;
+    std::map<std::string, llama_op_profile_entry> by_op;   // "backend/op"
+    std::map<std::string, llama_op_profile_entry> by_name; // "backend/op/name"
+    ggml_backend_sched_t sched = nullptr;
+    std::string tag;
+};
+
+static int g_op_profile_max_tokens = 0;  // 0 = off
+static int g_op_profile_every      = 32; // graphs per report, LLAMA_OP_PROFILE_EVERY
+
+static llama_op_profile_state & llama_op_profile_get(const void * ctx) {
+    static std::map<const void *, llama_op_profile_state> states;
+    return states[ctx];
+}
+
+static std::string llama_op_profile_fold_name(const char * name) {
+    static const std::regex re("-[0-9]+");
+    return std::regex_replace(std::string(name), re, "-N");
+}
+
+static void llama_op_profile_report(llama_op_profile_state & st) {
+    using pr = std::pair<std::string, llama_op_profile_entry>;
+    auto dump = [&st](const char * title, const std::map<std::string, llama_op_profile_entry> & m, size_t limit) {
+        std::vector<pr> v(m.begin(), m.end());
+        std::sort(v.begin(), v.end(), [](const pr & a, const pr & b) { return a.second.t_us > b.second.t_us; });
+        double total = 0;
+        for (const auto & e : v) { total += e.second.t_us; }
+        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %s: %s over %d graphs, %.2f ms per graph\n", st.tag.c_str(), title, st.n_graphs, total/1000.0/st.n_graphs);
+        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9s %6s %8s %8s  %s\n", "ms/graph", "%", "n/graph", "us/node", "backend/op[/name]");
+        for (size_t i = 0; i < v.size() && i < limit; ++i) {
+            const auto & e = v[i];
+            LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9.3f %6.1f %8.1f %8.1f  %s\n",
+                    e.second.t_us/1000.0/st.n_graphs, 100.0*e.second.t_us/total,
+                    (double) e.second.n/st.n_graphs, e.second.t_us/e.second.n, e.first.c_str());
+        }
+    };
+    dump("per backend/op", st.by_op, 40);
+    dump("per node name (layer numbers folded)", st.by_name, 48);
+}
+
+static bool llama_context_op_profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto & st = llama_op_profile_get(user_data);
+
+    if (!st.active) {
+        return ask ? false : true;
+    }
+
+    if (ask) {
+        st.t0 = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const double us = std::chrono::duration<double, std::micro>(t1 - st.t0).count();
+
+    ggml_backend_t be = st.sched ? ggml_backend_sched_get_tensor_backend(st.sched, t) : nullptr;
+    const std::string key_op = std::string(be ? ggml_backend_name(be) : "?") + "/" + ggml_op_desc(t);
+
+    auto & eo = st.by_op[key_op];
+    eo.t_us += us; eo.n++;
+    auto & en = st.by_name[key_op + "/" + llama_op_profile_fold_name(ggml_get_name(t))];
+    en.t_us += us; en.n++;
+
+    return true;
+}
 
 static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
@@ -306,6 +392,19 @@ llama_context::llama_context(
         if (e != nullptr && atoi(e) >= 2) {
             cparams.cb_eval = llama_context_nan_hunt_cb;
             cparams.cb_eval_user_data = this;
+        }
+    }
+
+    // [TAG_OP_PROFILE] LLAMA_OP_PROFILE=1 (or =<n_tokens ceiling>) times the decode graphs
+    if (cparams.cb_eval == nullptr) {
+        const char * e = getenv("LLAMA_OP_PROFILE");
+        if (e != nullptr && atoi(e) > 0) {
+            g_op_profile_max_tokens = atoi(e) == 1 ? 8 : atoi(e);
+            if (const char * ev = getenv("LLAMA_OP_PROFILE_EVERY")) { g_op_profile_every = std::max(1, atoi(ev)); }
+            cparams.cb_eval = llama_context_op_profile_cb;
+            cparams.cb_eval_user_data = this;
+            llama_op_profile_get(this).tag = std::string(llm_arch_name(model.arch)) + "/" + std::to_string(model.hparams.n_layer_all) + "L";
+            LLAMA_LOG_WARN("%s: [TAG_OP_PROFILE] per-node timing enabled for ubatches up to %d tokens (one sync per node)\n", __func__, g_op_profile_max_tokens);
         }
     }
 
@@ -2000,7 +2099,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         g_nan_hunt_ubatch = &ubatch;
 
+        // [TAG_OP_PROFILE]
+        llama_op_profile_state * prof = nullptr;
+        if (g_op_profile_max_tokens > 0 && cparams.cb_eval == llama_context_op_profile_cb && (int) ubatch.n_tokens <= g_op_profile_max_tokens) {
+            prof = &llama_op_profile_get(this);
+            prof->active = true;
+            prof->sched  = sched.get();
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (prof) {
+            prof->active = false;
+            if (++prof->n_graphs >= g_op_profile_every) {
+                llama_op_profile_report(*prof);
+                prof->n_graphs = 0;
+                prof->by_op.clear();
+                prof->by_name.clear();
+            }
+        }
 
         g_nan_hunt_ubatch = nullptr;
 
