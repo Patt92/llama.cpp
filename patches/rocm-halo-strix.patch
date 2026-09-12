@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..a9f190b83 100644
+index aae3bcd35..ba8d76690 100644
 --- a/README.md
 +++ b/README.md
 @@ -17,6 +17,225 @@
@@ -8,7 +8,7 @@ index aae3bcd35..a9f190b83 100644
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`2a3005c23f60cb38dab70b8ea2ddbd969bcf3e87`](https://github.com/ggml-org/llama.cpp/commit/2a3005c23f60cb38dab70b8ea2ddbd969bcf3e87).
++Based on upstream llama.cpp commit [`acecd56032ddc34bada14a2d978f110d9c987095`](https://github.com/ggml-org/llama.cpp/commit/acecd56032ddc34bada14a2d978f110d9c987095).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -220,7 +220,7 @@ index aae3bcd35..a9f190b83 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 2a3005c23f60cb38dab70b8ea2ddbd969bcf3e87
++git checkout acecd56032ddc34bada14a2d978f110d9c987095
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -3115,7 +3115,7 @@ index 9b6038adf..e15b59293 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 24afedd14..4737995aa 100644
+index 6923f3510..cc640cb4c 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -4,6 +4,8 @@
@@ -3127,7 +3127,7 @@ index 24afedd14..4737995aa 100644
  
  #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
  #define MMQ_ITER_K             256
-@@ -484,12 +486,18 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
+@@ -490,12 +492,18 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
      constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
      constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
  
@@ -3148,7 +3148,7 @@ index 24afedd14..4737995aa 100644
  #pragma unroll
          for (int n = 0; n < ntx; ++n) {
  #pragma unroll
-@@ -508,12 +516,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
+@@ -514,12 +522,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
  
                  if constexpr (type == GGML_TYPE_NVFP4) {
                      if (y_scale_used) {
@@ -3164,7 +3164,7 @@ index 24afedd14..4737995aa 100644
                      GGML_UNUSED(y_scale_used);
                  }
              }
-@@ -1477,6 +1485,12 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1483,6 +1491,12 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
      int J_best        = 0;
      int ntiles_J_best = INT_MAX;
  
@@ -3177,7 +3177,7 @@ index 24afedd14..4737995aa 100644
      for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
          const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
          if (config.type == GGML_TYPE_COUNT) {
-@@ -1596,4 +1610,6 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+@@ -1602,4 +1616,6 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
  void ggml_cuda_mul_mat_q(
          ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
  
