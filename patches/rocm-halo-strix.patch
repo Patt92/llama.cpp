@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..6f243961b 100644
+index aae3bcd35..a9f190b83 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,223 @@
+@@ -17,6 +17,225 @@
  
  </div>
  
@@ -25,6 +25,8 @@ index aae3bcd35..6f243961b 100644
 +- Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 +- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 +- Loads Unsloth's *shared* MTP sidecar (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), which ships the NextN block without `token_embd` or `output`. The head borrows both from the target through `ctx_other`, so the sidecar is only usable as `--model-draft` of its target; loaded on its own it stops with a message instead of segfaulting, and the memory-fitting pass logs `requires ctx_other (this warning is normal during memory fitting)` and fits the target alone. The self-contained draft export is driven exactly as before (own KV cache, catch-up decode, sequential positions); the shared sidecar gets the same treatment, not the Gemma4-assistant shared-memory semantics that `ctx_other` used to imply. `test-llama-archs --arch qwen4exp` checks that the borrowed head reproduces the self-contained one (NMSE 0).
++- Keys the captured HIP graph by the first node's shape and node count, not the first node alone. Speculative decoding alternates graphs of different token counts in one context (the draft decodes one token per step and catches up on the accepted tokens; the verify batch shrinks when the draft stops early), and every switch found the other shape in the slot, reset the warmup and captured again: 20% of graph computes were captures and HIP graphs cost 5-8% of decode on gfx1151 against running without them. With the shape in the key each variant keeps its own graph (replay 91%, capture 1.5%).
++- Fuses the qwen4exp hyper-connection tails for decode: `ggml_hc_gate_mix` (sigmoid, gating, stream collapse and its 1/hc, 7 nodes -> 1) and `ggml_hc_combine` (the scatter's scale, sigmoid, scale, repeat, mul, add, 6 -> 1), CPU and HIP, checked against the elementwise chain by `test-llama-archs --arch qwen4exp` (NMSE 1e-14) and `test-backend-ops`. `QWEN4EXP_HC_FUSED=0` rebuilds the chain. The op enum grows by two, so the RPC protocol patch version is bumped and both ends of a split must run this build. Measured effect is small (about 1 ms per verify step): a rocprof trace of the live model shows the decode step is not launch-bound but spent in the weight reads - the 517 MB Q6_K output head three times per step (target verify plus two draft steps, 6.8 ms), the routed experts at the memory roofline (10 ms), the dense projections (10 ms) - plus the RPC worker's share.
 +- `LLAMA_OP_PROFILE=1` times every node of the decode and verify graphs (ubatches up to 8 tokens, `=<n>` raises the ceiling) through the scheduler's eval callback, which synchronizes after each node, and prints a table per backend/op and per node name with the layer numbers folded every 32 graphs (`LLAMA_OP_PROFILE_EVERY`), separately for the target and the MTP draft context. The per-node sync (about 10 us on HIP, a round trip on RPC) is part of every number, so read it as a ranking of where a token's time goes, not as kernel time.
 +- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
 +- Gathers the QSA-selected keys and values into a compact buffer for decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213), which limited it to one token per stream; its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Extended here to ubatches of up to 8 tokens per stream, because speculative verification hands the target `n-max + 1` tokens per pass and the one-token gate sent every such pass down the masked path -- with `--spec-draft-n-max 2` the gather never engaged at all, which is why Qwen3.8-Flash-Next decoded at 28.7 t/s at 123 tokens but 15.7 t/s at 80k on the same build, with draft acceptance unchanged. Each token carries its own top-k list and becomes one entry of the attention batch; `test-llama-archs --arch qwen4exp` checks an 8-token verify batch against eight single-token gathers, and gathered against masked attention with equal selection widths on a cache deeper than the width. Engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it, `=2` forces it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
@@ -355,11 +357,37 @@ index 168796d61..5de299346 100644
              return
          self.gguf_writer.add_ple_layers(ple_layers)
          self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index cbfe40013..2c2624bfa 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    6
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    0
++#define RPC_PROTO_PATCH_VERSION    1
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 85a1ae7ae..a0abf8839 100644
+index 85a1ae7ae..98d0356df 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -2508,6 +2508,27 @@ extern "C" {
+@@ -585,6 +585,8 @@ extern "C" {
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_HC_GATE_MIX,
++        GGML_OP_HC_COMBINE,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2508,6 +2510,27 @@ extern "C" {
              struct ggml_tensor * a,
              int32_t              n_kv_max);
  
@@ -387,6 +415,241 @@ index 85a1ae7ae..a0abf8839 100644
      GGML_API void ggml_flash_attn_ext_add_sinks(
              struct ggml_tensor * a,
              struct ggml_tensor * sinks);
+@@ -2716,6 +2739,27 @@ extern "C" {
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // [TAG_HC_FUSED_OPS] Qwen3.8-Flash-Next (qwen4exp) hyper-connection tails, fused for decode.
++    //
++    // hc_gate_mix: x [n_embd, hc, n_tokens], gate [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
++    //   result[i, t] = (1/hc) * sum_h x[i, h, t] * sigmoid(gate[i, h, t])
++    // replaces sigmoid, mul, the per-stream view adds and the 1/hc scale of the stream collapse.
++    GGML_API struct ggml_tensor * ggml_hc_gate_mix(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * gate);
++
++    // hc_combine: residual [n_embd, hc, n_tokens], x [n_embd, n_tokens], inject [hc, n_tokens]
++    //             -> [n_embd, hc, n_tokens]
++    //   result[i, h, t] = residual[i, h, t] + x[i, t] * 2 * sigmoid(inject[h, t] * scale)
++    // replaces the scale, sigmoid, scale, repeat, mul and add of the stream scatter.
++    GGML_API struct ggml_tensor * ggml_hc_combine(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * residual,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * inject,
++            float                 scale);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 3ec40fb1a..bef2dae66 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1037,7 +1037,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             } break;
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+-            case GGML_OP_DSV4_HC_POST: {
++            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_HC_GATE_MIX:
++            case GGML_OP_HC_COMBINE: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 87a329f26..249423525 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2101,6 +2101,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_HC_GATE_MIX:
++            {
++                ggml_compute_forward_hc_gate_mix(params, tensor);
++            } break;
++        case GGML_OP_HC_COMBINE:
++            {
++                ggml_compute_forward_hc_combine(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2284,6 +2292,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
++        case GGML_OP_HC_GATE_MIX:
++        case GGML_OP_HC_COMBINE:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 266261c5e..1f3dbca84 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11389,6 +11389,146 @@ void ggml_compute_forward_dsv4_hc_post(
+     }
+ }
+ 
++// [TAG_HC_FUSED_OPS] ggml_compute_forward_hc_gate_mix
++
++static void ggml_compute_forward_hc_gate_mix_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * x    = dst->src[0];
++    const ggml_tensor * gate = dst->src[1];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(gate->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    const int64_t n_embd   = x->ne[0];
++    const int64_t hc       = x->ne[1];
++    const int64_t n_tokens = x->ne[2];
++
++    GGML_ASSERT(dst->ne[0] == n_embd);
++    GGML_ASSERT(dst->ne[1] == n_tokens);
++    GGML_ASSERT(ggml_are_same_shape(x, gate));
++
++    GGML_TENSOR_LOCALS(size_t, nbx, x,    nb);
++    GGML_TENSOR_LOCALS(size_t, nbg, gate, nb);
++    GGML_TENSOR_LOCALS(size_t, nbd, dst,  nb);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const float inv_hc = 1.0f / (float) hc;
++
++    const int64_t nr  = n_embd * n_tokens;
++    const int64_t dr  = (nr + nth - 1) / nth;
++    const int64_t ir0 = dr * ith;
++    const int64_t ir1 = MIN(ir0 + dr, nr);
++
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t i0 = ir % n_embd;
++        const int64_t it = ir / n_embd;
++
++        float sum = 0.0f;
++        for (int64_t ih = 0; ih < hc; ++ih) {
++            const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + ih*nbx1 + it*nbx2);
++            const float gv = *(const float *) ((const char *) gate->data + i0*nbg0 + ih*nbg1 + it*nbg2);
++            sum += xv * (1.0f / (1.0f + expf(-gv)));
++        }
++
++        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = sum * inv_hc;
++    }
++}
++
++void ggml_compute_forward_hc_gate_mix(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++
++    switch (src0->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_hc_gate_mix_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
++// ggml_compute_forward_hc_combine
++
++static void ggml_compute_forward_hc_combine_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * residual = dst->src[0];
++    const ggml_tensor * x        = dst->src[1];
++    const ggml_tensor * inject   = dst->src[2];
++
++    GGML_ASSERT(residual->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    const int64_t n_embd   = residual->ne[0];
++    const int64_t hc       = residual->ne[1];
++    const int64_t n_tokens = residual->ne[2];
++
++    GGML_ASSERT(dst->ne[0] == n_embd);
++    GGML_ASSERT(dst->ne[1] == hc);
++    GGML_ASSERT(dst->ne[2] == n_tokens);
++    GGML_ASSERT(x->ne[0] == n_embd);
++    GGML_ASSERT(x->ne[1] == n_tokens);
++    GGML_ASSERT(inject->ne[0] == hc);
++    GGML_ASSERT(inject->ne[1] == n_tokens);
++
++    float scale = 1.0f;
++    memcpy(&scale, dst->op_params, sizeof(scale));
++
++    GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
++    GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
++    GGML_TENSOR_LOCALS(size_t, nbi, inject,   nb);
++    GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t nr  = n_embd * hc * n_tokens;
++    const int64_t dr  = (nr + nth - 1) / nth;
++    const int64_t ir0 = dr * ith;
++    const int64_t ir1 = MIN(ir0 + dr, nr);
++
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t i0 = ir % n_embd;
++        const int64_t ih = (ir / n_embd) % hc;
++        const int64_t it = ir / (n_embd * hc);
++
++        const float rv = *(const float *) ((const char *) residual->data + i0*nbr0 + ih*nbr1 + it*nbr2);
++        const float xv = *(const float *) ((const char *) x->data        + i0*nbx0 + it*nbx1);
++        const float iv = *(const float *) ((const char *) inject->data   + ih*nbi0 + it*nbi1);
++
++        const float w = 2.0f / (1.0f + expf(-iv * scale));
++
++        *(float *) ((char *) dst->data + i0*nbd0 + ih*nbd1 + it*nbd2) = rv + xv * w;
++    }
++}
++
++void ggml_compute_forward_hc_combine(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++
++    switch (src0->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_hc_combine_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_rwkv_wkv7
+ 
+ static void ggml_compute_forward_rwkv_wkv7_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index ce2b3e870..8b55b60b4 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -117,6 +117,8 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_hc_gate_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_hc_combine(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
 index 26af90025..b2f462a21 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
@@ -1708,10 +1971,18 @@ index 1b431a724..55c946f4f 100644
                  n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                  sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 5ae3b8d22..3af1c4d6a 100644
+index 5ae3b8d22..ada496900 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -335,6 +335,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -61,6 +61,7 @@
+ #include "ggml-cuda/gla.cuh"
+ #include "ggml-cuda/gated_delta_net.cuh"
+ #include "ggml-cuda/dsv4-hc.cuh"
++#include "ggml-cuda/hc-fused.cuh"
+ #include "ggml-cuda/set.cuh"
+ #include "ggml-cuda/set-rows.cuh"
+ #include "ggml-cuda/pad_reflect_1d.cuh"
+@@ -335,6 +336,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
                        id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                        device_vmm ? "yes" : "no", prop.warpSize,
                        device_vram_mib);
@@ -1737,7 +2008,7 @@ index 5ae3b8d22..3af1c4d6a 100644
  #elif defined(GGML_USE_MUSA)
          // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
          info.devices[id].warp_size = 32;
-@@ -1883,7 +1902,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -1883,7 +1903,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
              if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                  return false;
              }
@@ -1751,7 +2022,7 @@ index 5ae3b8d22..3af1c4d6a 100644
              return false;
          }
      }
-@@ -1922,7 +1946,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1922,7 +1947,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
                      return;
                  }
              } else {
@@ -1767,7 +2038,41 @@ index 5ae3b8d22..3af1c4d6a 100644
                      ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                      return;
                  }
-@@ -3624,6 +3655,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -2383,6 +2415,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_DSV4_HC_POST:
+             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+             break;
++        case GGML_OP_HC_GATE_MIX:
++            ggml_cuda_op_hc_gate_mix(ctx, dst);
++            break;
++        case GGML_OP_HC_COMBINE:
++            ggml_cuda_op_hc_combine(ctx, dst);
++            break;
+         case GGML_OP_RWKV_WKV7:
+             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+             break;
+@@ -2581,7 +2619,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ }
+ 
+ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return cgraph->nodes[0];
++    // [TAG_CUDA_GRAPH_KEY_SHAPE] the first node alone is a poor key when one context alternates
++    // between graphs of different token counts, which speculative decoding does all the time: the
++    // draft context decodes 1 token per draft step and then catches up on the accepted tokens
++    // (2..n) with the same first node, so every switch found the other shape's properties in the
++    // slot, reset the warmup and captured again. On gfx1151 that made HIP graphs a net loss
++    // (capture 20% of the graph computes). Fold the node count and the token dimension of the first
++    // node into the key so each shape keeps its own captured graph.
++    const ggml_tensor * n0 = cgraph->nodes[0];
++    uintptr_t key = (uintptr_t) n0;
++    key ^= (uintptr_t) cgraph->n_nodes * (uintptr_t) 0x9E3779B97F4A7C15ull;
++    key ^= (uintptr_t) n0->ne[1] << 40;
++    key ^= (uintptr_t) n0->ne[2] << 52;
++    return (const void *) key;
+ }
+ 
+ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+@@ -3624,6 +3674,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -1805,7 +2110,7 @@ index 5ae3b8d22..3af1c4d6a 100644
      bool fused_mul_mat_vec = false;
      int  fused_node_count  = 0;
  
-@@ -4272,6 +4334,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4272,6 +4353,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -1821,7 +2126,7 @@ index 5ae3b8d22..3af1c4d6a 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (is_concurrent_event_active) {
-@@ -4351,7 +4422,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4351,7 +4441,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
@@ -1834,7 +2139,7 @@ index 5ae3b8d22..3af1c4d6a 100644
              }
          }
  
-@@ -5455,7 +5530,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5455,7 +5549,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->ne[0] <= 1024;
  #endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
          case GGML_OP_ARGSORT:
@@ -1843,6 +2148,183 @@ index 5ae3b8d22..3af1c4d6a 100644
              return op->src[0]->ne[0] <= 1024;
  #else
              return true;
+@@ -5492,6 +5586,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                 op->type == GGML_TYPE_F32;
++        case GGML_OP_HC_GATE_MIX:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                op->type == GGML_TYPE_F32;
++        case GGML_OP_HC_COMBINE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+diff --git a/ggml/src/ggml-cuda/hc-fused.cu b/ggml/src/ggml-cuda/hc-fused.cu
+new file mode 100644
+index 000000000..d42255278
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-fused.cu
+@@ -0,0 +1,146 @@
++// [TAG_HC_FUSED_OPS] fused hyper-connection tails for Qwen3.8-Flash-Next (qwen4exp).
++//
++// A decode step of this model is launch-bound: every layer carries two hyper-connection mixes
++// and two scatters, each a chain of small elementwise kernels over [n_embd, hc, n_tokens]. The
++// two ops below replace those chains with one kernel each, same arithmetic in the same order
++// per element (sigmoid, multiply, sum over the streams, scale).
++
++#include "hc-fused.cuh"
++
++// result[i, t] = (1/hc) * sum_h x[i, h, t] * sigmoid(gate[i, h, t])
++static __global__ void hc_gate_mix_f32(
++        const float * x,
++        const float * gate,
++        float * dst,
++        int64_t n_embd,
++        int64_t hc,
++        int64_t n_tokens,
++        int64_t sx0, int64_t sx1, int64_t sx2,
++        int64_t sg0, int64_t sg1, int64_t sg2,
++        int64_t sd0, int64_t sd1) {
++    ggml_cuda_pdl_lc();
++    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t nr = n_embd * n_tokens;
++
++    if (ir >= nr) {
++        return;
++    }
++
++    ggml_cuda_pdl_sync();
++
++    const int64_t i0 = ir % n_embd;
++    const int64_t it = ir / n_embd;
++
++    float sum = 0.0f;
++    for (int64_t ih = 0; ih < hc; ++ih) {
++        const float xv = x   [i0*sx0 + ih*sx1 + it*sx2];
++        const float gv = gate[i0*sg0 + ih*sg1 + it*sg2];
++        sum += xv * (1.0f / (1.0f + expf(-gv)));
++    }
++
++    dst[i0*sd0 + it*sd1] = sum * (1.0f / (float) hc);
++}
++
++// result[i, h, t] = residual[i, h, t] + x[i, t] * 2 * sigmoid(inject[h, t] * scale)
++static __global__ void hc_combine_f32(
++        const float * residual,
++        const float * x,
++        const float * inject,
++        float * dst,
++        int64_t n_embd,
++        int64_t hc,
++        int64_t n_tokens,
++        float scale,
++        int64_t sr0, int64_t sr1, int64_t sr2,
++        int64_t sx0, int64_t sx1,
++        int64_t si0, int64_t si1,
++        int64_t sd0, int64_t sd1, int64_t sd2) {
++    ggml_cuda_pdl_lc();
++    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t nr = n_embd * hc * n_tokens;
++
++    if (ir >= nr) {
++        return;
++    }
++
++    ggml_cuda_pdl_sync();
++
++    const int64_t i0 = ir % n_embd;
++    const int64_t ih = (ir / n_embd) % hc;
++    const int64_t it = ir / (n_embd * hc);
++
++    const float rv = residual[i0*sr0 + ih*sr1 + it*sr2];
++    const float xv = x       [i0*sx0 + it*sx1];
++    const float iv = inject  [ih*si0 + it*si1];
++
++    const float w = 2.0f / (1.0f + expf(-iv * scale));
++
++    dst[i0*sd0 + ih*sd1 + it*sd2] = rv + xv * w;
++}
++
++void ggml_cuda_op_hc_gate_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x    = dst->src[0];
++    const ggml_tensor * gate = dst->src[1];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(gate->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    GGML_TENSOR_LOCALS(size_t, nbx, x,    nb);
++    GGML_TENSOR_LOCALS(size_t, nbg, gate, nb);
++    GGML_TENSOR_LOCALS(size_t, nbd, dst,  nb);
++
++    const int64_t n_embd   = x->ne[0];
++    const int64_t hc       = x->ne[1];
++    const int64_t n_tokens = x->ne[2];
++
++    const int block_size = 256;
++    const int64_t nr = n_embd * n_tokens;
++    const dim3 block_dims(block_size, 1, 1);
++    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
++
++    ggml_cuda_kernel_launch(hc_gate_mix_f32, launch_params,
++            (const float *) x->data, (const float *) gate->data, (float *) dst->data,
++            n_embd, hc, n_tokens,
++            nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
++            nbg0 / sizeof(float), nbg1 / sizeof(float), nbg2 / sizeof(float),
++            nbd0 / sizeof(float), nbd1 / sizeof(float));
++}
++
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * residual = dst->src[0];
++    const ggml_tensor * x        = dst->src[1];
++    const ggml_tensor * inject   = dst->src[2];
++
++    GGML_ASSERT(residual->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    float scale = 1.0f;
++    memcpy(&scale, dst->op_params, sizeof(scale));
++
++    GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
++    GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
++    GGML_TENSOR_LOCALS(size_t, nbi, inject,   nb);
++    GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
++
++    const int64_t n_embd   = residual->ne[0];
++    const int64_t hc       = residual->ne[1];
++    const int64_t n_tokens = residual->ne[2];
++
++    const int block_size = 256;
++    const int64_t nr = n_embd * hc * n_tokens;
++    const dim3 block_dims(block_size, 1, 1);
++    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
++
++    ggml_cuda_kernel_launch(hc_combine_f32, launch_params,
++            (const float *) residual->data, (const float *) x->data, (const float *) inject->data, (float *) dst->data,
++            n_embd, hc, n_tokens, scale,
++            nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
++            nbx0 / sizeof(float), nbx1 / sizeof(float),
++            nbi0 / sizeof(float), nbi1 / sizeof(float),
++            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
++}
+diff --git a/ggml/src/ggml-cuda/hc-fused.cuh b/ggml/src/ggml-cuda/hc-fused.cuh
+new file mode 100644
+index 000000000..790c6bc13
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-fused.cuh
+@@ -0,0 +1,6 @@
++#include "common.cuh"
++#include "ggml.h"
++
++// [TAG_HC_FUSED_OPS] qwen4exp hyper-connection tails
++void ggml_cuda_op_hc_gate_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
 index 5edc967e0..5c8c3ad97 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
@@ -2964,10 +3446,46 @@ index cc7d72069..9f94e719a 100644
              __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 5ef03e190..21008f898 100644
+index 5ef03e190..965a2d618 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5567,6 +5567,43 @@ void ggml_flash_attn_ext_set_n_kv_max(
+@@ -1084,6 +1084,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "HC_GATE_MIX",
++    "HC_COMBINE",
+ 
+     "UNARY",
+ 
+@@ -1101,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1199,6 +1201,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "hc_gate_mix(x, gate)",
++    "hc_combine(residual, x, inject)",
+ 
+     "unary(x)",
+ 
+@@ -1216,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5567,6 +5571,43 @@ void ggml_flash_attn_ext_set_n_kv_max(
      ggml_set_op_params_i32(a, 4, n_kv_max);
  }
  
@@ -3011,6 +3529,78 @@ index 5ef03e190..21008f898 100644
  void ggml_flash_attn_ext_add_sinks(
          struct ggml_tensor * a,
          struct ggml_tensor * sinks) {
+@@ -6580,6 +6621,71 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+     return result;
+ }
+ 
++// [TAG_HC_FUSED_OPS] ggml_hc_gate_mix
++
++struct ggml_tensor * ggml_hc_gate_mix(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * gate) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(gate->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_are_same_shape(x, gate));
++
++    const int64_t n_embd   = x->ne[0];
++    const int64_t hc       = x->ne[1];
++    const int64_t n_tokens = x->ne[2];
++
++    GGML_ASSERT(hc > 0);
++    GGML_ASSERT(x->ne[3] == 1);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
++
++    result->op     = GGML_OP_HC_GATE_MIX;
++    result->src[0] = x;
++    result->src[1] = gate;
++
++    return result;
++}
++
++// ggml_hc_combine
++
++struct ggml_tensor * ggml_hc_combine(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * residual,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * inject,
++        float                 scale) {
++    GGML_ASSERT(residual->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(inject->type == GGML_TYPE_F32);
++
++    const int64_t n_embd   = residual->ne[0];
++    const int64_t hc       = residual->ne[1];
++    const int64_t n_tokens = residual->ne[2];
++
++    GGML_ASSERT(hc > 0);
++    GGML_ASSERT(residual->ne[3] == 1);
++    GGML_ASSERT(x->ne[0] == n_embd);
++    GGML_ASSERT(x->ne[1] == n_tokens);
++    GGML_ASSERT(x->ne[2] == 1);
++    GGML_ASSERT(x->ne[3] == 1);
++    GGML_ASSERT(inject->ne[0] == hc);
++    GGML_ASSERT(inject->ne[1] == n_tokens);
++    GGML_ASSERT(inject->ne[2] == 1);
++    GGML_ASSERT(inject->ne[3] == 1);
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++
++    ggml_set_op_params(result, &scale, sizeof(scale));
++
++    result->op     = GGML_OP_HC_COMBINE;
++    result->src[0] = residual;
++    result->src[1] = x;
++    result->src[2] = inject;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
 index d3a639f37..40bae295d 100644
 --- a/gguf-py/gguf/constants.py
@@ -3175,7 +3765,7 @@ index f1d173a57..ea962fd7c 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6334f3cca..35c9c4ff4 100644
+index 6334f3cca..788f519c2 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -13,10 +13,15 @@
@@ -3194,7 +3784,7 @@ index 6334f3cca..35c9c4ff4 100644
  #include <stdexcept>
  #include <string>
  
-@@ -80,6 +85,245 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+@@ -80,6 +85,255 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -3281,6 +3871,7 @@ index 6334f3cca..35c9c4ff4 100644
 +
 +static int g_op_profile_max_tokens = 0;  // 0 = off
 +static int g_op_profile_every      = 32; // graphs per report, LLAMA_OP_PROFILE_EVERY
++static int g_op_profile_names      = 48; // rows of the per-name table, LLAMA_OP_PROFILE_NAMES
 +
 +static llama_op_profile_state & llama_op_profile_get(const void * ctx) {
 +    static std::map<const void *, llama_op_profile_state> states;
@@ -3294,22 +3885,31 @@ index 6334f3cca..35c9c4ff4 100644
 +
 +static void llama_op_profile_report(llama_op_profile_state & st) {
 +    using pr = std::pair<std::string, llama_op_profile_entry>;
-+    auto dump = [&st](const char * title, const std::map<std::string, llama_op_profile_entry> & m, size_t limit) {
-+        std::vector<pr> v(m.begin(), m.end());
++    // one table per backend: the per-node sync costs a few us on a local GPU and a round trip
++    // on RPC, so the backends are not comparable and are listed separately
++    std::map<std::string, std::vector<pr>> by_backend_op;
++    std::map<std::string, std::vector<pr>> by_backend_name;
++    for (const auto & e : st.by_op)   { by_backend_op  [e.first.substr(0, e.first.find('/'))].push_back(e); }
++    for (const auto & e : st.by_name) { by_backend_name[e.first.substr(0, e.first.find('/'))].push_back(e); }
++
++    auto dump = [&st](const char * title, std::vector<pr> & v, size_t limit) {
 +        std::sort(v.begin(), v.end(), [](const pr & a, const pr & b) { return a.second.t_us > b.second.t_us; });
-+        double total = 0;
-+        for (const auto & e : v) { total += e.second.t_us; }
-+        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %s: %s over %d graphs, %.2f ms per graph\n", st.tag.c_str(), title, st.n_graphs, total/1000.0/st.n_graphs);
-+        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9s %6s %8s %8s  %s\n", "ms/graph", "%", "n/graph", "us/node", "backend/op[/name]");
++        double  total = 0;
++        int64_t n     = 0;
++        for (const auto & e : v) { total += e.second.t_us; n += e.second.n; }
++        LLAMA_LOG_WARN("[TAG_OP_PROFILE] %s: %s over %d graphs: %.2f ms and %.0f nodes per graph\n", st.tag.c_str(), title, st.n_graphs, total/1000.0/st.n_graphs, (double) n/st.n_graphs);
++        LLAMA_LOG_WARN("[TAG_OP_PROFILE] %9s %6s %8s %8s  %s\n", "ms/graph", "%", "n/graph", "us/node", "backend/op[/name]");
 +        for (size_t i = 0; i < v.size() && i < limit; ++i) {
 +            const auto & e = v[i];
-+            LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9.3f %6.1f %8.1f %8.1f  %s\n",
++            LLAMA_LOG_WARN("[TAG_OP_PROFILE] %9.3f %6.1f %8.1f %8.1f  %s\n",
 +                    e.second.t_us/1000.0/st.n_graphs, 100.0*e.second.t_us/total,
 +                    (double) e.second.n/st.n_graphs, e.second.t_us/e.second.n, e.first.c_str());
 +        }
 +    };
-+    dump("per backend/op", st.by_op, 40);
-+    dump("per node name (layer numbers folded)", st.by_name, 48);
++    for (auto & kv : by_backend_op) {
++        dump((kv.first + " per op").c_str(), kv.second, 40);
++        dump((kv.first + " per node name (layer numbers folded)").c_str(), by_backend_name[kv.first], g_op_profile_names);
++    }
 +}
 +
 +static bool llama_context_op_profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -3440,7 +4040,7 @@ index 6334f3cca..35c9c4ff4 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -140,6 +384,30 @@ llama_context::llama_context(
+@@ -140,6 +394,31 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -3461,6 +4061,7 @@ index 6334f3cca..35c9c4ff4 100644
 +        if (e != nullptr && atoi(e) > 0) {
 +            g_op_profile_max_tokens = atoi(e) == 1 ? 8 : atoi(e);
 +            if (const char * ev = getenv("LLAMA_OP_PROFILE_EVERY")) { g_op_profile_every = std::max(1, atoi(ev)); }
++            if (const char * ev = getenv("LLAMA_OP_PROFILE_NAMES")) { g_op_profile_names = std::max(1, atoi(ev)); }
 +            cparams.cb_eval = llama_context_op_profile_cb;
 +            cparams.cb_eval_user_data = this;
 +            llama_op_profile_get(this).tag = std::string(llm_arch_name(model.arch)) + "/" + std::to_string(model.hparams.n_layer_all) + "L";
@@ -3471,7 +4072,7 @@ index 6334f3cca..35c9c4ff4 100644
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -152,7 +420,10 @@ llama_context::llama_context(
+@@ -152,7 +431,10 @@ llama_context::llama_context(
          cparams.ctx_other = params.ctx_other;
      }
  
@@ -3483,7 +4084,7 @@ index 6334f3cca..35c9c4ff4 100644
          if (model.tok_embd == nullptr || model.output == nullptr) {
              if (params.ctx_other == nullptr) {
                  throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-@@ -1826,8 +2097,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1826,8 +2108,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          ggml_status status;
  
@@ -3514,7 +4115,7 @@ index 6334f3cca..35c9c4ff4 100644
          if (!res) {
              // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
              llama_pos pos_min[LLAMA_MAX_SEQ];
-@@ -1985,6 +2278,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1985,6 +2289,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
      // set to total number of outputs in the batch, for use in llama_get_logits_ith
      n_outputs = n_outputs_all;
  
@@ -6238,7 +6839,7 @@ index 87195fddd..7c4c8b7a8 100644
  };
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..16956a4cd 100644
+index 8ace95f73..27f4d7f3d 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -6,6 +6,26 @@
@@ -6344,7 +6945,7 @@ index 8ace95f73..16956a4cd 100644
          const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
  
          const int64_t head_k_dim = hparams.ssm_d_state;
-@@ -203,61 +257,94 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -203,66 +257,107 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
          const int64_t conv_dim   = key_dim * 2 + value_dim;
  
          // two HC modules per layer: before the token mixer, before the MoE
@@ -6433,15 +7034,15 @@ index 8ace95f73..16956a4cd 100644
 +        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
 +        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
 +        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
++
++        if (il < n_layer) {
++            continue;
++        }
  
 -        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
 -        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
-+        if (il < n_layer) {
-+            continue;
-+        }
-+
 +        // NextN/MTP head. enorm/hnorm gate the two inputs; eh_proj is the checkpoint's
 +        // fc_embedding and fc_hidden fused side by side, so one matmul over
 +        // concat(e, h) computes fc_embedding@e + fc_hidden@h.
@@ -6477,7 +7078,86 @@ index 8ace95f73..16956a4cd 100644
      return std::make_unique<graph>(*this, params);
  }
  
-@@ -397,7 +484,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+ // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
+ // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
++// [TAG_HC_FUSED_OPS] QWEN4EXP_HC_FUSED=0 rebuilds the hyper-connection tails from the elementwise
++// ops (the reference the fused kernels are checked against); default on.
++static bool qwen4exp_hc_fused() {
++    // read per call so a test can flip it between graph builds; a few hundred getenv per build
++    const char * e = getenv("QWEN4EXP_HC_FUSED");
++    return e == nullptr || atoi(e) != 0;
++}
++
+ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         ggml_tensor *  x,
+         ggml_tensor *  w_norm,
+@@ -284,23 +379,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+ 
+     ggml_tensor * lo = build_lora_mm(w_down, xn);
+     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+-    cb(gate, "hc_gate", il);
+-
+-    ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
+-    gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+-
+-    // collapse the streams by their mean
+-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+-            ggml_row_size(gated->type, n_embd) * hc, 0);
+-    mixed = ggml_cont(ctx0, mixed);
+-    for (int64_t c = 1; c < hc; ++c) {
+-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+-                ggml_row_size(gated->type, n_embd) * hc,
+-                ggml_row_size(gated->type, n_embd) * c);
+-        mixed = ggml_add(ctx0, mixed, s);
++
++    ggml_tensor * mixed;
++    if (qwen4exp_hc_fused()) {
++        // [TAG_HC_FUSED_OPS] sigmoid, gating, the stream collapse and its 1/hc in one kernel
++        ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
++        cb(gate_logits, "hc_gate_logits", il);
++
++        mixed = ggml_hc_gate_mix(ctx0,
++                ggml_reshape_3d(ctx0, xn,          n_embd, hc, nt),
++                ggml_reshape_3d(ctx0, gate_logits, n_embd, hc, nt));
++    } else {
++        ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
++        cb(gate, "hc_gate", il);
++
++        ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
++        gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
++
++        // collapse the streams by their mean
++        mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
++                ggml_row_size(gated->type, n_embd) * hc, 0);
++        mixed = ggml_cont(ctx0, mixed);
++        for (int64_t c = 1; c < hc; ++c) {
++            ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
++                    ggml_row_size(gated->type, n_embd) * hc,
++                    ggml_row_size(gated->type, n_embd) * c);
++            mixed = ggml_add(ctx0, mixed, s);
++        }
++        mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+     }
+-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+     cb(mixed, "hc_mixed", il);
+ 
+     if (inject) {
+@@ -319,6 +426,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     const int64_t hc = hparams.dsv4_hc_mult;
+     const int64_t nt = residual->ne[2];
+ 
++    if (qwen4exp_hc_fused()) {
++        // [TAG_HC_FUSED_OPS] the scatter in one kernel: residual + block_out * 2*sigmoid(inject/hc)
++        ggml_tensor * cur = ggml_hc_combine(ctx0, residual, block_out, inject, 1.0f / (float) hc);
++        cb(cur, "hc_combine", il);
++        return cur;
++    }
++
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+     w = ggml_scale(ctx0, w, 2.0f);
+@@ -397,7 +511,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
@@ -6490,7 +7170,7 @@ index 8ace95f73..16956a4cd 100644
              // everything below is per token, so drop the rows that produce no output
              cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
              inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-@@ -425,6 +516,23 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -425,6 +543,23 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
          cb(res_hc, "l_last", il);
      }
  
@@ -6514,7 +7194,7 @@ index 8ace95f73..16956a4cd 100644
      // the final mixer is the output norm: there is no separate one
      ggml_tensor * cur = build_hc_mix(res_hc,
              model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-@@ -440,6 +548,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -440,6 +575,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  
@@ -6723,7 +7403,7 @@ index 8ace95f73..16956a4cd 100644
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                  ggml_tensor * input,
                          int   il) {
-@@ -528,7 +838,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -528,7 +865,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_tensor *                           inp_pos,
          ggml_tensor *                           kq_mask,
          int *                                   sections,
@@ -6733,7 +7413,7 @@ index 8ace95f73..16956a4cd 100644
      const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
  
      const int64_t idx_dim  = hparams.indexer_head_size;
-@@ -549,7 +860,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -549,7 +887,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -6745,7 +7425,7 @@ index 8ace95f73..16956a4cd 100644
          kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
          cparams.causal_attn && !hparams.use_alibi;
  
-@@ -662,7 +976,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -662,7 +1003,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      cb(expanded, "indexer_score_tokens", il);
  
      // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
@@ -6759,7 +7439,7 @@ index 8ace95f73..16956a4cd 100644
  
      ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
  
-@@ -681,8 +1000,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -681,8 +1027,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_tensor *             k_cur,
          ggml_tensor *             v_cur,
          ggml_tensor *             top_k,
@@ -6771,7 +7451,7 @@ index 8ace95f73..16956a4cd 100644
      // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
      // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
      if (inp->self_k_rot) {
-@@ -712,6 +1033,79 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -712,6 +1060,79 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -6851,7 +7531,7 @@ index 8ace95f73..16956a4cd 100644
      ggml_tensor * kq_mask = inp->get_kq_mask();
  
      // prepare new kq mask - starts filled with -INFINITY
-@@ -771,7 +1165,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -771,7 +1192,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      // indexer reads the same block input as q/k/v; no cache or no ratio means dense
      const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
  
@@ -6889,7 +7569,7 @@ index 8ace95f73..16956a4cd 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -824,7 +1247,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -824,7 +1274,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  
      if (top_k) {
@@ -6901,10 +7581,84 @@ index 8ace95f73..16956a4cd 100644
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b63b3773e..bc56331d5 100644
+index b63b3773e..7ac5bae77 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6356,7 +6356,7 @@ struct test_concat : public test_case {
+@@ -4283,6 +4283,73 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
+ };
+ 
+ 
++// [TAG_HC_FUSED_OPS] GGML_OP_HC_GATE_MIX
++struct test_hc_gate_mix : public test_case {
++    const int64_t n_embd;
++    const int64_t hc;
++    const int64_t n_tokens;
++    const bool    view; // x and gate as views into a wider [hc*n_embd, n_tokens] buffer, as the graph builds them
++
++    std::string vars() override {
++        return VARS_TO_STR4(n_embd, hc, n_tokens, view);
++    }
++
++    test_hc_gate_mix(int64_t n_embd = 31, int64_t hc = 4, int64_t n_tokens = 17, bool view = false)
++        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), view(view) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x;
++        ggml_tensor * gate;
++        if (view) {
++            ggml_tensor * xw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
++            ggml_set_name(xw, "x");
++            ggml_tensor * gw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
++            ggml_set_name(gw, "gate");
++            x    = ggml_reshape_3d(ctx, xw, n_embd, hc, n_tokens);
++            gate = ggml_reshape_3d(ctx, gw, n_embd, hc, n_tokens);
++        } else {
++            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++            ggml_set_name(x, "x");
++            gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++            ggml_set_name(gate, "gate");
++        }
++
++        ggml_tensor * out = ggml_hc_gate_mix(ctx, x, gate);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// GGML_OP_HC_COMBINE
++struct test_hc_combine : public test_case {
++    const int64_t n_embd;
++    const int64_t hc;
++    const int64_t n_tokens;
++
++    std::string vars() override {
++        return VARS_TO_STR3(n_embd, hc, n_tokens);
++    }
++
++    test_hc_combine(int64_t n_embd = 31, int64_t hc = 4, int64_t n_tokens = 17)
++        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++        ggml_set_name(residual, "residual");
++
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
++        ggml_set_name(x, "x");
++
++        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
++        ggml_set_name(inject, "inject");
++
++        ggml_tensor * out = ggml_hc_combine(ctx, residual, x, inject, 1.0f / (float) hc);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++
+ // GGML_OP_SSM_CONV
+ struct test_ssm_conv : public test_case {
+     const ggml_type type;
+@@ -6356,7 +6423,7 @@ struct test_concat : public test_case {
      const std::array<int64_t, 4> ne_a;
      const int64_t ne_b_d;
      const int dim;
@@ -6913,7 +7667,7 @@ index b63b3773e..bc56331d5 100644
  
      std::string vars() override {
          return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
-@@ -6391,7 +6391,15 @@ struct test_concat : public test_case {
+@@ -6391,7 +6458,15 @@ struct test_concat : public test_case {
              ggml_set_name(a, "a");
          }
          ggml_tensor * b;
@@ -6930,7 +7684,22 @@ index b63b3773e..bc56331d5 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -9843,6 +9851,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -8948,6 +9023,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
+     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
+ 
++    // [TAG_HC_FUSED_OPS]
++    for (int64_t nt : {1, 3, 8, 257}) {
++        test_cases.emplace_back(new test_hc_gate_mix(2560, 4, nt, true));
++        test_cases.emplace_back(new test_hc_gate_mix(31, 4, nt, false));
++        test_cases.emplace_back(new test_hc_combine(2560, 4, nt));
++        test_cases.emplace_back(new test_hc_combine(31, 3, nt));
++    }
++
+     // glu ops
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         for (int v : {0, 1}) {
+@@ -9843,6 +9926,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  #endif
  
  #if 1
@@ -6955,7 +7724,7 @@ index b63b3773e..bc56331d5 100644
      for (ggml_type type_a : base_types) {
          for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
              std::vector<int> ks = { 256 };
-@@ -10345,6 +10371,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10345,6 +10446,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -6964,7 +7733,7 @@ index b63b3773e..bc56331d5 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10721,13 +10749,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10721,13 +10824,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                          GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      }
  
@@ -6978,7 +7747,7 @@ index b63b3773e..bc56331d5 100644
      // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-@@ -10888,6 +10909,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10888,6 +10984,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -6990,7 +7759,42 @@ index b63b3773e..bc56331d5 100644
      // gdn + cache cpy fusion (K > 1)
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
-@@ -11192,14 +11218,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11139,6 +11240,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     }
+ 
+ 
++    // [TAG_QWEN4EXP_DECODE_SHAPES] the dense matmuls of a Qwen3.8-Flash-Next verify step (1..4
++    // tokens): hyper-connection down/up/inject, attention q/qkv/out, GDN in/out projections,
++    // shared expert, and the Q6_K output head over the 248320-token vocabulary
++    for (int bs : {1, 2, 3, 4}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,    320, bs, 10240, {1, 1}, {1, 1})); // hc_ffn_down
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,    320, bs, 10240, {1, 1}, {1, 1})); // hc_attn_down
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_1, GGML_TYPE_F32,  10240, bs,   320, {1, 1}, {1, 1})); // hc_*_up
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,      4, bs, 10240, {1, 1}, {1, 1})); // hc_*_inject
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  12288, bs,  2560, {1, 1}, {1, 1})); // attn_q
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  10240, bs,  2560, {1, 1}, {1, 1})); // attn_qkv (GDN)
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   6144, bs,  2560, {1, 1}, {1, 1})); // z / attn_gate
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   2560, bs,  6144, {1, 1}, {1, 1})); // ssm_out / attn_output
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,    640, bs,  2560, {1, 1}, {1, 1})); // shared expert gate/up
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   2560, bs,   640, {1, 1}, {1, 1})); // shared expert down
++    }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 2560, {1, 1}, {1, 1})); // output head, draft step
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 3, 2560, {1, 1}, {1, 1})); // output head, verify
++
++    // [TAG_QWEN4EXP_MOE_SHAPES] Qwen3.8-Flash-Next: 512 experts, 10 routed, n_ff_exp 640; gate/up
++    // are Q5_K [2560 x 640], down is Q8_0 [640 x 2560]; the verify batch is 2..4 tokens
++    for (int bs : {1, 2, 3, 4, 8}) {
++        for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
++            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560, 1));
++        }
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
++    }
++
+     // gpt-oss-20b
+     for (int bs : {1, 4, 8, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
+@@ -11192,14 +11321,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
@@ -7011,7 +7815,7 @@ index b63b3773e..bc56331d5 100644
      for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
          for (int hs : { 64, 128, 256, 576, }) {
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 3496f72e4..e53850419 100644
+index 3496f72e4..cf02155e7 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -10,9 +10,13 @@
@@ -7150,7 +7954,7 @@ index 3496f72e4..e53850419 100644
      if (!encode) {
          ctx_params.n_ubatch = 64;
      }
-@@ -421,6 +450,310 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -421,6 +450,336 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
      return std::make_pair(std::move(model), std::move(lctx));
  }
  
@@ -7286,6 +8090,32 @@ index 3496f72e4..e53850419 100644
 +    }
 +    printf("qwen4exp QSA gather: %u-token verify batch, gathered vs masked over %u of %u cells, NMSE = %.2e\n",
 +            n_verify, n_top_k + 3, n_prefill + n_verify, nmse_val);
++}
++
++// [TAG_HC_FUSED_OPS] the fused hyper-connection tails must reproduce the elementwise chain
++static void test_qwen4exp_hc_fused(
++        const bool moe, const size_t seed, const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode) {
++    const uint32_t n_prefill = 24;
++    const uint32_t n_verify  = 3;
++
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, moe, false);
++    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_verify, 128, seed + 2);
++
++    std::vector<float> logits_fused;
++    std::vector<float> logits_plain;
++    for (int mode = 0; mode < 2; ++mode) {
++        setenv("QWEN4EXP_HC_FUSED", mode == 0 ? "1" : "0", 1);
++        auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
++        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
++        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_fused : &logits_plain);
++    }
++    unsetenv("QWEN4EXP_HC_FUSED");
++
++    const double nmse_val = nmse(logits_plain, logits_fused);
++    if (!(nmse_val < 1e-6)) {
++        throw std::runtime_error(string_format("qwen4exp HC fused: fused hyper-connection tails differ from the elementwise chain, NMSE = %.2e", nmse_val));
++    }
++    printf("qwen4exp HC fused: fused vs elementwise hyper-connection tails, NMSE = %.2e\n", nmse_val);
 +}
 +
 +// [TAG_QWEN4EXP_SHARED_MTP] a shared MTP sidecar (Unsloth's mtp-*-shared-*.gguf) carries neither
@@ -7461,7 +8291,7 @@ index 3496f72e4..e53850419 100644
  static std::vector<float> get_logits(
          llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
      const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
-@@ -477,6 +810,7 @@ static bool moe_mandatory(const llm_arch arch) {
+@@ -477,6 +836,7 @@ static bool moe_mandatory(const llm_arch arch) {
          case LLM_ARCH_DEEPSEEK4:
          case LLM_ARCH_GLM4_MOE:
          case LLM_ARCH_GLM_DSA:
@@ -7469,7 +8299,7 @@ index 3496f72e4..e53850419 100644
          case LLM_ARCH_EXAONE_MOE:
          case LLM_ARCH_BAILINGMOE:
          case LLM_ARCH_BAILINGMOE2:
-@@ -759,10 +1093,33 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -759,10 +1119,34 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                      if (logits_cpu.empty()) {
                          model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                          logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
@@ -7499,6 +8329,7 @@ index 3496f72e4..e53850419 100644
 +                            test_qwen4exp_qsa_gather(gguf_ctx.get(), seed, dc.devs, dc.split_mode, tokens);
 +                            test_qwen4exp_qsa_gather_vs_masked(moe, seed, dc.devs, dc.split_mode);
 +                            test_qwen4exp_shared_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
++                            test_qwen4exp_hc_fused(moe, seed, dc.devs, dc.split_mode);
 +                        }
                          const double nmse_val = nmse(logits_cpu, logits_dev);
                          snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
