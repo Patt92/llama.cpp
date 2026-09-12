@@ -1,14 +1,14 @@
 diff --git a/README.md b/README.md
-index aae3bcd35ad9c2ba3e914750a36e125fec0b5355..a7bc0bd5bfc9ba9961f746db86a9f89291d5e2e5 100644
+index aae3bcd35..6f243961b 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,222 @@
+@@ -17,6 +17,223 @@
  
  </div>
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`8172e6577ac2b35de1ec1e5d1c0aaad6c4a2129f`](https://github.com/ggml-org/llama.cpp/commit/8172e6577ac2b35de1ec1e5d1c0aaad6c4a2129f).
++Based on upstream llama.cpp commit [`2a3005c23f60cb38dab70b8ea2ddbd969bcf3e87`](https://github.com/ggml-org/llama.cpp/commit/2a3005c23f60cb38dab70b8ea2ddbd969bcf3e87).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -25,6 +25,7 @@ index aae3bcd35ad9c2ba3e914750a36e125fec0b5355..a7bc0bd5bfc9ba9961f746db86a9f892
 +- Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 +- On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 +- Loads Unsloth's *shared* MTP sidecar (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), which ships the NextN block without `token_embd` or `output`. The head borrows both from the target through `ctx_other`, so the sidecar is only usable as `--model-draft` of its target; loaded on its own it stops with a message instead of segfaulting, and the memory-fitting pass logs `requires ctx_other (this warning is normal during memory fitting)` and fits the target alone. The self-contained draft export is driven exactly as before (own KV cache, catch-up decode, sequential positions); the shared sidecar gets the same treatment, not the Gemma4-assistant shared-memory semantics that `ctx_other` used to imply. `test-llama-archs --arch qwen4exp` checks that the borrowed head reproduces the self-contained one (NMSE 0).
++- `LLAMA_OP_PROFILE=1` times every node of the decode and verify graphs (ubatches up to 8 tokens, `=<n>` raises the ceiling) through the scheduler's eval callback, which synchronizes after each node, and prints a table per backend/op and per node name with the layer numbers folded every 32 graphs (`LLAMA_OP_PROFILE_EVERY`), separately for the target and the MTP draft context. The per-node sync (about 10 us on HIP, a round trip on RPC) is part of every number, so read it as a ranking of where a token's time goes, not as kernel time.
 +- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
 +- Gathers the QSA-selected keys and values into a compact buffer for decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213), which limited it to one token per stream; its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Extended here to ubatches of up to 8 tokens per stream, because speculative verification hands the target `n-max + 1` tokens per pass and the one-token gate sent every such pass down the masked path -- with `--spec-draft-n-max 2` the gather never engaged at all, which is why Qwen3.8-Flash-Next decoded at 28.7 t/s at 123 tokens but 15.7 t/s at 80k on the same build, with draft acceptance unchanged. Each token carries its own top-k list and becomes one entry of the attention batch; `test-llama-archs --arch qwen4exp` checks an 8-token verify batch against eight single-token gathers, and gathered against masked attention with equal selection widths on a cache deeper than the width. Engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it, `=2` forces it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
 +- Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
@@ -217,7 +218,7 @@ index aae3bcd35ad9c2ba3e914750a36e125fec0b5355..a7bc0bd5bfc9ba9961f746db86a9f892
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 8172e6577ac2b35de1ec1e5d1c0aaad6c4a2129f
++git checkout 2a3005c23f60cb38dab70b8ea2ddbd969bcf3e87
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -226,7 +227,7 @@ index aae3bcd35ad9c2ba3e914750a36e125fec0b5355..a7bc0bd5bfc9ba9961f746db86a9f892
  
  A few options to get `llama.cpp` installed on your machine:
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 77dfe9535f3f5d41164b31c10d390699fcba274a..11227c407455900c95f38344c5c9b7755d95be1a 100644
+index 77dfe9535..11227c407 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -1420,7 +1420,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -250,7 +251,7 @@ index 77dfe9535f3f5d41164b31c10d390699fcba274a..11227c407455900c95f38344c5c9b775
  
          if (chain_heads) {
 diff --git a/conversion/qwen4exp.py b/conversion/qwen4exp.py
-index 168796d616b98725ad27d209843f38d0fd27f147..5de299346056e14e0fc0a35bb436451c4ebeb0a2 100644
+index 168796d61..5de299346 100644
 --- a/conversion/qwen4exp.py
 +++ b/conversion/qwen4exp.py
 @@ -1,6 +1,6 @@
@@ -355,7 +356,7 @@ index 168796d616b98725ad27d209843f38d0fd27f147..5de299346056e14e0fc0a35bb436451c
          self.gguf_writer.add_ple_layers(ple_layers)
          self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 85a1ae7ae20880c782fe25ad80ba7f9f98f3515b..a0abf8839e94c0ff132e2593b04bd0e03ff5302b 100644
+index 85a1ae7ae..a0abf8839 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2508,6 +2508,27 @@ extern "C" {
@@ -387,7 +388,7 @@ index 85a1ae7ae20880c782fe25ad80ba7f9f98f3515b..a0abf8839e94c0ff132e2593b04bd0e0
              struct ggml_tensor * a,
              struct ggml_tensor * sinks);
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
-index 26af900259721d3cd4a79c44f4a5e9c0e9e4c379..b2f462a216a8775c3535a675a204bb67918488de 100644
+index 26af90025..b2f462a21 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
 +++ b/ggml/src/ggml-cuda/argsort.cu
 @@ -1,13 +1,15 @@
@@ -436,7 +437,7 @@ index 26af900259721d3cd4a79c44f4a5e9c0e9e4c379..b2f462a216a8775c3535a675a204bb67
      const size_t shared_mem     = ncols_pad * sizeof(int);
      const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
 diff --git a/ggml/src/ggml-cuda/argsort.cuh b/ggml/src/ggml-cuda/argsort.cuh
-index 3abb6448a05733d5da519d89a7b79d81a2a76315..5e5d5af4cd48424350d83fe5485da7f0dda1a16a 100644
+index 3abb6448a..5e5d5af4c 100644
 --- a/ggml/src/ggml-cuda/argsort.cuh
 +++ b/ggml/src/ggml-cuda/argsort.cuh
 @@ -2,7 +2,7 @@
@@ -458,7 +459,7 @@ index 3abb6448a05733d5da519d89a7b79d81a2a76315..5e5d5af4cd48424350d83fe5485da7f0
                                    int *           dst,
                                    const int       ncols,
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 7d14ce9067eea04133db61b89202e83ca6a1888e..43ca9f269b0113efb35ad6a7eba9d6976474ad5e 100644
+index 7d14ce906..43ca9f269 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1262,6 +1262,32 @@ struct ggml_tensor_extra_gpu {
@@ -550,7 +551,7 @@ index 7d14ce9067eea04133db61b89202e83ca6a1888e..43ca9f269b0113efb35ad6a7eba9d697
  
  struct ggml_cuda_mm_fusion_args_host {
 diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
-index 6df89013ca79f75e9ba6da93dc3e7e8470eca4ce..045af3218a12d247a26e8f4f3b106b002815bbbc 100644
+index 6df89013c..045af3218 100644
 --- a/ggml/src/ggml-cuda/concat.cu
 +++ b/ggml/src/ggml-cuda/concat.cu
 @@ -115,32 +115,103 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -664,7 +665,7 @@ index 6df89013ca79f75e9ba6da93dc3e7e8470eca4ce..045af3218a12d247a26e8f4f3b106b00
          const T * src0_d = (const T *) src0->data;
          const T * src1_d = (const T *) src1->data;
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 48b631e60fb4e46232e781abab1a3530eab3c091..7442bc22af20b142518db041c07b53a0635545e3 100644
+index 48b631e60..7442bc22a 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -1133,21 +1133,12 @@ void launch_fattn(
@@ -695,7 +696,7 @@ index 48b631e60fb4e46232e781abab1a3530eab3c091..7442bc22af20b142518db041c07b53a0
          blocks_num.x = ntiles_dst;
          blocks_num.y = 1;
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 578f6cf79c25b257448f5ee5b2c8fc0219c6e83c..bc5060e813e5322c21d3342e9aa0d0c33e7f5d2d 100644
+index 578f6cf79..bc5060e81 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -158,8 +158,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
@@ -719,7 +720,7 @@ index 578f6cf79c25b257448f5ee5b2c8fc0219c6e83c..bc5060e813e5322c21d3342e9aa0d0c3
          return;
      }
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index 8981ab804ce0ac625e8b0905e2392339343a2e1a..0ca5a948b0f4ff083e8b23f020427de131ac97ff 100644
+index 8981ab804..0ca5a948b 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -229,7 +229,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
@@ -1505,7 +1506,7 @@ index 8981ab804ce0ac625e8b0905e2392339343a2e1a..0ca5a948b0f4ff083e8b23f020427de1
  extern DECL_FATTN_TILE_CASE( 64,  64);
  extern DECL_FATTN_TILE_CASE( 72,  72);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ceb4727931d46d28c6f3db24712d63fcf55e8b5b..d11a964d59a30c70b5f8cf56f129dc4bca535aff 100644
+index ceb472793..d11a964d5 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -221,24 +221,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
@@ -1546,7 +1547,7 @@ index ceb4727931d46d28c6f3db24712d63fcf55e8b5b..d11a964d59a30c70b5f8cf56f129dc4b
      }
  
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724d7237121dea29ca9c82bcd4817337a7..55c946f4f04b50dea85f024139359c62f256f3b5 100644
+index 1b431a724..55c946f4f 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,8 +1,8 @@
@@ -1707,7 +1708,7 @@ index 1b431a724d7237121dea29ca9c82bcd4817337a7..55c946f4f04b50dea85f024139359c62
                  n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                  sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 5ae3b8d22a3652b16484d355881d5b7386476be6..3af1c4d6a234074727686de573b1acb8c93b8eb3 100644
+index 5ae3b8d22..3af1c4d6a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -335,6 +335,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
@@ -1843,7 +1844,7 @@ index 5ae3b8d22a3652b16484d355881d5b7386476be6..3af1c4d6a234074727686de573b1acb8
  #else
              return true;
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 5edc967e0e92c0fe3a48f94648beb9975937e62c..5c8c3ad97883c7c0cdb4725cd88b5bb09d534214 100644
+index 5edc967e0..5c8c3ad97 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -2,6 +2,7 @@
@@ -2013,7 +2014,7 @@ index 5edc967e0e92c0fe3a48f94648beb9975937e62c..5c8c3ad97883c7c0cdb4725cd88b5bb0
          if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
              // use wmma kernel
 diff --git a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
-index 180b2d9370d19806dab113180570eda1ec02aa3e..1e92f6fbc591ac7b0f85be60844cf7a64ee0af2e 100644
+index 180b2d937..1e92f6fbc 100644
 --- a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
 +++ b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
 @@ -85,9 +85,9 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
@@ -2047,7 +2048,7 @@ index 180b2d9370d19806dab113180570eda1ec02aa3e..1e92f6fbc591ac7b0f85be60844cf7a6
      CASE(GGML_TYPE_Q6_K, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
      CASE(GGML_TYPE_Q6_K, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-index 4d1c398fc545e40f6e5ce45d336688c0174568f5..e7a36df5c7e711ea69940ff5dc59f64cc5e9151b 100644
+index 4d1c398fc..e7a36df5c 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 +++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 @@ -160,7 +160,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
@@ -2398,7 +2399,7 @@ index 4d1c398fc545e40f6e5ce45d336688c0174568f5..e7a36df5c7e711ea69940ff5dc59f64c
          }
      }
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 9b6038adff9e5579c2aa2d022fcdc805b56d886c..e15b59293feb15397f2a334f0ff3f2f8309bbce7 100644
+index 9b6038adf..e15b59293 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -82,6 +82,127 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
@@ -2632,7 +2633,7 @@ index 9b6038adff9e5579c2aa2d022fcdc805b56d886c..e15b59293feb15397f2a334f0ff3f2f8
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 24afedd1432b6e9db2d277e7d52cfe02a807ff53..4737995aaebebd3de9f9ad1250e6dbca1730e0b1 100644
+index 24afedd14..4737995aa 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -4,6 +4,8 @@
@@ -2702,7 +2703,7 @@ index 24afedd1432b6e9db2d277e7d52cfe02a807ff53..4737995aaebebd3de9f9ad1250e6dbca
 +
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 6305230b1f92c6c8242cfee5778ae08bda25dc80..f88d18be67f6cc6c08b3b7afbad83e2616311447 100644
+index 6305230b1..f88d18be6 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -99,6 +99,7 @@ enum mmvq_parameter_table_id {
@@ -2804,7 +2805,7 @@ index 6305230b1f92c6c8242cfee5778ae08bda25dc80..f88d18be67f6cc6c08b3b7afbad83e26
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index f2a6f2009c9ac907b6002667a49dcb6c2e75be56..a0fbf1e6244a72d7f74f38e601db05e7ca4ae7c6 100644
+index f2a6f2009..a0fbf1e62 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -240,7 +240,13 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
@@ -2822,7 +2823,7 @@ index f2a6f2009c9ac907b6002667a49dcb6c2e75be56..a0fbf1e6244a72d7f74f38e601db05e7
  
  template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
-index 2fc0fe9fdbb71da709cb1e01f1f496d1f9425718..f226743368ae62a5e915677ad72bd32178f27e4d 100644
+index 2fc0fe9fd..f22674336 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
 +++ b/ggml/src/ggml-cuda/vendors/hip.h
 @@ -10,6 +10,21 @@
@@ -2858,7 +2859,7 @@ index 2fc0fe9fdbb71da709cb1e01f1f496d1f9425718..f226743368ae62a5e915677ad72bd321
  #define cudaStream_t hipStream_t
  #define cudaSuccess hipSuccess
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index cc7d7206933f39260e2db319627415019cb73a7d..9f94e719a1758b5df17d0f0e12503ddd792773f3 100644
+index cc7d72069..9f94e719a 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -700,7 +700,14 @@ static void ggml_backend_rpc_buffer_memset_tensor(
@@ -2963,7 +2964,7 @@ index cc7d7206933f39260e2db319627415019cb73a7d..9f94e719a1758b5df17d0f0e12503ddd
              __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 5ef03e190e34a04295f6622f59515ec6a88b8deb..21008f89848cb88ee98ea0afd45e2f4e54126fd2 100644
+index 5ef03e190..21008f898 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5567,6 +5567,43 @@ void ggml_flash_attn_ext_set_n_kv_max(
@@ -3011,7 +3012,7 @@ index 5ef03e190e34a04295f6622f59515ec6a88b8deb..21008f89848cb88ee98ea0afd45e2f4e
          struct ggml_tensor * a,
          struct ggml_tensor * sinks) {
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index d3a639f374c08a139cdb45700bea04b715596d26..40bae295d6c0e7854cd2928df18a94f616a6c6f7 100644
+index d3a639f37..40bae295d 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
 @@ -1184,6 +1184,11 @@ class MODEL_TENSOR(IntEnum):
@@ -3053,7 +3054,7 @@ index d3a639f374c08a139cdb45700bea04b715596d26..40bae295d6c0e7854cd2928df18a94f6
      MODEL_ARCH.PLAMO: [
          MODEL_TENSOR.TOKEN_EMBD,
 diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
-index d2dfeece59522ffb417f70939cf94ee157591eee..eed2ffd608886af28c0c0f0734104b4e5e15f2b7 100644
+index d2dfeece5..eed2ffd60 100644
 --- a/gguf-py/gguf/tensor_mapping.py
 +++ b/gguf-py/gguf/tensor_mapping.py
 @@ -2803,6 +2803,16 @@ class TensorNameMap:
@@ -3074,7 +3075,7 @@ index d2dfeece59522ffb417f70939cf94ee157591eee..eed2ffd608886af28c0c0f0734104b4e
                  "model.layers.{bid}.self_attn.indexer.q_layernorm",
              ),
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index bc922b6a7bd625dc9ec9b7f5f02e3e7a6957d252..51b8d538bd174f7715ee24b337d58824c5971f10 100644
+index bc922b6a7..51b8d538b 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -31,6 +31,7 @@ set(LLAMA_CORE_SOURCES
@@ -3086,7 +3087,7 @@ index bc922b6a7bd625dc9ec9b7f5f02e3e7a6957d252..51b8d538bd174f7715ee24b337d58824
      llama-mmap.cpp
      llama-model-loader.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index b5efb72065654663f70431cc97aca57f6da7ae0d..76a0b6ad051dc08e48d9c8ef7ded5b598bda2769 100644
+index b5efb7206..76a0b6ad0 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -84,6 +84,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -3142,7 +3143,7 @@ index b5efb72065654663f70431cc97aca57f6da7ae0d..76a0b6ad051dc08e48d9c8ef7ded5b59
          case LLM_ARCH_T5:
          case LLM_ARCH_NEMOTRON_H:
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index f1d173a5755690077251b65255a95749006304cb..ea962fd7c02705b5cbe501bee19bd09e35ca738b 100644
+index f1d173a57..ea962fd7c 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
 @@ -89,6 +89,7 @@ enum llm_arch {
@@ -3174,18 +3175,26 @@ index f1d173a5755690077251b65255a95749006304cb..ea962fd7c02705b5cbe501bee19bd09e
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6334f3ccab304749bbf7b51362dee7c9348771d7..896e8f7277687a26cacb815cd9a0eaa4ba4f2544 100644
+index 6334f3cca..35c9c4ff4 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -13,6 +13,7 @@
+@@ -13,10 +13,15 @@
  #include "llama-sampler.h"
  #include "llama.h"
  
++#include <algorithm>
 +#include <atomic>
++#include <chrono>
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
-@@ -80,6 +81,163 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+ #include <limits>
++#include <map>
++#include <regex>
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -80,6 +85,245 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -3246,6 +3255,88 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..896e8f7277687a26cacb815cd9a0eaa4
 +
 +// the ubatch being computed, so a NaN column can be named by token id and position
 +static const llama_ubatch * g_nan_hunt_ubatch = nullptr;
++
++// [TAG_OP_PROFILE] LLAMA_OP_PROFILE=1 times every graph node of the small (decode / verify)
++// ubatches: the scheduler synchronizes the backend after each node when a callback is set, so
++// the wall time between the ask and the observe call is the node's own time plus one sync.
++// Aggregated per op and per node name (layer numbers folded), printed every 32 decode graphs
++// (LLAMA_OP_PROFILE_EVERY) as a table sorted by time. Absolute numbers carry the per-node sync (about 10 us on HIP, a
++// round trip on RPC), so read them as a ranking; the totals say where the tokens go.
++// LLAMA_OP_PROFILE=<n> sets the n_tokens ceiling of the ubatches that are profiled (default 8).
++// Each llama_context (target, draft) keeps its own table, reported with its arch and layer count.
++struct llama_op_profile_entry {
++    double  t_us = 0;
++    int64_t n    = 0;
++};
++
++struct llama_op_profile_state {
++    bool active   = false; // set around process_ubatch for the ubatches under the ceiling
++    int  n_graphs = 0;
++    std::chrono::steady_clock::time_point t0;
++    std::map<std::string, llama_op_profile_entry> by_op;   // "backend/op"
++    std::map<std::string, llama_op_profile_entry> by_name; // "backend/op/name"
++    ggml_backend_sched_t sched = nullptr;
++    std::string tag;
++};
++
++static int g_op_profile_max_tokens = 0;  // 0 = off
++static int g_op_profile_every      = 32; // graphs per report, LLAMA_OP_PROFILE_EVERY
++
++static llama_op_profile_state & llama_op_profile_get(const void * ctx) {
++    static std::map<const void *, llama_op_profile_state> states;
++    return states[ctx];
++}
++
++static std::string llama_op_profile_fold_name(const char * name) {
++    static const std::regex re("-[0-9]+");
++    return std::regex_replace(std::string(name), re, "-N");
++}
++
++static void llama_op_profile_report(llama_op_profile_state & st) {
++    using pr = std::pair<std::string, llama_op_profile_entry>;
++    auto dump = [&st](const char * title, const std::map<std::string, llama_op_profile_entry> & m, size_t limit) {
++        std::vector<pr> v(m.begin(), m.end());
++        std::sort(v.begin(), v.end(), [](const pr & a, const pr & b) { return a.second.t_us > b.second.t_us; });
++        double total = 0;
++        for (const auto & e : v) { total += e.second.t_us; }
++        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %s: %s over %d graphs, %.2f ms per graph\n", st.tag.c_str(), title, st.n_graphs, total/1000.0/st.n_graphs);
++        LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9s %6s %8s %8s  %s\n", "ms/graph", "%", "n/graph", "us/node", "backend/op[/name]");
++        for (size_t i = 0; i < v.size() && i < limit; ++i) {
++            const auto & e = v[i];
++            LLAMA_LOG_INFO("[TAG_OP_PROFILE] %9.3f %6.1f %8.1f %8.1f  %s\n",
++                    e.second.t_us/1000.0/st.n_graphs, 100.0*e.second.t_us/total,
++                    (double) e.second.n/st.n_graphs, e.second.t_us/e.second.n, e.first.c_str());
++        }
++    };
++    dump("per backend/op", st.by_op, 40);
++    dump("per node name (layer numbers folded)", st.by_name, 48);
++}
++
++static bool llama_context_op_profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto & st = llama_op_profile_get(user_data);
++
++    if (!st.active) {
++        return ask ? false : true;
++    }
++
++    if (ask) {
++        st.t0 = std::chrono::steady_clock::now();
++        return true;
++    }
++
++    const auto t1 = std::chrono::steady_clock::now();
++    const double us = std::chrono::duration<double, std::micro>(t1 - st.t0).count();
++
++    ggml_backend_t be = st.sched ? ggml_backend_sched_get_tensor_backend(st.sched, t) : nullptr;
++    const std::string key_op = std::string(be ? ggml_backend_name(be) : "?") + "/" + ggml_op_desc(t);
++
++    auto & eo = st.by_op[key_op];
++    eo.t_us += us; eo.n++;
++    auto & en = st.by_name[key_op + "/" + llama_op_profile_fold_name(ggml_get_name(t))];
++    en.t_us += us; en.n++;
++
++    return true;
++}
 +
 +static bool llama_context_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 +    GGML_UNUSED(user_data);
@@ -3349,7 +3440,7 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..896e8f7277687a26cacb815cd9a0eaa4
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -140,6 +298,17 @@ llama_context::llama_context(
+@@ -140,6 +384,30 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -3364,10 +3455,23 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..896e8f7277687a26cacb815cd9a0eaa4
 +        }
 +    }
 +
++    // [TAG_OP_PROFILE] LLAMA_OP_PROFILE=1 (or =<n_tokens ceiling>) times the decode graphs
++    if (cparams.cb_eval == nullptr) {
++        const char * e = getenv("LLAMA_OP_PROFILE");
++        if (e != nullptr && atoi(e) > 0) {
++            g_op_profile_max_tokens = atoi(e) == 1 ? 8 : atoi(e);
++            if (const char * ev = getenv("LLAMA_OP_PROFILE_EVERY")) { g_op_profile_every = std::max(1, atoi(ev)); }
++            cparams.cb_eval = llama_context_op_profile_cb;
++            cparams.cb_eval_user_data = this;
++            llama_op_profile_get(this).tag = std::string(llm_arch_name(model.arch)) + "/" + std::to_string(model.hparams.n_layer_all) + "L";
++            LLAMA_LOG_WARN("%s: [TAG_OP_PROFILE] per-node timing enabled for ubatches up to %d tokens (one sync per node)\n", __func__, g_op_profile_max_tokens);
++        }
++    }
++
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -152,7 +321,10 @@ llama_context::llama_context(
+@@ -152,7 +420,10 @@ llama_context::llama_context(
          cparams.ctx_other = params.ctx_other;
      }
  
@@ -3379,20 +3483,38 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..896e8f7277687a26cacb815cd9a0eaa4
          if (model.tok_embd == nullptr || model.output == nullptr) {
              if (params.ctx_other == nullptr) {
                  throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-@@ -1826,8 +1998,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1826,8 +2097,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          ggml_status status;
  
 +        g_nan_hunt_ubatch = &ubatch;
 +
++        // [TAG_OP_PROFILE]
++        llama_op_profile_state * prof = nullptr;
++        if (g_op_profile_max_tokens > 0 && cparams.cb_eval == llama_context_op_profile_cb && (int) ubatch.n_tokens <= g_op_profile_max_tokens) {
++            prof = &llama_op_profile_get(this);
++            prof->active = true;
++            prof->sched  = sched.get();
++        }
++
          const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
  
++        if (prof) {
++            prof->active = false;
++            if (++prof->n_graphs >= g_op_profile_every) {
++                llama_op_profile_report(*prof);
++                prof->n_graphs = 0;
++                prof->by_op.clear();
++                prof->by_name.clear();
++            }
++        }
++
 +        g_nan_hunt_ubatch = nullptr;
 +
          if (!res) {
              // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
              llama_pos pos_min[LLAMA_MAX_SEQ];
-@@ -1985,6 +2161,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1985,6 +2278,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
      // set to total number of outputs in the batch, for use in llama_get_logits_ith
      n_outputs = n_outputs_all;
  
@@ -3445,7 +3567,7 @@ index 6334f3ccab304749bbf7b51362dee7c9348771d7..896e8f7277687a26cacb815cd9a0eaa4
      if (n_outputs > 0) {
          bool sorted_output = true;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5855393ef7cc6328fb9d21f47e13f68a01e2b252..0428d3556826f7f30df2cf87cea61aaf5ff65c58 100644
+index 5855393ef..0428d3556 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -13,6 +13,7 @@
@@ -3574,7 +3696,7 @@ index 5855393ef7cc6328fb9d21f47e13f68a01e2b252..0428d3556826f7f30df2cf87cea61aaf
      const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
  
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index cc4110639d4b8417564b34baa99475e026f8b7db..24ae78642be7eab13eb765d0ea844b7526633d95 100644
+index cc4110639..24ae78642 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -31,6 +31,7 @@ class llama_kv_cache_dsv4_context;
@@ -3638,7 +3760,7 @@ index cc4110639d4b8417564b34baa99475e026f8b7db..24ae78642be7eab13eb765d0ea844b75
  
 diff --git a/src/llama-memory-hybrid-kpool.cpp b/src/llama-memory-hybrid-kpool.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..1fa0698ee5c967de83492cedd567d3a3ff8e752f
+index 000000000..1fa0698ee
 --- /dev/null
 +++ b/src/llama-memory-hybrid-kpool.cpp
 @@ -0,0 +1,739 @@
@@ -4383,7 +4505,7 @@ index 0000000000000000000000000000000000000000..1fa0698ee5c967de83492cedd567d3a3
 +}
 diff --git a/src/llama-memory-hybrid-kpool.h b/src/llama-memory-hybrid-kpool.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..afb823fd51c9da4509a8e06dbef4fa57e17d5f52
+index 000000000..afb823fd5
 --- /dev/null
 +++ b/src/llama-memory-hybrid-kpool.h
 @@ -0,0 +1,260 @@
@@ -4648,7 +4770,7 @@ index 0000000000000000000000000000000000000000..afb823fd51c9da4509a8e06dbef4fa57
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f9e9a8bcb06e682a90eab33fa091b1b33f7018cd..671a2d79548e5be2aa69b8d96307ed586b725929 100644
+index f9e9a8bcb..671a2d795 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
@@ -4726,7 +4848,7 @@ index f9e9a8bcb06e682a90eab33fa091b1b33f7018cd..671a2d79548e5be2aa69b8d96307ed58
  
          // use what we call a normal RoPE, operating on pairs of consecutive head values
 diff --git a/src/llama-model.h b/src/llama-model.h
-index a02b30ca7adad5089fd8d3553d8c14118718f4f9..5beda913554684e6e9535f93271c1a0fb01524d9 100644
+index a02b30ca7..5beda9135 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -231,6 +231,12 @@ struct llama_layer_nextn {
@@ -4744,7 +4866,7 @@ index a02b30ca7adad5089fd8d3553d8c14118718f4f9..5beda913554684e6e9535f93271c1a0f
  struct llama_layer_switch_lora {
 diff --git a/src/models/glm5next.cpp b/src/models/glm5next.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..6a07e7901909a4367baaa009eacff91a7676bef6
+index 000000000..6a07e7901
 --- /dev/null
 +++ b/src/models/glm5next.cpp
 @@ -0,0 +1,1270 @@
@@ -6019,7 +6141,7 @@ index 0000000000000000000000000000000000000000..6a07e7901909a4367baaa009eacff91a
 +    ggml_build_forward_expand(gf, cur);
 +}
 diff --git a/src/models/models.h b/src/models/models.h
-index 87195fddd1283e62bd1fa4d46d378646ccdeefd3..7c4c8b7a8c4aa0494381efa941a2d09040538613 100644
+index 87195fddd..7c4c8b7a8 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -1341,6 +1341,44 @@ struct llama_model_glm_dsa : public llama_model_base {
@@ -6116,7 +6238,7 @@ index 87195fddd1283e62bd1fa4d46d378646ccdeefd3..7c4c8b7a8c4aa0494381efa941a2d090
  };
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73475537eda0fbb4933e65f38f19ce0e5..16956a4cddac8d2031723821c01ab120674addde 100644
+index 8ace95f73..16956a4cd 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -6,6 +6,26 @@
@@ -6779,7 +6901,7 @@ index 8ace95f73475537eda0fbb4933e65f38f19ce0e5..16956a4cddac8d2031723821c01ab120
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b63b3773eef8091386386425a347c77ea6bed66f..bc56331d5894b6ccd9bd6e7ec40092a868bb6ebc 100644
+index b63b3773e..bc56331d5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6356,7 +6356,7 @@ struct test_concat : public test_case {
@@ -6889,7 +7011,7 @@ index b63b3773eef8091386386425a347c77ea6bed66f..bc56331d5894b6ccd9bd6e7ec40092a8
      for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
          for (int hs : { 64, 128, 256, 576, }) {
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 3496f72e494995d65029f215e67bad28edebf677..e538504194fbd3e869adfb4801410ab8dd1245b9 100644
+index 3496f72e4..e53850419 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -10,9 +10,13 @@
@@ -7383,7 +7505,7 @@ index 3496f72e494995d65029f215e67bad28edebf677..e538504194fbd3e869adfb4801410ab8
                          status_nmse = "\033[1;32mOK\033[0m";
 diff --git a/tests/test-rpc-cache.cpp b/tests/test-rpc-cache.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..899e14cc11430211a37b1e869c35527b608d4611
+index 000000000..899e14cc1
 --- /dev/null
 +++ b/tests/test-rpc-cache.cpp
 @@ -0,0 +1,56 @@
@@ -7445,7 +7567,7 @@ index 0000000000000000000000000000000000000000..899e14cc11430211a37b1e869c35527b
 +}
 diff --git a/tests/test-rpc-cache.sh b/tests/test-rpc-cache.sh
 new file mode 100755
-index 0000000000000000000000000000000000000000..b8faf9c4f14ec8a49f358b729e1dbe9d8dcea6a0
+index 000000000..b8faf9c4f
 --- /dev/null
 +++ b/tests/test-rpc-cache.sh
 @@ -0,0 +1,36 @@
@@ -7486,7 +7608,7 @@ index 0000000000000000000000000000000000000000..b8faf9c4f14ec8a49f358b729e1dbe9d
 +
 +"$client" "$endpoint" "$test_dir/rpc"
 diff --git a/tools/mtmd/CMakeLists.txt b/tools/mtmd/CMakeLists.txt
-index 176eb15057407eb230c485aed313200b8e77b090..4978b3b686744e08203d5003248d5b0bc670f1e2 100644
+index 176eb1505..4978b3b68 100644
 --- a/tools/mtmd/CMakeLists.txt
 +++ b/tools/mtmd/CMakeLists.txt
 @@ -39,6 +39,7 @@ add_library(mtmd
@@ -7498,7 +7620,7 @@ index 176eb15057407eb230c485aed313200b8e77b090..4978b3b686744e08203d5003248d5b0b
              models/granite4-vision.cpp
              models/hunyuanvl.cpp
 diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
-index 72148a4d9a9bee3b6f81545f2695f1c20bacfae3..0c7b23d53be729862f6b25f72647cdeeb677156a 100644
+index 72148a4d9..0c7b23d53 100644
 --- a/tools/mtmd/clip-impl.h
 +++ b/tools/mtmd/clip-impl.h
 @@ -63,6 +63,7 @@
@@ -7526,7 +7648,7 @@ index 72148a4d9a9bee3b6f81545f2695f1c20bacfae3..0c7b23d53be729862f6b25f72647cdee
      { PROJECTOR_TYPE_YASA2,             "yasa2"},
      { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
 diff --git a/tools/mtmd/clip-model.h b/tools/mtmd/clip-model.h
-index f737ccc24527ad4f8809a429325a74c17ad58d79..196390a28a10ccb8364a23d2d858c738015d43a4 100644
+index f737ccc24..196390a28 100644
 --- a/tools/mtmd/clip-model.h
 +++ b/tools/mtmd/clip-model.h
 @@ -17,6 +17,7 @@ enum ffn_op_type {
@@ -7547,7 +7669,7 @@ index f737ccc24527ad4f8809a429325a74c17ad58d79..196390a28a10ccb8364a23d2d858c738
  
      float eps = 1e-6;
 diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
-index cd6421def528f3a4156f440d9676b18edba8402b..36c017e9889960d5e5f0fa339397b00f9f6ab859 100644
+index cd6421def..36c017e98 100644
 --- a/tools/mtmd/clip.cpp
 +++ b/tools/mtmd/clip.cpp
 @@ -684,6 +684,14 @@ ggml_tensor * clip_graph::build_ffn(
@@ -7645,7 +7767,7 @@ index cd6421def528f3a4156f440d9676b18edba8402b..36c017e9889960d5e5f0fa339397b00f
              return ctx->model.mm_2_w->ne[1];
 diff --git a/tools/mtmd/models/glm5next-vision.cpp b/tools/mtmd/models/glm5next-vision.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e1130f1cc5d2138b5c6bad87f307b93fc5a2cda3
+index 000000000..e1130f1cc
 --- /dev/null
 +++ b/tools/mtmd/models/glm5next-vision.cpp
 @@ -0,0 +1,16 @@
@@ -7666,7 +7788,7 @@ index 0000000000000000000000000000000000000000..e1130f1cc5d2138b5c6bad87f307b93f
 +    return clip_graph_glm4v::build();
 +}
 diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
-index 5945c6d92cb7eba4d403b992279b8dcd794e80e0..f37b40f65ef802ec7f16f3104118fd8e329738d1 100644
+index 5945c6d92..f37b40f65 100644
 --- a/tools/mtmd/models/models.h
 +++ b/tools/mtmd/models/models.h
 @@ -183,6 +183,11 @@ struct clip_graph_glm4v : clip_graph {
@@ -7682,7 +7804,7 @@ index 5945c6d92cb7eba4d403b992279b8dcd794e80e0..f37b40f65ef802ec7f16f3104118fd8e
      clip_graph_hunyuanvl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
      ggml_cgraph * build() override;
 diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
-index 00ecadcf4dfe8b0f39ebca095c6995b7a041986f..f44272dacab8450cdee506d9076b54c1f998e7bc 100644
+index 00ecadcf4..f44272dac 100644
 --- a/tools/mtmd/mtmd.cpp
 +++ b/tools/mtmd/mtmd.cpp
 @@ -861,6 +861,7 @@ struct mtmd_context {
@@ -7694,7 +7816,7 @@ index 00ecadcf4dfe8b0f39ebca095c6995b7a041986f..f44272dacab8450cdee506d9076b54c1
                      // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
                      img_beg = "<|begin_of_image|>";
 diff --git a/tools/rpc/CMakeLists.txt b/tools/rpc/CMakeLists.txt
-index 2891c7d034cf289f2674266721bd638ba01ced9a..4803ea75bb8e292012142b0ed62a36c72575b29c 100644
+index 2891c7d03..4803ea75b 100644
 --- a/tools/rpc/CMakeLists.txt
 +++ b/tools/rpc/CMakeLists.txt
 @@ -13,6 +13,16 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
