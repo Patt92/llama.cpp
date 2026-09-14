@@ -341,6 +341,11 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    // [TAG_SCHED_ALLOC_FRESH] like ggml_backend_sched_alloc_graph, but the compute buffers are planned
+    // from scratch for this graph instead of reusing the previous plan where the tensors happen to
+    // fit. The placement then depends only on the graph, so a graph that is allocated again later
+    // lands on the same addresses.
+    GGML_API bool                 ggml_backend_sched_alloc_graph_fresh(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

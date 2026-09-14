@@ -1657,13 +1657,10 @@ bool llama_context::graph_ring_alloc(ggml_cgraph * gf) {
     // with several slots a graph must land on the same addresses every time it is planned, so
     // that the backends' captured graphs and the RPC server's stored graph stay valid across
     // switches. The allocator's plan-reuse shortcut gives a graph the placement of whatever it
-    // planned before when the tensors happen to fit, so plan from scratch (reserve) first and
-    // let the allocation pick that plan up. A single slot keeps the plain path.
-    if (gf_res_ring.size() > 1 && getenv("LLAMA_GRAPH_RING_NORESERVE") == nullptr) {
-        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-            return false;
-        }
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    // planned before when the tensors happen to fit, so plan from scratch. A single slot keeps
+    // the plain path.
+    if (gf_res_ring.size() > 1) {
+        return ggml_backend_sched_alloc_graph_fresh(sched.get(), gf);
     }
     return ggml_backend_sched_alloc_graph(sched.get(), gf);
 }
