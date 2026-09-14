@@ -6,16 +6,19 @@
 // cache line
 //
 
-#if defined(__cpp_lib_hardware_interference_size)
-#define CACHE_LINE_SIZE std::hardware_destructive_interference_size
-#else
+// [TAG_CACHE_LINE_C_CXX] the same value for the C planner (ggml-cpu.c) and the C++ kernels
+// (ops.cpp): the planner sizes the work buffer with CACHE_LINE_SIZE-padded per-thread strides
+// and the kernels index it with the same expression, so the two translation units must agree.
+// With std::hardware_destructive_interference_size on the C++ side only (256 on Apple arm64
+// libc++) the kernels ran CACHE_LINE_SIZE*(n_threads-1) bytes past the buffer the planner sized.
 #if defined(__POWER9_VECTOR__)
 #define CACHE_LINE_SIZE 128
 #elif defined(__VXE__) || defined(__VXE2__)
 #define CACHE_LINE_SIZE 256
+#elif defined(__APPLE__) && defined(__aarch64__)
+#define CACHE_LINE_SIZE 128
 #else
 #define CACHE_LINE_SIZE 64
-#endif
 #endif
 
 // -Winterference-size was introduced in GCC 12
