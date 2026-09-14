@@ -764,6 +764,11 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // [TAG_GRAPH_RING]
+    if (n_reused_ring > 0) {
+        LLAMA_LOG_INFO("%s: graphs reused = %d, of which re-planned from another ring slot = %d\n", __func__, n_reused, n_reused_ring);
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -881,7 +886,19 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    {
+        // [TAG_GRAPH_RING] LLAMA_GRAPH_RING=<n> slots (default 4, 1 = one previous graph as before)
+        int n_ring = 4;
+        if (const char * e = getenv("LLAMA_GRAPH_RING")) {
+            n_ring = std::max(1, atoi(e));
+        }
+        gf_res_ring.clear();
+        for (int i = 0; i < n_ring; ++i) {
+            gf_res_ring.emplace_back(new llm_graph_result(max_nodes));
+        }
+        gf_res_prev = gf_res_ring[0].get();
+        LLAMA_LOG_INFO("%s: graph ring            = %d\n", __func__, n_ring);
+    }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -1101,7 +1118,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        graph_ring_reset();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1615,6 +1632,42 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// [TAG_GRAPH_RING]
+void llama_context::graph_ring_release(llm_graph_result * res) {
+    ggml_context * ctx = res->get_ctx();
+    if (ctx == nullptr) {
+        return;
+    }
+    // every tensor of the compute context was placed by the scheduler's allocator: drop the
+    // placement so the next ggml_backend_sched_alloc_graph plans it again. Views recover their
+    // data from view_src in ggml_backend_view_init.
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+    }
+}
+
+void llama_context::graph_ring_reset() {
+    for (auto & r : gf_res_ring) {
+        r->reset();
+    }
+}
+
+bool llama_context::graph_ring_alloc(ggml_cgraph * gf) {
+    // with several slots a graph must land on the same addresses every time it is planned, so
+    // that the backends' captured graphs and the RPC server's stored graph stay valid across
+    // switches. The allocator's plan-reuse shortcut gives a graph the placement of whatever it
+    // planned before when the tensors happen to fit, so plan from scratch (reserve) first and
+    // let the allocation pick that plan up. A single slot keeps the plain path.
+    if (gf_res_ring.size() > 1 && getenv("LLAMA_GRAPH_RING_NORESERVE") == nullptr) {
+        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            return false;
+        }
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    }
+    return ggml_backend_sched_alloc_graph(sched.get(), gf);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1622,8 +1675,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
+    // [TAG_GRAPH_RING] look for a previous graph with this topology: the slot the scheduler
+    // holds first, then the other slots, most recently used first
+    llm_graph_result * res = nullptr;
+    size_t i_res = 0;
+    {
+        const auto gparams_probe = graph_params(gf_res_prev, ubatch, mctx, gtype);
+        if (!graph_reuse_disable) {
+            for (size_t i = 0; i < gf_res_ring.size(); ++i) {
+                auto * cand = gf_res_ring[i].get();
+                if (cand->can_reuse(gparams_probe)) {
+                    res   = cand;
+                    i_res = i;
+                    break;
+                }
+            }
+        }
+        if (res == nullptr) {
+            // build into the least recently used slot
+            i_res = gf_res_ring.size() - 1;
+            res   = gf_res_ring[i_res].get();
+        }
+    }
+    auto * gf = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1637,6 +1711,48 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
+        }
+
+        if (res != gf_res_prev) {
+            // the scheduler holds another slot's allocation: plan this graph again. Its compute
+            // tensors are released first so the planner lays them out exactly as it did the first
+            // time (same graph, same buffers -> same offsets), which keeps the backends' captured
+            // graphs and the RPC server's stored graph valid for this uid.
+            ggml_backend_sched_synchronize(sched.get());
+
+            // LLAMA_GRAPH_RING_CHECK=1 verifies that the re-plan reproduces the previous placement
+            static const bool ring_check = getenv("LLAMA_GRAPH_RING_CHECK") != nullptr;
+            std::vector<std::pair<ggml_tensor *, void *>> before;
+            if (ring_check) {
+                for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t != nullptr; t = ggml_get_next_tensor(res->get_ctx(), t)) {
+                    before.emplace_back(t, t->data);
+                }
+            }
+
+            graph_ring_release(res);
+
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            if (!graph_ring_alloc(gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            n_reused_ring++;
+
+            if (ring_check) {
+                int n_diff = 0;
+                for (const auto & [t, d] : before) {
+                    if (t->data != d) {
+                        if (n_diff < 8) {
+                            LLAMA_LOG_WARN("%s: [TAG_GRAPH_RING] '%s' op=%s moved %p -> %p\n", __func__, ggml_get_name(t), ggml_op_desc(t), d, t->data);
+                        }
+                        n_diff++;
+                    }
+                }
+                LLAMA_LOG_WARN("%s: [TAG_GRAPH_RING] re-plan: %d of %zu tensors moved\n", __func__, n_diff, before.size());
+            }
         }
 
         n_reused++;
@@ -1658,12 +1774,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (!graph_ring_alloc(gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
     }
+
+    // move the slot to the front: most recently used, and the one the scheduler holds
+    if (i_res != 0) {
+        auto tmp = std::move(gf_res_ring[i_res]);
+        gf_res_ring.erase(gf_res_ring.begin() + i_res);
+        gf_res_ring.insert(gf_res_ring.begin(), std::move(tmp));
+    }
+    gf_res_prev = res;
 
     // set the input data for the input tensors
     {
@@ -2777,7 +2901,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    graph_ring_reset();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3705,6 +3829,7 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+    n_reused_ring = 0;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -3867,7 +3992,7 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = gf_res_prev.get();
+            auto * res = gf_res_prev;
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 

@@ -491,6 +491,20 @@ static void test_qwen4exp_mtp(
 }
 
 // decode tokens[pos0, pos0+n) in batches of `step`, collecting logits of every token when `out` is set
+// set an environment variable for the duration of a test and restore what was there before,
+// so the reference logits computed earlier and the roundtrip computed later see the same graph
+struct env_scope {
+    std::string name;
+    std::string old;
+    bool had = false;
+    env_scope(const char * n, const char * v) : name(n) {
+        if (const char * e = getenv(n)) { had = true; old = e; }
+        setenv(n, v, 1);
+    }
+    void set(const char * v) { setenv(name.c_str(), v, 1); }
+    ~env_scope() { if (had) { setenv(name.c_str(), old.c_str(), 1); } else { unsetenv(name.c_str()); } }
+};
+
 static void qwen4exp_decode_range(llama_context * lctx, const std::vector<llama_token> & tokens,
         uint32_t pos0, uint32_t n, uint32_t step, std::vector<float> * out) {
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
@@ -526,7 +540,7 @@ static void test_qwen4exp_qsa_gather(
     const uint32_t n_verify  = 8;
     GGML_ASSERT(tokens.size() >= n_prefill + n_verify);
 
-    setenv("QWEN4EXP_QSA_GATHER", "2", 1);
+    env_scope env("QWEN4EXP_QSA_GATHER", "2");
 
     std::vector<float> logits_batched;
     std::vector<float> logits_single;
@@ -541,7 +555,6 @@ static void test_qwen4exp_qsa_gather(
         qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, 1, &logits_single);
     }
 
-    unsetenv("QWEN4EXP_QSA_GATHER");
 
     const double nmse_val = nmse(logits_single, logits_batched);
     if (!(nmse_val < 1e-4)) {
@@ -568,13 +581,15 @@ static void test_qwen4exp_qsa_gather_vs_masked(
 
     std::vector<float> logits_gather;
     std::vector<float> logits_masked;
-    for (int mode = 0; mode < 2; ++mode) {
-        setenv("QWEN4EXP_QSA_GATHER", mode == 0 ? "2" : "0", 1);
-        auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
-        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
-        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_gather : &logits_masked);
+    {
+        env_scope env("QWEN4EXP_QSA_GATHER", "2");
+        for (int mode = 0; mode < 2; ++mode) {
+            env.set(mode == 0 ? "2" : "0");
+            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
+            qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
+            qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_gather : &logits_masked);
+        }
     }
-    unsetenv("QWEN4EXP_QSA_GATHER");
 
     const double nmse_val = nmse(logits_masked, logits_gather);
     if (!(nmse_val < 1e-4)) {
@@ -582,6 +597,44 @@ static void test_qwen4exp_qsa_gather_vs_masked(
     }
     printf("qwen4exp QSA gather: %u-token verify batch, gathered vs masked over %u of %u cells, NMSE = %.2e\n",
             n_verify, n_top_k + 3, n_prefill + n_verify, nmse_val);
+}
+
+// [TAG_GRAPH_RING] alternating ubatch shapes in one context (the speculative pattern: draft
+// steps of one token, verify batches of 2..4) must produce the same logits whether the context
+// keeps one previous graph or a ring of them - the ring re-plans a kept graph instead of
+// rebuilding it, and a wrong re-plan would corrupt the compute tensors.
+static void test_qwen4exp_graph_ring(
+        const bool moe, const size_t seed, const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode) {
+    const uint32_t n_prefill = 16;
+    const std::vector<uint32_t> steps = { 1, 3, 1, 2, 3, 1, 1, 4, 3, 2 };
+    uint32_t n_gen = 0;
+    for (auto st : steps) { n_gen += st; }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, moe, false);
+    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_gen, 128, seed + 3);
+
+    std::vector<float> logits_ring;
+    std::vector<float> logits_one;
+    {
+        env_scope env("LLAMA_GRAPH_RING", "4");
+        for (int mode = 0; mode < 2; ++mode) {
+            env.set(mode == 0 ? "4" : "1");
+            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
+            std::vector<float> & out = mode == 0 ? logits_ring : logits_one;
+            qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
+            uint32_t pos = n_prefill;
+            for (auto st : steps) {
+                qwen4exp_decode_range(mc.second.get(), tokens, pos, st, st, &out);
+                pos += st;
+            }
+        }
+    }
+
+    const double nmse_val = nmse(logits_one, logits_ring);
+    if (!(nmse_val < 1e-6)) {
+        throw std::runtime_error(string_format("qwen4exp graph ring: alternating ubatch shapes differ from single-slot reuse, NMSE = %.2e", nmse_val));
+    }
+    printf("qwen4exp graph ring: %zu alternating ubatch shapes, ring vs single slot, NMSE = %.2e\n", steps.size(), nmse_val);
 }
 
 // [TAG_HC_FUSED_OPS] the fused hyper-connection tails must reproduce the elementwise chain
@@ -595,13 +648,15 @@ static void test_qwen4exp_hc_fused(
 
     std::vector<float> logits_fused;
     std::vector<float> logits_plain;
-    for (int mode = 0; mode < 2; ++mode) {
-        setenv("QWEN4EXP_HC_FUSED", mode == 0 ? "1" : "0", 1);
-        auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
-        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
-        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_fused : &logits_plain);
+    {
+        env_scope env("QWEN4EXP_HC_FUSED", "1");
+        for (int mode = 0; mode < 2; ++mode) {
+            env.set(mode == 0 ? "1" : "0");
+            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
+            qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
+            qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_fused : &logits_plain);
+        }
     }
-    unsetenv("QWEN4EXP_HC_FUSED");
 
     const double nmse_val = nmse(logits_plain, logits_fused);
     if (!(nmse_val < 1e-6)) {
@@ -1035,6 +1090,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     std::vector<device_config> dev_configs;
     size_t max_device_label_length = 4;
     {
+        // [TAG_RPC_GRAPH_SLOTS] LLAMA_ARCH_TEST_RPC=host:port[,host:port] adds RPC devices to the
+        // sweep, so the graph reuse / re-plan paths are exercised across the wire as well
+        if (const char * rpc = getenv("LLAMA_ARCH_TEST_RPC")) {
+            ggml_backend_load_all();
+            ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+            if (rpc_reg == nullptr) {
+                throw std::runtime_error("LLAMA_ARCH_TEST_RPC set but the RPC backend is not available");
+            }
+            typedef ggml_backend_reg_t (*add_server_t)(const char * endpoint);
+            auto add_server = (add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+            GGML_ASSERT(add_server != nullptr);
+            for (const auto & server : string_split<std::string>(std::string(rpc), ',')) {
+                ggml_backend_register(add_server(server.c_str()));
+            }
+        }
+
         std::vector<ggml_backend_dev_t> devices_meta;
         {
             const size_t device_count = ggml_backend_dev_count();
@@ -1147,6 +1218,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                             test_qwen4exp_qsa_gather_vs_masked(moe, seed, dc.devs, dc.split_mode);
                             test_qwen4exp_shared_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
                             test_qwen4exp_hc_fused(moe, seed, dc.devs, dc.split_mode);
+                            test_qwen4exp_graph_ring(moe, seed, dc.devs, dc.split_mode);
                         }
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

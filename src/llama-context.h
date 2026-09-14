@@ -364,8 +364,20 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    llm_graph_result_ptr gf_res_prev;
+    // [TAG_GRAPH_RING] the previous graph results, most recently used first. Speculative decoding
+    // alternates ubatch shapes (draft steps of one token, catch-up and verify batches of 2..n)
+    // and a single previous graph forced a rebuild on every switch; the ring keeps one built graph
+    // per recent shape. gf_res_prev is the slot the scheduler currently holds allocated.
+    std::vector<llm_graph_result_ptr> gf_res_ring;
+    llm_graph_result * gf_res_prev = nullptr;
     llm_graph_result_ptr gf_res_reserve;
+
+    // release the compute allocations of a ring slot so the scheduler can plan it again
+    void graph_ring_release(llm_graph_result * res);
+    // mark every ring slot as not reusable (the scheduler was reset)
+    void graph_ring_reset();
+    // plan and allocate a ring graph so that its placement is reproducible
+    bool graph_ring_alloc(ggml_cgraph * gf);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -391,4 +403,5 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    mutable int32_t n_reused_ring = 0; // [TAG_GRAPH_RING] of which from a slot other than the scheduler's current one
 };
