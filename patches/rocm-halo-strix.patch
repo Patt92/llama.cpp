@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..359db19b4 100644
+index aae3bcd35..333c9100f 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,225 @@
+@@ -17,6 +17,228 @@
  
  </div>
  
@@ -27,6 +27,9 @@ index aae3bcd35..359db19b4 100644
 +- Loads Unsloth's *shared* MTP sidecar (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), which ships the NextN block without `token_embd` or `output`. The head borrows both from the target through `ctx_other`, so the sidecar is only usable as `--model-draft` of its target; loaded on its own it stops with a message instead of segfaulting, and the memory-fitting pass logs `requires ctx_other (this warning is normal during memory fitting)` and fits the target alone. The self-contained draft export is driven exactly as before (own KV cache, catch-up decode, sequential positions); the shared sidecar gets the same treatment, not the Gemma4-assistant shared-memory semantics that `ctx_other` used to imply. `test-llama-archs --arch qwen4exp` checks that the borrowed head reproduces the self-contained one (NMSE 0).
 +- Keys the captured HIP graph by the first node's shape and node count, not the first node alone. Speculative decoding alternates graphs of different token counts in one context (the draft decodes one token per step and catches up on the accepted tokens; the verify batch shrinks when the draft stops early), and every switch found the other shape in the slot, reset the warmup and captured again: 20% of graph computes were captures and HIP graphs cost 5-8% of decode on gfx1151 against running without them. With the shape in the key each variant keeps its own graph (replay 91%, capture 1.5%).
 +- Fuses the qwen4exp hyper-connection tails for decode: `ggml_hc_gate_mix` (sigmoid, gating, stream collapse and its 1/hc, 7 nodes -> 1) and `ggml_hc_combine` (the scatter's scale, sigmoid, scale, repeat, mul, add, 6 -> 1), CPU and HIP, checked against the elementwise chain by `test-llama-archs --arch qwen4exp` (NMSE 1e-14) and `test-backend-ops`. `QWEN4EXP_HC_FUSED=0` rebuilds the chain. The op enum grows by two, so the RPC protocol patch version is bumped and both ends of a split must run this build. Measured effect is small (about 1 ms per verify step): a rocprof trace of the live model shows the decode step is not launch-bound but spent in the weight reads - the 517 MB Q6_K output head three times per step (target verify plus two draft steps, 6.8 ms), the routed experts at the memory roofline (10 ms), the dense projections (10 ms) - plus the RPC worker's share.
++- Keeps a ring of the last four built graphs per context (`LLAMA_GRAPH_RING`, 1 = the previous single slot). Speculative decoding alternates ubatch shapes - one-token draft steps, catch-up and verify batches of 2..n, shorter verify batches whenever the draft stops early at a high `--spec-draft-p-min` - and a single previous graph rebuilt on every switch: ~30 ms per step on the RPC split, `graphs reused = 96 of 219` at p-min 0.75. A reused slot that the scheduler does not hold is planned again from scratch so it lands on the addresses it had (`LLAMA_GRAPH_RING_CHECK=1` reports any tensor that moved), which keeps the backends' captured graphs and the RPC server's stored graph valid. Checked by `test-llama-archs --arch qwen4exp` (ring vs single slot over ten alternating shapes, NMSE 0).
++- The RPC server stores the last four deserialized graphs per device, addressed by the hash of the serialized graph instead of the graph uid; the recompute request has a reply, and a graph the server no longer holds is sent whole. Protocol patch version 2 - both ends of a split must run this build.
++- Fixes a heap overflow in the CPU backend on Apple arm64: `CACHE_LINE_SIZE` was 256 in the C++ kernels (`std::hardware_destructive_interference_size`) and 64 in the C planner, so every op with a cache-line-padded per-thread scratch wrote past the work buffer whenever it was the op that sized it. Found with guard malloc in the rope cos/sin cache; sporadic malloc aborts in `test-llama-archs` since 2026-09-06.
 +- `LLAMA_OP_PROFILE=1` times every node of the decode and verify graphs (ubatches up to 8 tokens, `=<n>` raises the ceiling) through the scheduler's eval callback, which synchronizes after each node, and prints a table per backend/op and per node name with the layer numbers folded every 32 graphs (`LLAMA_OP_PROFILE_EVERY`), separately for the target and the MTP draft context. The per-node sync (about 10 us on HIP, a round trip on RPC) is part of every number, so read it as a ranking of where a token's time goes, not as kernel time.
 +- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
 +- Gathers the QSA-selected keys and values into a compact buffer for decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213), which limited it to one token per stream; its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Extended here to ubatches of up to 8 tokens per stream, because speculative verification hands the target `n-max + 1` tokens per pass and the one-token gate sent every such pass down the masked path -- with `--spec-draft-n-max 2` the gather never engaged at all, which is why Qwen3.8-Flash-Next decoded at 28.7 t/s at 123 tokens but 15.7 t/s at 80k on the same build, with draft acceptance unchanged. Each token carries its own top-k list and becomes one entry of the attention batch; `test-llama-archs --arch qwen4exp` checks an 8-token verify batch against eight single-token gathers, and gathered against masked attention with equal selection widths on a cache deeper than the width. Engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it, `=2` forces it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
@@ -358,7 +361,7 @@ index 168796d61..5de299346 100644
          self.gguf_writer.add_ple_layers(ple_layers)
          self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index cbfe40013..2c2624bfa 100644
+index cbfe40013..c1c2cc76e 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -8,10 +8,10 @@ extern "C" {
@@ -366,7 +369,7 @@ index cbfe40013..2c2624bfa 100644
  #define RPC_PROTO_MAJOR_VERSION    6
  #define RPC_PROTO_MINOR_VERSION    0
 -#define RPC_PROTO_PATCH_VERSION    0
-+#define RPC_PROTO_PATCH_VERSION    1
++#define RPC_PROTO_PATCH_VERSION    2
  
  #ifdef  __cplusplus
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -638,10 +641,35 @@ index 266261c5e..1f3dbca84 100644
  
  static void ggml_compute_forward_rwkv_wkv7_f32(
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index ce2b3e870..8b55b60b4 100644
+index ce2b3e870..ad5c6db77 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
-@@ -117,6 +117,8 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
+@@ -6,17 +6,20 @@
+ // cache line
+ //
+ 
+-#if defined(__cpp_lib_hardware_interference_size)
+-#define CACHE_LINE_SIZE std::hardware_destructive_interference_size
+-#else
++// [TAG_CACHE_LINE_C_CXX] the same value for the C planner (ggml-cpu.c) and the C++ kernels
++// (ops.cpp): the planner sizes the work buffer with CACHE_LINE_SIZE-padded per-thread strides
++// and the kernels index it with the same expression, so the two translation units must agree.
++// With std::hardware_destructive_interference_size on the C++ side only (256 on Apple arm64
++// libc++) the kernels ran CACHE_LINE_SIZE*(n_threads-1) bytes past the buffer the planner sized.
+ #if defined(__POWER9_VECTOR__)
+ #define CACHE_LINE_SIZE 128
+ #elif defined(__VXE__) || defined(__VXE2__)
+ #define CACHE_LINE_SIZE 256
++#elif defined(__APPLE__) && defined(__aarch64__)
++#define CACHE_LINE_SIZE 128
+ #else
+ #define CACHE_LINE_SIZE 64
+ #endif
+-#endif
+ 
+ // -Winterference-size was introduced in GCC 12
+ #if defined(__cplusplus) && defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 12
+@@ -117,6 +120,8 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
  void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -3245,10 +3273,65 @@ index 2fc0fe9fd..f22674336 100644
  #define cudaStream_t hipStream_t
  #define cudaSuccess hipSuccess
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index cc7d72069..9f94e719a 100644
+index cc7d72069..a7c2ac774 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -700,7 +700,14 @@ static void ggml_backend_rpc_buffer_memset_tensor(
+@@ -200,8 +200,14 @@ struct rpc_msg_get_device_memory_rsp {
+     uint64_t total_mem;
+ };
+ 
++// [TAG_RPC_GRAPH_SLOTS] a stored graph is addressed by the hash of its serialized form
+ struct rpc_msg_graph_recompute_req {
+     uint32_t device;
++    uint64_t hash;
++};
++
++struct rpc_msg_graph_recompute_rsp {
++    uint8_t result; // 1: the server had the graph and ran it; 0: send the full graph
+ };
+ 
+ #pragma pack(pop)
+@@ -213,14 +219,38 @@ static ggml_guid_t ggml_backend_rpc_guid() {
+     return &guid;
+ }
+ 
++// [TAG_RPC_GRAPH_SLOTS] the server keeps the last few deserialized graphs per device, addressed by
++// the hash of the serialized graph (ops, shapes, data pointers, params - everything the server
++// would rebuild). Speculative decoding alternates a few ubatch shapes; with one slot, keyed by
++// the graph uid that changes on every re-plan, every switch re-sent the whole graph. The client
++// keeps the hashes it believes the server holds; a RECOMPUTE the server cannot serve is answered
++// with 0 and the client sends the full graph, so a stale or evicted entry costs one round trip,
++// never a wrong result.
++static constexpr size_t RPC_GRAPH_SLOTS = 4;
++
+ struct ggml_backend_rpc_device_context {
+     std::string endpoint;
+     uint32_t    device;
+     std::string name;
+     std::string description;
+-    uint64_t    last_graph_uid;
++    std::vector<uint64_t> graph_hashes; // most recently used first, at most RPC_GRAPH_SLOTS
+ };
+ 
++// move hash to the front of the list, evicting the least recently used beyond the slot count;
++// returns true if it was already present
++static bool rpc_graph_hashes_touch(std::vector<uint64_t> & hashes, uint64_t hash) {
++    auto it = std::find(hashes.begin(), hashes.end(), hash);
++    const bool present = it != hashes.end();
++    if (present) {
++        hashes.erase(it);
++    }
++    hashes.insert(hashes.begin(), hash);
++    if (hashes.size() > RPC_GRAPH_SLOTS) {
++        hashes.resize(RPC_GRAPH_SLOTS);
++    }
++    return present;
++}
++
+ struct ggml_backend_rpc_buffer_type_context {
+     std::string endpoint;
+     uint32_t    device;
+@@ -700,7 +730,14 @@ static void ggml_backend_rpc_buffer_memset_tensor(
  static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
      rpc_tensor rpc_tensor = serialize_tensor(tensor);
@@ -3264,7 +3347,75 @@ index cc7d72069..9f94e719a 100644
          auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
          request->tensor = rpc_tensor;
          request->offset = offset;
-@@ -1169,6 +1176,11 @@ private:
+@@ -984,6 +1021,12 @@ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const s
+     tensors.push_back(result);
+ }
+ 
++// [TAG_RPC_GRAPH_SLOTS] identity of a serialized graph: everything after the device field
++static uint64_t rpc_graph_hash(const uint8_t * payload, size_t size) {
++    GGML_ASSERT(size >= sizeof(uint32_t));
++    return fnv_hash(payload + sizeof(uint32_t), size - sizeof(uint32_t));
++}
++
+ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, const std::shared_ptr<rpc_dispatcher> & dispatcher, size_t * output_size) {
+     uint32_t n_nodes = cgraph->n_nodes;
+     std::vector<rpc_tensor> tensors;
+@@ -1018,18 +1061,26 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
+ 
+     GGML_ASSERT(cgraph->n_nodes > 0);
+-    bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
+-    if (reuse) {
++
++    // serializing is a memcpy of a few hundred KB; what the stored graph saves is the transfer
++    // and the server-side rebuild of every tensor
++    size_t input_size = 0;
++    uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
++    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
++    const uint64_t hash = rpc_graph_hash(input, input_size);
++
++    if (rpc_graph_hashes_touch(rpc_dev_ctx->graph_hashes, hash)) {
+         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
+         request->device = rpc_ctx->device;
+-        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+-    } else {
+-        rpc_dev_ctx->last_graph_uid = cgraph->uid;
+-        size_t input_size = 0;
+-        uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
+-        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+-        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
++        request->hash   = hash;
++        rpc_msg_graph_recompute_rsp response = { 0 };
++        rpc_ctx->dispatcher->send(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request), &response, sizeof(response));
++        if (response.result) {
++            return GGML_STATUS_SUCCESS;
++        }
++        // evicted or never stored: fall through and send it whole
+     }
++    rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -1148,14 +1199,16 @@ public:
+     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+     bool graph_compute(const std::vector<uint8_t> & input);
+-    bool graph_recompute(const rpc_msg_graph_recompute_req & request);
++    bool graph_recompute(const rpc_msg_graph_recompute_req & request, rpc_msg_graph_recompute_rsp & response);
+     bool init_tensor(const rpc_msg_init_tensor_req & request);
+     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+ 
+     struct stored_graph {
++        uint64_t               hash = 0;
+         std::vector<uint8_t>   buffer;
+-        ggml_cgraph          * graph;
++        ggml_context_ptr       ctx;
++        ggml_cgraph          * graph = nullptr;
+     };
+ 
+ private:
+@@ -1169,9 +1222,15 @@ private:
  
      std::vector<ggml_backend_t> backends;
      const char * cache_dir;
@@ -3274,9 +3425,15 @@ index cc7d72069..9f94e719a 100644
 +    uint64_t pending_cache_hash = 0;
 +    bool     pending_cache      = false;
      std::unordered_set<ggml_backend_buffer_t> buffers;
-     // store the last computed graph for each backend
-     std::vector<stored_graph> stored_graphs;
-@@ -1435,15 +1447,41 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+-    // store the last computed graph for each backend
+-    std::vector<stored_graph> stored_graphs;
++    // [TAG_RPC_GRAPH_SLOTS] the last RPC_GRAPH_SLOTS computed graphs for each backend, most
++    // recently used first, addressed by the hash of their serialized form
++    std::vector<std::vector<stored_graph>> stored_graphs;
+ };
+ 
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+@@ -1435,15 +1494,41 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
      }
  
      const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
@@ -3322,7 +3479,7 @@ index cc7d72069..9f94e719a 100644
      }
      ggml_backend_tensor_set(tensor, data, offset, size);
      return true;
-@@ -1473,6 +1511,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+@@ -1473,6 +1558,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
  {
      std::vector<uint8_t> cached_file;
      if (!get_cached_file(request.hash, cached_file)) {
@@ -3331,7 +3488,7 @@ index cc7d72069..9f94e719a 100644
          response.result = 0;
          return true;
      }
-@@ -1490,6 +1530,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+@@ -1490,6 +1577,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
          GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
          return false;
      }
@@ -3349,6 +3506,124 @@ index cc7d72069..9f94e719a 100644
      LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
              __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
  
+@@ -1708,18 +1806,45 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     const rpc_tensor * tensors = (const rpc_tensor *)src;
+     LOG_DBG("[%s] device: %u, n_nodes: %u, n_tensors: %u\n", __func__, device, n_nodes, n_tensors);
+ 
++    // [TAG_RPC_GRAPH_SLOTS] store it under its hash: reuse the slot of the same hash if it is
++    // still here, else the least recently used one; the slot moves to the front
++    const uint64_t hash = rpc_graph_hash(input.data(), input.size());
++    auto & slots = stored_graphs[device];
++    {
++        size_t i_slot = slots.size();
++        for (size_t i = 0; i < slots.size(); ++i) {
++            if (slots[i].hash == hash) {
++                i_slot = i;
++                break;
++            }
++        }
++        if (i_slot == slots.size()) {
++            if (slots.size() < RPC_GRAPH_SLOTS) {
++                slots.emplace_back();
++            }
++            i_slot = slots.size() - 1;
++        }
++        if (i_slot != 0) {
++            std::rotate(slots.begin(), slots.begin() + i_slot, slots.begin() + i_slot + 1);
++        }
++    }
++    stored_graph & sg = slots.front();
++    sg.hash  = hash;
++    sg.graph = nullptr;
++    sg.ctx.reset();
++
+     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
+-    if (stored_graphs[device].buffer.size() < buf_size) {
+-        stored_graphs[device].buffer.resize(buf_size);
++    if (sg.buffer.size() < buf_size) {
++        sg.buffer.resize(buf_size);
+     }
+     struct ggml_init_params params = {
+         /*.mem_size   =*/ buf_size,
+-        /*.mem_buffer =*/ stored_graphs[device].buffer.data(),
++        /*.mem_buffer =*/ sg.buffer.data(),
+         /*.no_alloc   =*/ true,
+     };
+-    ggml_context_ptr ctx_ptr { ggml_init(params) };
+-    GGML_ASSERT(ctx_ptr != nullptr);
+-    ggml_context * ctx = ctx_ptr.get();
++    sg.ctx.reset(ggml_init(params));
++    GGML_ASSERT(sg.ctx != nullptr);
++    ggml_context * ctx = sg.ctx.get();
+     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
+     graph->n_nodes = n_nodes;
+     std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
+@@ -1748,22 +1873,37 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     }
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+-    stored_graphs[device].graph = graph;
++    sg.graph = graph;
+     return true;
+ }
+ 
+-bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
++bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request, rpc_msg_graph_recompute_rsp & response) {
+     uint32_t device = request.device;
++    response.result = 0;
+     if (device >= backends.size()) {
+         return false;
+     }
+-    if (stored_graphs[device].graph == nullptr) {
+-        return false;
++    auto & slots = stored_graphs[device];
++    size_t i_slot = slots.size();
++    for (size_t i = 0; i < slots.size(); ++i) {
++        if (slots[i].hash == request.hash && slots[i].graph != nullptr) {
++            i_slot = i;
++            break;
++        }
++    }
++    if (i_slot == slots.size()) {
++        // not here (evicted, or a restart): the client sends the full graph
++        LOG_DBG("[%s] device: %u, hash %016" PRIx64 " not stored\n", __func__, device, request.hash);
++        return true;
++    }
++    if (i_slot != 0) {
++        std::rotate(slots.begin(), slots.begin() + i_slot, slots.begin() + i_slot + 1);
+     }
+-    ggml_cgraph * graph = stored_graphs[device].graph;
+-    LOG_DBG("[%s] device: %u\n", __func__, device);
++    ggml_cgraph * graph = slots.front().graph;
++    LOG_DBG("[%s] device: %u, hash %016" PRIx64 "\n", __func__, device, request.hash);
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    response.result = 1;
+     return true;
+ }
+ 
+@@ -2028,7 +2168,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+                     return;
+                 }
+-                if (!server.graph_recompute(request)) {
++                rpc_msg_graph_recompute_rsp response;
++                if (!server.graph_recompute(request, response)) {
++                    return;
++                }
++                if (!send_msg(sock, &response, sizeof(response))) {
+                     return;
+                 }
+                 break;
+@@ -2327,7 +2471,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
+             /* .device      = */    ind,
+             /* .name        = */    dev_name,
+             /* .description = */    dev_desc,
+-            /* .last_graph_uid = */ 0,
++            /* .graph_hashes   = */ {},
+         };
+ 
+         ggml_backend_dev_t dev = new ggml_backend_device {
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 5ef03e190..965a2d618 100644
 --- a/ggml/src/ggml.c
@@ -3669,7 +3944,7 @@ index f1d173a57..ea962fd7c 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6334f3cca..788f519c2 100644
+index 6334f3cca..d163b6444 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -13,10 +13,15 @@
@@ -3988,7 +4263,196 @@ index 6334f3cca..788f519c2 100644
          if (model.tok_embd == nullptr || model.output == nullptr) {
              if (params.ctx_other == nullptr) {
                  throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-@@ -1826,8 +2108,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -482,6 +764,11 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++    // [TAG_GRAPH_RING]
++    if (n_reused_ring > 0) {
++        LLAMA_LOG_INFO("%s: graphs reused = %d, of which re-planned from another ring slot = %d\n", __func__, n_reused, n_reused_ring);
++    }
++
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+@@ -599,7 +886,19 @@ void llama_context::sched_reserve() {
+ 
+     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+ 
+-    gf_res_prev.reset(new llm_graph_result(max_nodes));
++    {
++        // [TAG_GRAPH_RING] LLAMA_GRAPH_RING=<n> slots (default 4, 1 = one previous graph as before)
++        int n_ring = 4;
++        if (const char * e = getenv("LLAMA_GRAPH_RING")) {
++            n_ring = std::max(1, atoi(e));
++        }
++        gf_res_ring.clear();
++        for (int i = 0; i < n_ring; ++i) {
++            gf_res_ring.emplace_back(new llm_graph_result(max_nodes));
++        }
++        gf_res_prev = gf_res_ring[0].get();
++        LLAMA_LOG_INFO("%s: graph ring            = %d\n", __func__, n_ring);
++    }
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+ 
+     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+@@ -819,7 +1118,7 @@ bool llama_context::memory_update(bool optimize) {
+         // reset the previous graph result to make sure that it won't be reused
+         // TODO: change the mctx->apply() to return information if a graph reserve is needed
+         //       reset the graph result only if the memory module did reset the scheduler
+-        gf_res_prev->reset();
++        graph_ring_reset();
+ 
+         if (!mctx->apply()) {
+             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+@@ -1333,6 +1632,42 @@ bool llama_context::set_adapter_cvec(
+     return res;
+ }
+ 
++// [TAG_GRAPH_RING]
++void llama_context::graph_ring_release(llm_graph_result * res) {
++    ggml_context * ctx = res->get_ctx();
++    if (ctx == nullptr) {
++        return;
++    }
++    // every tensor of the compute context was placed by the scheduler's allocator: drop the
++    // placement so the next ggml_backend_sched_alloc_graph plans it again. Views recover their
++    // data from view_src in ggml_backend_view_init.
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++        t->data   = nullptr;
++        t->buffer = nullptr;
++    }
++}
++
++void llama_context::graph_ring_reset() {
++    for (auto & r : gf_res_ring) {
++        r->reset();
++    }
++}
++
++bool llama_context::graph_ring_alloc(ggml_cgraph * gf) {
++    // with several slots a graph must land on the same addresses every time it is planned, so
++    // that the backends' captured graphs and the RPC server's stored graph stay valid across
++    // switches. The allocator's plan-reuse shortcut gives a graph the placement of whatever it
++    // planned before when the tensors happen to fit, so plan from scratch (reserve) first and
++    // let the allocation pick that plan up. A single slot keeps the plain path.
++    if (gf_res_ring.size() > 1 && getenv("LLAMA_GRAPH_RING_NORESERVE") == nullptr) {
++        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
++            return false;
++        }
++        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++    }
++    return ggml_backend_sched_alloc_graph(sched.get(), gf);
++}
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -1340,8 +1675,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
+-    auto * res = gf_res_prev.get();
+-    auto * gf  = res->get_gf();
++    // [TAG_GRAPH_RING] look for a previous graph with this topology: the slot the scheduler
++    // holds first, then the other slots, most recently used first
++    llm_graph_result * res = nullptr;
++    size_t i_res = 0;
++    {
++        const auto gparams_probe = graph_params(gf_res_prev, ubatch, mctx, gtype);
++        if (!graph_reuse_disable) {
++            for (size_t i = 0; i < gf_res_ring.size(); ++i) {
++                auto * cand = gf_res_ring[i].get();
++                if (cand->can_reuse(gparams_probe)) {
++                    res   = cand;
++                    i_res = i;
++                    break;
++                }
++            }
++        }
++        if (res == nullptr) {
++            // build into the least recently used slot
++            i_res = gf_res_ring.size() - 1;
++            res   = gf_res_ring[i_res].get();
++        }
++    }
++    auto * gf = res->get_gf();
+ 
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+@@ -1357,6 +1713,48 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             ggml_backend_sched_synchronize(sched.get());
+         }
+ 
++        if (res != gf_res_prev) {
++            // the scheduler holds another slot's allocation: plan this graph again. Its compute
++            // tensors are released first so the planner lays them out exactly as it did the first
++            // time (same graph, same buffers -> same offsets), which keeps the backends' captured
++            // graphs and the RPC server's stored graph valid for this uid.
++            ggml_backend_sched_synchronize(sched.get());
++
++            // LLAMA_GRAPH_RING_CHECK=1 verifies that the re-plan reproduces the previous placement
++            static const bool ring_check = getenv("LLAMA_GRAPH_RING_CHECK") != nullptr;
++            std::vector<std::pair<ggml_tensor *, void *>> before;
++            if (ring_check) {
++                for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t != nullptr; t = ggml_get_next_tensor(res->get_ctx(), t)) {
++                    before.emplace_back(t, t->data);
++                }
++            }
++
++            graph_ring_release(res);
++
++            ggml_backend_sched_reset(sched.get());
++            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++
++            if (!graph_ring_alloc(gf)) {
++                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
++                ret = GGML_STATUS_ALLOC_FAILED;
++                return nullptr;
++            }
++            n_reused_ring++;
++
++            if (ring_check) {
++                int n_diff = 0;
++                for (const auto & [t, d] : before) {
++                    if (t->data != d) {
++                        if (n_diff < 8) {
++                            LLAMA_LOG_WARN("%s: [TAG_GRAPH_RING] '%s' op=%s moved %p -> %p\n", __func__, ggml_get_name(t), ggml_op_desc(t), d, t->data);
++                        }
++                        n_diff++;
++                    }
++                }
++                LLAMA_LOG_WARN("%s: [TAG_GRAPH_RING] re-plan: %d of %zu tensors moved\n", __func__, n_diff, before.size());
++            }
++        }
++
+         n_reused++;
+     } else {
+         res->reset();
+@@ -1376,13 +1774,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
+-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
++        if (!graph_ring_alloc(gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
+     }
+ 
++    // move the slot to the front: most recently used, and the one the scheduler holds
++    if (i_res != 0) {
++        auto tmp = std::move(gf_res_ring[i_res]);
++        gf_res_ring.erase(gf_res_ring.begin() + i_res);
++        gf_res_ring.insert(gf_res_ring.begin(), std::move(tmp));
++    }
++    gf_res_prev = res;
++
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+@@ -1826,8 +2232,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          ggml_status status;
  
@@ -4019,7 +4483,7 @@ index 6334f3cca..788f519c2 100644
          if (!res) {
              // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
              llama_pos pos_min[LLAMA_MAX_SEQ];
-@@ -1985,6 +2289,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1985,6 +2413,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
      // set to total number of outputs in the batch, for use in llama_get_logits_ith
      n_outputs = n_outputs_all;
  
@@ -4071,6 +4535,65 @@ index 6334f3cca..788f519c2 100644
      // set output mappings
      if (n_outputs > 0) {
          bool sorted_output = true;
+@@ -2428,7 +2901,7 @@ ggml_cgraph * llama_context::graph_reserve(
+     ggml_backend_sched_reset(sched.get());
+ 
+     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
+-    gf_res_prev->reset();
++    graph_ring_reset();
+ 
+     // store the n_outputs as it is, and restore it afterwards
+     // TODO: not sure if needed, might simplify in the future by removing this
+@@ -3356,6 +3829,7 @@ void llama_context::perf_reset() {
+     t_eval_us   = n_eval = 0;
+     t_p_eval_us = n_p_eval = 0;
+     n_reused    = 0;
++    n_reused_ring = 0;
+ }
+ 
+ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -3518,7 +3992,7 @@ void llama_context::opt_epoch_iter(
+                 break;
+             }
+ 
+-            auto * res = gf_res_prev.get();
++            auto * res = gf_res_prev;
+ 
+             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..637bba020 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -364,9 +364,21 @@ private:
+     std::vector<ggml_backend_buffer_type_t> backend_buft;
+     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+ 
+-    llm_graph_result_ptr gf_res_prev;
++    // [TAG_GRAPH_RING] the previous graph results, most recently used first. Speculative decoding
++    // alternates ubatch shapes (draft steps of one token, catch-up and verify batches of 2..n)
++    // and a single previous graph forced a rebuild on every switch; the ring keeps one built graph
++    // per recent shape. gf_res_prev is the slot the scheduler currently holds allocated.
++    std::vector<llm_graph_result_ptr> gf_res_ring;
++    llm_graph_result * gf_res_prev = nullptr;
+     llm_graph_result_ptr gf_res_reserve;
+ 
++    // release the compute allocations of a ring slot so the scheduler can plan it again
++    void graph_ring_release(llm_graph_result * res);
++    // mark every ring slot as not reusable (the scheduler was reset)
++    void graph_ring_reset();
++    // plan and allocate a ring graph so that its placement is reproducible
++    bool graph_ring_alloc(ggml_cgraph * gf);
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+@@ -391,4 +403,5 @@ private:
+     mutable int32_t n_eval   = 0; // number of eval calls
+ 
+     mutable int32_t n_reused = 0; // number of times the previous graph was reused
++    mutable int32_t n_reused_ring = 0; // [TAG_GRAPH_RING] of which from a slot other than the scheduler's current one
+ };
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 5855393ef..0428d3556 100644
 --- a/src/llama-graph.cpp
@@ -7698,7 +8221,7 @@ index d02297cf5..a99a8613b 100644
          for (int hs : { 64, 128, 256, 576, }) {
              const int  hsv    = hs == 576 ? 512 : hs;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 018ff1f42..0bca7cf23 100644
+index 018ff1f42..d225ee8b0 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -10,9 +10,13 @@
@@ -7837,7 +8360,7 @@ index 018ff1f42..0bca7cf23 100644
      if (!encode) {
          ctx_params.n_ubatch = 64;
      }
-@@ -421,6 +450,336 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -421,6 +450,391 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
      return std::make_pair(std::move(model), std::move(lctx));
  }
  
@@ -7882,6 +8405,20 @@ index 018ff1f42..0bca7cf23 100644
 +}
 +
 +// decode tokens[pos0, pos0+n) in batches of `step`, collecting logits of every token when `out` is set
++// set an environment variable for the duration of a test and restore what was there before,
++// so the reference logits computed earlier and the roundtrip computed later see the same graph
++struct env_scope {
++    std::string name;
++    std::string old;
++    bool had = false;
++    env_scope(const char * n, const char * v) : name(n) {
++        if (const char * e = getenv(n)) { had = true; old = e; }
++        setenv(n, v, 1);
++    }
++    void set(const char * v) { setenv(name.c_str(), v, 1); }
++    ~env_scope() { if (had) { setenv(name.c_str(), old.c_str(), 1); } else { unsetenv(name.c_str()); } }
++};
++
 +static void qwen4exp_decode_range(llama_context * lctx, const std::vector<llama_token> & tokens,
 +        uint32_t pos0, uint32_t n, uint32_t step, std::vector<float> * out) {
 +    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
@@ -7917,7 +8454,7 @@ index 018ff1f42..0bca7cf23 100644
 +    const uint32_t n_verify  = 8;
 +    GGML_ASSERT(tokens.size() >= n_prefill + n_verify);
 +
-+    setenv("QWEN4EXP_QSA_GATHER", "2", 1);
++    env_scope env("QWEN4EXP_QSA_GATHER", "2");
 +
 +    std::vector<float> logits_batched;
 +    std::vector<float> logits_single;
@@ -7932,7 +8469,6 @@ index 018ff1f42..0bca7cf23 100644
 +        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, 1, &logits_single);
 +    }
 +
-+    unsetenv("QWEN4EXP_QSA_GATHER");
 +
 +    const double nmse_val = nmse(logits_single, logits_batched);
 +    if (!(nmse_val < 1e-4)) {
@@ -7959,13 +8495,15 @@ index 018ff1f42..0bca7cf23 100644
 +
 +    std::vector<float> logits_gather;
 +    std::vector<float> logits_masked;
-+    for (int mode = 0; mode < 2; ++mode) {
-+        setenv("QWEN4EXP_QSA_GATHER", mode == 0 ? "2" : "0", 1);
-+        auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
-+        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
-+        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_gather : &logits_masked);
++    {
++        env_scope env("QWEN4EXP_QSA_GATHER", "2");
++        for (int mode = 0; mode < 2; ++mode) {
++            env.set(mode == 0 ? "2" : "0");
++            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
++            qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
++            qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_gather : &logits_masked);
++        }
 +    }
-+    unsetenv("QWEN4EXP_QSA_GATHER");
 +
 +    const double nmse_val = nmse(logits_masked, logits_gather);
 +    if (!(nmse_val < 1e-4)) {
@@ -7973,6 +8511,44 @@ index 018ff1f42..0bca7cf23 100644
 +    }
 +    printf("qwen4exp QSA gather: %u-token verify batch, gathered vs masked over %u of %u cells, NMSE = %.2e\n",
 +            n_verify, n_top_k + 3, n_prefill + n_verify, nmse_val);
++}
++
++// [TAG_GRAPH_RING] alternating ubatch shapes in one context (the speculative pattern: draft
++// steps of one token, verify batches of 2..4) must produce the same logits whether the context
++// keeps one previous graph or a ring of them - the ring re-plans a kept graph instead of
++// rebuilding it, and a wrong re-plan would corrupt the compute tensors.
++static void test_qwen4exp_graph_ring(
++        const bool moe, const size_t seed, const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode) {
++    const uint32_t n_prefill = 16;
++    const std::vector<uint32_t> steps = { 1, 3, 1, 2, 3, 1, 1, 4, 3, 2 };
++    uint32_t n_gen = 0;
++    for (auto st : steps) { n_gen += st; }
++
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, moe, false);
++    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_gen, 128, seed + 3);
++
++    std::vector<float> logits_ring;
++    std::vector<float> logits_one;
++    {
++        env_scope env("LLAMA_GRAPH_RING", "4");
++        for (int mode = 0; mode < 2; ++mode) {
++            env.set(mode == 0 ? "4" : "1");
++            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
++            std::vector<float> & out = mode == 0 ? logits_ring : logits_one;
++            qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
++            uint32_t pos = n_prefill;
++            for (auto st : steps) {
++                qwen4exp_decode_range(mc.second.get(), tokens, pos, st, st, &out);
++                pos += st;
++            }
++        }
++    }
++
++    const double nmse_val = nmse(logits_one, logits_ring);
++    if (!(nmse_val < 1e-6)) {
++        throw std::runtime_error(string_format("qwen4exp graph ring: alternating ubatch shapes differ from single-slot reuse, NMSE = %.2e", nmse_val));
++    }
++    printf("qwen4exp graph ring: %zu alternating ubatch shapes, ring vs single slot, NMSE = %.2e\n", steps.size(), nmse_val);
 +}
 +
 +// [TAG_HC_FUSED_OPS] the fused hyper-connection tails must reproduce the elementwise chain
@@ -7986,13 +8562,15 @@ index 018ff1f42..0bca7cf23 100644
 +
 +    std::vector<float> logits_fused;
 +    std::vector<float> logits_plain;
-+    for (int mode = 0; mode < 2; ++mode) {
-+        setenv("QWEN4EXP_HC_FUSED", mode == 0 ? "1" : "0", 1);
-+        auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
-+        qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
-+        qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_fused : &logits_plain);
++    {
++        env_scope env("QWEN4EXP_HC_FUSED", "1");
++        for (int mode = 0; mode < 2; ++mode) {
++            env.set(mode == 0 ? "1" : "0");
++            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
++            qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
++            qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_fused : &logits_plain);
++        }
 +    }
-+    unsetenv("QWEN4EXP_HC_FUSED");
 +
 +    const double nmse_val = nmse(logits_plain, logits_fused);
 +    if (!(nmse_val < 1e-6)) {
@@ -8174,7 +8752,7 @@ index 018ff1f42..0bca7cf23 100644
  static std::vector<float> get_logits(
          llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
      const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
-@@ -477,6 +836,7 @@ static bool moe_mandatory(const llm_arch arch) {
+@@ -477,6 +891,7 @@ static bool moe_mandatory(const llm_arch arch) {
          case LLM_ARCH_DEEPSEEK4:
          case LLM_ARCH_GLM4_MOE:
          case LLM_ARCH_GLM_DSA:
@@ -8182,7 +8760,30 @@ index 018ff1f42..0bca7cf23 100644
          case LLM_ARCH_EXAONE_MOE:
          case LLM_ARCH_BAILINGMOE:
          case LLM_ARCH_BAILINGMOE2:
-@@ -760,10 +1120,34 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -675,6 +1090,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+     std::vector<device_config> dev_configs;
+     size_t max_device_label_length = 4;
+     {
++        // [TAG_RPC_GRAPH_SLOTS] LLAMA_ARCH_TEST_RPC=host:port[,host:port] adds RPC devices to the
++        // sweep, so the graph reuse / re-plan paths are exercised across the wire as well
++        if (const char * rpc = getenv("LLAMA_ARCH_TEST_RPC")) {
++            ggml_backend_load_all();
++            ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
++            if (rpc_reg == nullptr) {
++                throw std::runtime_error("LLAMA_ARCH_TEST_RPC set but the RPC backend is not available");
++            }
++            typedef ggml_backend_reg_t (*add_server_t)(const char * endpoint);
++            auto add_server = (add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
++            GGML_ASSERT(add_server != nullptr);
++            for (const auto & server : string_split<std::string>(std::string(rpc), ',')) {
++                ggml_backend_register(add_server(server.c_str()));
++            }
++        }
++
+         std::vector<ggml_backend_dev_t> devices_meta;
+         {
+             const size_t device_count = ggml_backend_dev_count();
+@@ -760,10 +1191,35 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                      if (logits_cpu.empty()) {
                          model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                          logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
@@ -8213,6 +8814,7 @@ index 018ff1f42..0bca7cf23 100644
 +                            test_qwen4exp_qsa_gather_vs_masked(moe, seed, dc.devs, dc.split_mode);
 +                            test_qwen4exp_shared_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
 +                            test_qwen4exp_hc_fused(moe, seed, dc.devs, dc.split_mode);
++                            test_qwen4exp_graph_ring(moe, seed, dc.devs, dc.split_mode);
 +                        }
                          const double nmse_val = nmse(logits_cpu, logits_dev);
                          snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
