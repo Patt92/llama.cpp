@@ -783,9 +783,24 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// [TAG_SCHED_SRC_RESTORE] a source the split rewrote to point at one of the scheduler's input
+// copies; remembered so the original can be put back before the copies are destroyed
+struct ggml_backend_sched_src_restore {
+    struct ggml_tensor * node;
+    int                  j;
+    struct ggml_tensor * src;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+
+    // [TAG_SCHED_SRC_RESTORE] splitting a graph rewrites node sources that cross backends to the
+    // scheduler's input copies, which live in sched->ctx and die with the next split or reset. A
+    // caller that keeps a built graph and hands it to the scheduler again (llama_context's graph
+    // ring) would otherwise re-split a graph whose sources point at freed copies. The rewrites
+    // are recorded here and undone before the copies go away.
+    std::vector<ggml_backend_sched_src_restore> src_restore;
 
     int n_backends;
 
@@ -1063,7 +1078,18 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// [TAG_SCHED_SRC_RESTORE] put the original sources back into the graph the scheduler last split
+static void ggml_backend_sched_src_restore_apply(ggml_backend_sched_t sched) {
+    for (const auto & r : sched->src_restore) {
+        r.node->src[r.j] = r.src;
+    }
+    sched->src_restore.clear();
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // the copies of the previous split die with sched->ctx below
+    ggml_backend_sched_src_restore_apply(sched);
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1416,6 +1442,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
                     }
+                    sched->src_restore.push_back({ node, j, src });
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
@@ -1854,6 +1881,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    new (&sched->src_restore) std::vector<ggml_backend_sched_src_restore>();
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -1940,6 +1968,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    sched->src_restore.~vector();
     free(sched);
 }
 
@@ -1947,6 +1976,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
     if (!sched->is_reset) {
+        ggml_backend_sched_src_restore_apply(sched);
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
@@ -2010,13 +2040,22 @@ bool ggml_backend_sched_alloc_graph_fresh(ggml_backend_sched_t sched, struct ggm
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
-    sched->cur_copy = sched->next_copy;
-    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+    // [TAG_SCHED_ALLOC_FRESH] the previous graph may still be running and its split inputs may
+    // move: synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+
+    // everything has completed, so the input copies of slot 0 are free: always use them, which
+    // keeps the placement of the graph inputs the same on every plan (with pipeline parallelism
+    // the copy slot would otherwise alternate and move the inputs with it)
+    sched->cur_copy  = 0;
+    sched->next_copy = sched->n_copies > 1 ? 1 : 0;
 
     ggml_backend_sched_split_graph(sched, graph);
 
-    // [TAG_SCHED_ALLOC_FRESH] plan from scratch; the allocation below finds the plan matching
-    // and only assigns the addresses. one split, so the graph's sources point at live copies.
+    // plan from scratch; the allocation below finds the plan matching and only assigns the
+    // addresses. one split, so the graph's sources point at live copies.
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }

@@ -1778,6 +1778,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    static const bool ring_log = getenv("LLAMA_GRAPH_RING_LOG") != nullptr;
+    if (ring_log) {
+        fprintf(stderr, "%s: [TAG_GRAPH_RING] ctx=%p n_tokens=%u gtype=%d slot=%zu %s\n", __func__, (void *) this, ubatch.n_tokens, (int) gtype, i_res,
+                res == gf_res_prev ? "reused-held" : (n_reused > 0 && res->get_gf() == gf && gf_res_ring[i_res]->can_reuse(gparams) ? "reused-replanned" : "built"));
+    }
+
     // move the slot to the front: most recently used, and the one the scheduler holds
     if (i_res != 0) {
         auto tmp = std::move(gf_res_ring[i_res]);
