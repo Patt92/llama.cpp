@@ -1,14 +1,14 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..333c9100f 100644
+index aae3bcd35..babf8a85d 100644
 --- a/README.md
 +++ b/README.md
-@@ -17,6 +17,228 @@
+@@ -17,6 +17,227 @@
  
  </div>
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`661643e43079a4ee6faab4c1895291767b67ea8d`](https://github.com/ggml-org/llama.cpp/commit/661643e43079a4ee6faab4c1895291767b67ea8d).
++Based on upstream llama.cpp commit [`54315813269112dd0baed7112ec87ad93a8218ca`](https://github.com/ggml-org/llama.cpp/commit/54315813269112dd0baed7112ec87ad93a8218ca).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -29,7 +29,6 @@ index aae3bcd35..333c9100f 100644
 +- Fuses the qwen4exp hyper-connection tails for decode: `ggml_hc_gate_mix` (sigmoid, gating, stream collapse and its 1/hc, 7 nodes -> 1) and `ggml_hc_combine` (the scatter's scale, sigmoid, scale, repeat, mul, add, 6 -> 1), CPU and HIP, checked against the elementwise chain by `test-llama-archs --arch qwen4exp` (NMSE 1e-14) and `test-backend-ops`. `QWEN4EXP_HC_FUSED=0` rebuilds the chain. The op enum grows by two, so the RPC protocol patch version is bumped and both ends of a split must run this build. Measured effect is small (about 1 ms per verify step): a rocprof trace of the live model shows the decode step is not launch-bound but spent in the weight reads - the 517 MB Q6_K output head three times per step (target verify plus two draft steps, 6.8 ms), the routed experts at the memory roofline (10 ms), the dense projections (10 ms) - plus the RPC worker's share.
 +- Keeps a ring of the last four built graphs per context (`LLAMA_GRAPH_RING`, 1 = the previous single slot). Speculative decoding alternates ubatch shapes - one-token draft steps, catch-up and verify batches of 2..n, shorter verify batches whenever the draft stops early at a high `--spec-draft-p-min` - and a single previous graph rebuilt on every switch: ~30 ms per step on the RPC split, `graphs reused = 96 of 219` at p-min 0.75. A reused slot that the scheduler does not hold is planned again from scratch so it lands on the addresses it had (`LLAMA_GRAPH_RING_CHECK=1` reports any tensor that moved), which keeps the backends' captured graphs and the RPC server's stored graph valid. Checked by `test-llama-archs --arch qwen4exp` (ring vs single slot over ten alternating shapes, NMSE 0).
 +- The RPC server stores the last four deserialized graphs per device, addressed by the hash of the serialized graph instead of the graph uid; the recompute request has a reply, and a graph the server no longer holds is sent whole. Protocol patch version 2 - both ends of a split must run this build.
-+- Fixes a heap overflow in the CPU backend on Apple arm64: `CACHE_LINE_SIZE` was 256 in the C++ kernels (`std::hardware_destructive_interference_size`) and 64 in the C planner, so every op with a cache-line-padded per-thread scratch wrote past the work buffer whenever it was the op that sized it. Found with guard malloc in the rope cos/sin cache; sporadic malloc aborts in `test-llama-archs` since 2026-09-06.
 +- `LLAMA_OP_PROFILE=1` times every node of the decode and verify graphs (ubatches up to 8 tokens, `=<n>` raises the ceiling) through the scheduler's eval callback, which synchronizes after each node, and prints a table per backend/op and per node name with the layer numbers folded every 32 graphs (`LLAMA_OP_PROFILE_EVERY`), separately for the target and the MTP draft context. The per-node sync (about 10 us on HIP, a round trip on RPC) is part of every number, so read it as a ranking of where a token's time goes, not as kernel time.
 +- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
 +- Gathers the QSA-selected keys and values into a compact buffer for decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213), which limited it to one token per stream; its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Extended here to ubatches of up to 8 tokens per stream, because speculative verification hands the target `n-max + 1` tokens per pass and the one-token gate sent every such pass down the masked path -- with `--spec-draft-n-max 2` the gather never engaged at all, which is why Qwen3.8-Flash-Next decoded at 28.7 t/s at 123 tokens but 15.7 t/s at 80k on the same build, with draft acceptance unchanged. Each token carries its own top-k list and becomes one entry of the attention batch; `test-llama-archs --arch qwen4exp` checks an 8-token verify batch against eight single-token gathers, and gathered against masked attention with equal selection widths on a cache deeper than the width. Engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it, `=2` forces it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
@@ -223,7 +222,7 @@ index aae3bcd35..333c9100f 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 661643e43079a4ee6faab4c1895291767b67ea8d
++git checkout 54315813269112dd0baed7112ec87ad93a8218ca
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -779,35 +778,10 @@ index 266261c5e..1f3dbca84 100644
  
  static void ggml_compute_forward_rwkv_wkv7_f32(
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index ce2b3e870..ad5c6db77 100644
+index 2728b08b6..16623d3c9 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
-@@ -6,17 +6,20 @@
- // cache line
- //
- 
--#if defined(__cpp_lib_hardware_interference_size)
--#define CACHE_LINE_SIZE std::hardware_destructive_interference_size
--#else
-+// [TAG_CACHE_LINE_C_CXX] the same value for the C planner (ggml-cpu.c) and the C++ kernels
-+// (ops.cpp): the planner sizes the work buffer with CACHE_LINE_SIZE-padded per-thread strides
-+// and the kernels index it with the same expression, so the two translation units must agree.
-+// With std::hardware_destructive_interference_size on the C++ side only (256 on Apple arm64
-+// libc++) the kernels ran CACHE_LINE_SIZE*(n_threads-1) bytes past the buffer the planner sized.
- #if defined(__POWER9_VECTOR__)
- #define CACHE_LINE_SIZE 128
- #elif defined(__VXE__) || defined(__VXE2__)
- #define CACHE_LINE_SIZE 256
-+#elif defined(__APPLE__) && defined(__aarch64__)
-+#define CACHE_LINE_SIZE 128
- #else
- #define CACHE_LINE_SIZE 64
- #endif
--#endif
- 
- // -Winterference-size was introduced in GCC 12
- #if defined(__cplusplus) && defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 12
-@@ -117,6 +120,8 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
+@@ -108,6 +108,8 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
  void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -2041,7 +2015,7 @@ index 1b431a724..55c946f4f 100644
                  n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                  sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 790553888..6547463a0 100644
+index 74bb47145..c938a068f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -61,6 +61,7 @@
@@ -2209,7 +2183,7 @@ index 790553888..6547463a0 100644
              }
          }
  
-@@ -5463,7 +5557,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5460,7 +5554,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->ne[0] <= 1024;
  #endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
          case GGML_OP_ARGSORT:
@@ -2218,7 +2192,7 @@ index 790553888..6547463a0 100644
              return op->src[0]->ne[0] <= 1024;
  #else
              return true;
-@@ -5500,6 +5594,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5499,6 +5593,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -3919,10 +3893,10 @@ index 5ef03e190..965a2d618 100644
  
  struct ggml_hash_set ggml_hash_set_new(size_t size) {
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index d3a639f37..40bae295d 100644
+index e54ee5a0f..e41d89469 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
-@@ -1184,6 +1184,11 @@ class MODEL_TENSOR(IntEnum):
+@@ -1185,6 +1185,11 @@ class MODEL_TENSOR(IntEnum):
      NEXTN_HNORM            = auto()
      NEXTN_SHARED_HEAD_HEAD = auto()
      NEXTN_SHARED_HEAD_NORM = auto()
@@ -3934,7 +3908,7 @@ index d3a639f37..40bae295d 100644
      # eagle3
      FC                     = auto()  # feature fusion layer
      D2T                    = auto()  # draft to target vocabulary mapping
-@@ -1967,6 +1972,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+@@ -1969,6 +1974,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
      MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
      MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
      MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
@@ -3944,7 +3918,7 @@ index d3a639f37..40bae295d 100644
      MODEL_TENSOR.FC:                        "fc",
      MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
      MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
-@@ -2951,6 +2959,15 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+@@ -2953,6 +2961,15 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
          MODEL_TENSOR.PLE_NORM_QUERY,
          MODEL_TENSOR.PLE_NORM_CONV,
          MODEL_TENSOR.PLE_CONV1D,
@@ -3982,7 +3956,7 @@ index d2dfeece5..eed2ffd60 100644
                  "model.layers.{bid}.self_attn.indexer.q_layernorm",
              ),
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index bc922b6a7..51b8d538b 100644
+index afdaddc79..1a6c54f37 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -31,6 +31,7 @@ set(LLAMA_CORE_SOURCES
@@ -3994,10 +3968,10 @@ index bc922b6a7..51b8d538b 100644
      llama-mmap.cpp
      llama-model-loader.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index b5efb7206..76a0b6ad0 100644
+index 0fac27efc..b465e83b7 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -84,6 +84,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+@@ -85,6 +85,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
      { LLM_ARCH_GLM4,             "glm4"             },
      { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
      { LLM_ARCH_GLM_DSA,          "glm-dsa"          },
@@ -4005,7 +3979,7 @@ index b5efb7206..76a0b6ad0 100644
      { LLM_ARCH_BITNET,           "bitnet"           },
      { LLM_ARCH_T5,               "t5"               },
      { LLM_ARCH_T5ENCODER,        "t5encoder"        },
-@@ -284,6 +285,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+@@ -285,6 +286,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
      { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.attention.indexer.key_length"           },
      { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
      { LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,           "%s.attention.indexer.block_size"           },
@@ -4013,7 +3987,7 @@ index b5efb7206..76a0b6ad0 100644
      { LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,         "%s.attention.indexer.local_blocks"         },
      { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
      { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
-@@ -578,6 +580,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+@@ -579,6 +581,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
      { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
      { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
      { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
@@ -4023,7 +3997,7 @@ index b5efb7206..76a0b6ad0 100644
      { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
      { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
      { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
-@@ -967,6 +972,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+@@ -968,6 +973,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
      {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
      {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
      {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
@@ -4033,7 +4007,7 @@ index b5efb7206..76a0b6ad0 100644
      // Nemotron 3 Super
      // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
      {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
-@@ -1083,6 +1091,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
+@@ -1084,6 +1092,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
          case LLM_ARCH_QWEN4EXP:
          case LLM_ARCH_DEEPSEEK4:
          case LLM_ARCH_MINIMAX_01:
@@ -4041,7 +4015,7 @@ index b5efb7206..76a0b6ad0 100644
              return true;
          default:
              return false;
-@@ -1137,6 +1146,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1138,6 +1147,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_HY_V4:
          case LLM_ARCH_DOTS3NOTE:
          case LLM_ARCH_GLM_DSA:
@@ -4050,10 +4024,10 @@ index b5efb7206..76a0b6ad0 100644
          case LLM_ARCH_T5:
          case LLM_ARCH_NEMOTRON_H:
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index f1d173a57..ea962fd7c 100644
+index 6e67f5d65..2ed08b9f3 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
-@@ -89,6 +89,7 @@ enum llm_arch {
+@@ -90,6 +90,7 @@ enum llm_arch {
      LLM_ARCH_GLM4,
      LLM_ARCH_GLM4_MOE,
      LLM_ARCH_GLM_DSA,
@@ -4061,7 +4035,7 @@ index f1d173a57..ea962fd7c 100644
      LLM_ARCH_BITNET,
      LLM_ARCH_T5,
      LLM_ARCH_T5ENCODER,
-@@ -289,6 +290,7 @@ enum llm_kv {
+@@ -290,6 +291,7 @@ enum llm_kv {
      LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
      LLM_KV_ATTENTION_INDEXER_TOP_K,
      LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,
@@ -4069,7 +4043,7 @@ index f1d173a57..ea962fd7c 100644
      LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,
      LLM_KV_ATTENTION_INDEXER_TYPES,
      LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,
-@@ -690,6 +692,11 @@ enum llm_tensor {
+@@ -691,6 +693,11 @@ enum llm_tensor {
      LLM_TENSOR_NEXTN_HNORM,
      LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
      LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
@@ -4736,7 +4710,7 @@ index bf91daa8b..637bba020 100644
 +    mutable int32_t n_reused_ring = 0; // [TAG_GRAPH_RING] of which from a slot other than the scheduler's current one
  };
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5855393ef..0428d3556 100644
+index fd4290cf0..8b9874237 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -13,6 +13,7 @@
@@ -5939,7 +5913,7 @@ index 000000000..afb823fd5
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f9e9a8bcb..671a2d795 100644
+index 3b2536283..79cde4a44 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
@@ -5950,7 +5924,7 @@ index f9e9a8bcb..671a2d795 100644
  #include "llama-memory-recurrent.h"
  
  #include "llama.h"
-@@ -202,6 +203,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+@@ -204,6 +205,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
              return new llama_model_deepseek4(params);
          case LLM_ARCH_GLM_DSA:
              return new llama_model_glm_dsa(params);
@@ -5959,7 +5933,7 @@ index f9e9a8bcb..671a2d795 100644
          case LLM_ARCH_MISTRAL4:
              return new llama_model_mistral4(params);
          case LLM_ARCH_CHATGLM:
-@@ -2478,6 +2481,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2480,6 +2483,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              nullptr);
                  }
              } break;
@@ -5999,7 +5973,7 @@ index f9e9a8bcb..671a2d795 100644
          case LLM_ARCH_DFLASH:
              {
                  // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
-@@ -2512,7 +2548,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2514,7 +2550,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                  const bool mtp_on_hybrid_qwen =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                      (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
@@ -6008,7 +5982,7 @@ index f9e9a8bcb..671a2d795 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -2896,6 +2932,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -2898,6 +2934,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_NEMOTRON_H_MOE:
          case LLM_ARCH_KIMI_LINEAR:
          case LLM_ARCH_KIMI_K3:
@@ -7310,10 +7284,10 @@ index 000000000..6a07e7901
 +    ggml_build_forward_expand(gf, cur);
 +}
 diff --git a/src/models/models.h b/src/models/models.h
-index 87195fddd..7c4c8b7a8 100644
+index da519dcfd..0b349122d 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -1341,6 +1341,44 @@ struct llama_model_glm_dsa : public llama_model_base {
+@@ -1354,6 +1354,44 @@ struct llama_model_glm_dsa : public llama_model_base {
      std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
  };
  
@@ -7358,7 +7332,7 @@ index 87195fddd..7c4c8b7a8 100644
  struct llama_model_eagle3 : public llama_model_base {
      llama_model_eagle3(const struct llama_model_params & params) : llama_model_base(params) {}
      void load_arch_hparams(llama_model_loader & ml) override;
-@@ -2355,7 +2393,12 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2368,7 +2406,12 @@ struct llama_model_qwen4exp : public llama_model_base {
  
      struct graph : public llm_build_delta_net_base {
          graph(const llama_model & model, const llm_graph_params & params);
@@ -7372,7 +7346,7 @@ index 87195fddd..7c4c8b7a8 100644
          // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
          ggml_tensor * build_hc_mix(
                      ggml_tensor * x,
-@@ -2387,8 +2430,10 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2400,8 +2443,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                      ggml_tensor * k_cur,
                      ggml_tensor * v_cur,
                      ggml_tensor * top_k,
@@ -7384,7 +7358,7 @@ index 87195fddd..7c4c8b7a8 100644
  
          // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
          // so the layers sharing a ratio share one input set
-@@ -2401,7 +2446,8 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2414,7 +2459,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                      ggml_tensor * inp_pos,
                      ggml_tensor * kq_mask,
                              int * sections,
@@ -7394,7 +7368,7 @@ index 87195fddd..7c4c8b7a8 100644
  
          ggml_tensor * build_layer_attn_linear(
               llm_graph_input_rs * inp,
-@@ -2447,6 +2493,11 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2460,6 +2506,11 @@ struct llama_model_qwen4exp : public llama_model_base {
          const llama_model & model;
      };
  
@@ -7407,7 +7381,7 @@ index 87195fddd..7c4c8b7a8 100644
  };
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..27f4d7f3d 100644
+index e58d35034..0c5ad9d1b 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -6,6 +6,26 @@
@@ -7450,7 +7424,7 @@ index 8ace95f73..27f4d7f3d 100644
      ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
      ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
      ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-@@ -154,15 +180,28 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -154,16 +180,29 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
      const int64_t hc_dim = hc * n_embd;
      const int64_t hc_lr  = hparams.hc_low_rank;
  
@@ -7468,12 +7442,13 @@ index 8ace95f73..27f4d7f3d 100644
 +    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
  
 -    // there is no output_norm: the final hyper-connection mixer carries it
--    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, 0);
--    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
--    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
 +    // there is no output_norm: the final hyper-connection mixer carries it. the MTP head
 +    // has its own in nextn.hc_head_*, so a draft-only file does not carry these
-+    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, trunk_flags);
+     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
+-    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
+-    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
+-    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
++    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { n_embd, hc }, trunk_flags | TENSOR_ALLOW_RESHAPE);
 +    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
 +    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
  
@@ -7485,7 +7460,7 @@ index 8ace95f73..27f4d7f3d 100644
          output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
      }
  
-@@ -188,10 +227,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -189,10 +228,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                             { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
      }
  
@@ -7513,23 +7488,23 @@ index 8ace95f73..27f4d7f3d 100644
          const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
  
          const int64_t head_k_dim = hparams.ssm_d_state;
-@@ -203,66 +257,107 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -204,66 +258,107 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
          const int64_t conv_dim   = key_dim * 2 + value_dim;
  
          // two HC modules per layer: before the token mixer, before the MoE
--        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, 0);
+-        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
 -        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, 0);
 -        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, 0);
 -        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, 0);
--        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, 0);
+-        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
 -        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, 0);
 -        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, 0);
 -        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, 0);
-+        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, flags);
++        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
 +        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, flags);
 +        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
 +        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, flags);
-+        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, flags);
++        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
 +        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, flags);
 +        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
 +        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, flags);
@@ -7579,15 +7554,15 @@ index 8ace95f73..27f4d7f3d 100644
          if (hparams.is_ple(il)) {
 -            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, 0);
 -            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, 0);
--            layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, 0);
--            layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, 0);
--            layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, 0);
+-            layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
+-            layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
+-            layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
 -            layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, 0);
 +            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, flags);
 +            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, flags);
-+            layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, flags);
-+            layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, flags);
-+            layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, flags);
++            layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
++            layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
++            layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
 +            layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
          }
  
@@ -7615,12 +7590,12 @@ index 8ace95f73..27f4d7f3d 100644
 +        // fc_embedding and fc_hidden fused side by side, so one matmul over
 +        // concat(e, h) computes fc_embedding@e + fc_hidden@h.
 +        layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, flags);
-+        layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
++        layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
 +        layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 +
 +        // the head's own output mixer, mirroring the trunk's hc_head_*: it collapses the
 +        // hc streams and stands in for the output norm, of which qwen4exp has none
-+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
++        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
 +        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
 +        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
 +
@@ -7762,7 +7737,7 @@ index 8ace95f73..27f4d7f3d 100644
      // the final mixer is the output norm: there is no separate one
      ggml_tensor * cur = build_hc_mix(res_hc,
              model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-@@ -440,6 +575,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -440,6 +575,205 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  
@@ -7829,12 +7804,9 @@ index 8ace95f73..27f4d7f3d 100644
 +
 +    auto * inp_attn = build_attn_inp_kv();
 +
-+    // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
-+    // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
-+    ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
-+    h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
-+    h_norm = ggml_mul(ctx0, h_norm, layer.nextn.hnorm);
-+    h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
++    // grouped RMSNorm over the wide stream: normalise each hc stream, then scale with the
++    // head's [n_embd, hc] gamma, exactly as build_hc_mix does
++    ggml_tensor * h_norm = ggml_mul(ctx0, ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps), layer.nextn.hnorm);
 +    cb(h_norm, "mtp_hnorm", il);
 +
 +    // the token embedding is shared across the streams, so broadcast it to hc copies
@@ -7971,7 +7943,7 @@ index 8ace95f73..27f4d7f3d 100644
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                  ggml_tensor * input,
                          int   il) {
-@@ -528,7 +865,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -528,7 +862,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_tensor *                           inp_pos,
          ggml_tensor *                           kq_mask,
          int *                                   sections,
@@ -7981,7 +7953,7 @@ index 8ace95f73..27f4d7f3d 100644
      const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
  
      const int64_t idx_dim  = hparams.indexer_head_size;
-@@ -549,7 +887,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -549,7 +884,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -7993,7 +7965,7 @@ index 8ace95f73..27f4d7f3d 100644
          kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
          cparams.causal_attn && !hparams.use_alibi;
  
-@@ -662,7 +1003,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -662,7 +1000,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      cb(expanded, "indexer_score_tokens", il);
  
      // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
@@ -8007,7 +7979,7 @@ index 8ace95f73..27f4d7f3d 100644
  
      ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
  
-@@ -681,8 +1027,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -681,8 +1024,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_tensor *             k_cur,
          ggml_tensor *             v_cur,
          ggml_tensor *             top_k,
@@ -8019,7 +7991,7 @@ index 8ace95f73..27f4d7f3d 100644
      // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
      // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
      if (inp->self_k_rot) {
-@@ -712,6 +1060,79 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -712,6 +1057,79 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -8099,7 +8071,7 @@ index 8ace95f73..27f4d7f3d 100644
      ggml_tensor * kq_mask = inp->get_kq_mask();
  
      // prepare new kq mask - starts filled with -INFINITY
-@@ -771,7 +1192,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -771,7 +1189,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      // indexer reads the same block input as q/k/v; no cache or no ratio means dense
      const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
  
@@ -8137,7 +8109,7 @@ index 8ace95f73..27f4d7f3d 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -824,7 +1274,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -824,7 +1271,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  
      if (top_k) {
@@ -8149,7 +8121,7 @@ index 8ace95f73..27f4d7f3d 100644
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index d02297cf5..a99a8613b 100644
+index 1616004e0..c8000e2d8 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4283,6 +4283,73 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
@@ -8252,7 +8224,7 @@ index d02297cf5..a99a8613b 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -8948,6 +9023,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -8960,6 +9035,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
      test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
  
@@ -8267,7 +8239,7 @@ index d02297cf5..a99a8613b 100644
      // glu ops
      for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
          for (int v : {0, 1}) {
-@@ -9843,6 +9926,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9855,6 +9938,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  #endif
  
  #if 1
@@ -8292,7 +8264,7 @@ index d02297cf5..a99a8613b 100644
      for (ggml_type type_a : base_types) {
          for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
              std::vector<int> ks = { 256 };
-@@ -10345,6 +10446,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10357,6 +10458,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -8301,7 +8273,7 @@ index d02297cf5..a99a8613b 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10888,6 +10991,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10907,6 +11010,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -8313,7 +8285,7 @@ index d02297cf5..a99a8613b 100644
      // gdn + cache cpy fusion (K > 1)
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
-@@ -11139,6 +11247,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11158,6 +11266,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      }
  
  
@@ -8348,7 +8320,7 @@ index d02297cf5..a99a8613b 100644
      // gpt-oss-20b
      for (int bs : {1, 4, 8, 512}) {
          for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
-@@ -11201,6 +11337,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11228,6 +11364,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
@@ -8362,7 +8334,7 @@ index d02297cf5..a99a8613b 100644
          for (int hs : { 64, 128, 256, 576, }) {
              const int  hsv    = hs == 576 ? 512 : hs;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 018ff1f42..d225ee8b0 100644
+index 90a6a7162..3693ce9b5 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -10,9 +10,13 @@
@@ -8432,7 +8404,7 @@ index 018ff1f42..d225ee8b0 100644
      } else if (arch == LLM_ARCH_MINIMAX_M3) {
          // partial rotary: n_rot must not exceed the indexer key length (64)
          ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
-@@ -256,7 +277,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+@@ -257,7 +278,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
          ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
          ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
          // without this the QSA layers fall back to dense and go uncovered
@@ -8445,7 +8417,7 @@ index 018ff1f42..d225ee8b0 100644
  
          // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
          const uint32_t ple_ngram_size      = 3;
-@@ -289,7 +314,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+@@ -290,7 +315,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
      ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
                arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
  
@@ -8454,7 +8426,7 @@ index 018ff1f42..d225ee8b0 100644
      ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
      ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
      ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
-@@ -310,15 +335,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+@@ -311,15 +336,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
          ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
      }
  
@@ -8478,7 +8450,7 @@ index 018ff1f42..d225ee8b0 100644
          ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
          ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
          ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
-@@ -390,7 +417,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
+@@ -396,7 +423,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
  
  static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
          struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
@@ -8487,7 +8459,7 @@ index 018ff1f42..d225ee8b0 100644
      GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
      llama_model_params model_params = llama_model_default_params();
      model_params.progress_callback = silent_model_load_progress;
-@@ -398,11 +425,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -404,11 +431,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
      devs_copy.push_back(nullptr);
      model_params.devices = devs_copy.data();
      model_params.split_mode = split_mode;
@@ -8501,7 +8473,7 @@ index 018ff1f42..d225ee8b0 100644
      if (!encode) {
          ctx_params.n_ubatch = 64;
      }
-@@ -421,6 +450,391 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -427,6 +456,391 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
      return std::make_pair(std::move(model), std::move(lctx));
  }
  
@@ -8893,7 +8865,7 @@ index 018ff1f42..d225ee8b0 100644
  static std::vector<float> get_logits(
          llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
      const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
-@@ -477,6 +891,7 @@ static bool moe_mandatory(const llm_arch arch) {
+@@ -483,6 +897,7 @@ static bool moe_mandatory(const llm_arch arch) {
          case LLM_ARCH_DEEPSEEK4:
          case LLM_ARCH_GLM4_MOE:
          case LLM_ARCH_GLM_DSA:
@@ -8901,7 +8873,7 @@ index 018ff1f42..d225ee8b0 100644
          case LLM_ARCH_EXAONE_MOE:
          case LLM_ARCH_BAILINGMOE:
          case LLM_ARCH_BAILINGMOE2:
-@@ -675,6 +1090,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -682,6 +1097,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
      std::vector<device_config> dev_configs;
      size_t max_device_label_length = 4;
      {
@@ -8924,7 +8896,7 @@ index 018ff1f42..d225ee8b0 100644
          std::vector<ggml_backend_dev_t> devices_meta;
          {
              const size_t device_count = ggml_backend_dev_count();
-@@ -760,10 +1191,35 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -767,10 +1198,35 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                      if (logits_cpu.empty()) {
                          model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                          logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
@@ -9065,7 +9037,7 @@ index 000000000..b8faf9c4f
 +
 +"$client" "$endpoint" "$test_dir/rpc"
 diff --git a/tools/mtmd/CMakeLists.txt b/tools/mtmd/CMakeLists.txt
-index 176eb1505..4978b3b68 100644
+index 907468e87..e6a387a0e 100644
 --- a/tools/mtmd/CMakeLists.txt
 +++ b/tools/mtmd/CMakeLists.txt
 @@ -39,6 +39,7 @@ add_library(mtmd
