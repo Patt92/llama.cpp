@@ -19,7 +19,7 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`6011c34ce6099646ccdf0d39a61c6e681477c178`](https://github.com/ggml-org/llama.cpp/commit/6011c34ce6099646ccdf0d39a61c6e681477c178).
+Based on upstream llama.cpp commit [`aa39d7a3e145a88202793a89462d65e94a5fc25f`](https://github.com/ggml-org/llama.cpp/commit/aa39d7a3e145a88202793a89462d65e94a5fc25f).
 
 This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 
@@ -37,7 +37,6 @@ This branch tracks the current upstream `llama.cpp` master and intentionally kee
 - On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
 - Loads Unsloth's *shared* MTP sidecar (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), which ships the NextN block without `token_embd` or `output`. The head borrows both from the target through `ctx_other`, so the sidecar is only usable as `--model-draft` of its target; loaded on its own it stops with a message instead of segfaulting, and the memory-fitting pass logs `requires ctx_other (this warning is normal during memory fitting)` and fits the target alone. The self-contained draft export is driven exactly as before (own KV cache, catch-up decode, sequential positions); the shared sidecar gets the same treatment, not the Gemma4-assistant shared-memory semantics that `ctx_other` used to imply. `test-llama-archs --arch qwen4exp` checks that the borrowed head reproduces the self-contained one (NMSE 0).
 - Keys the captured HIP graph by the first node's shape and node count, not the first node alone. Speculative decoding alternates graphs of different token counts in one context (the draft decodes one token per step and catches up on the accepted tokens; the verify batch shrinks when the draft stops early), and every switch found the other shape in the slot, reset the warmup and captured again: 20% of graph computes were captures and HIP graphs cost 5-8% of decode on gfx1151 against running without them. With the shape in the key each variant keeps its own graph (replay 91%, capture 1.5%).
-- Fuses the qwen4exp hyper-connection tails for decode: `ggml_hc_gate_mix` (sigmoid, gating, stream collapse and its 1/hc, 7 nodes -> 1) and `ggml_hc_combine` (the scatter's scale, sigmoid, scale, repeat, mul, add, 6 -> 1), CPU and HIP, checked against the elementwise chain by `test-llama-archs --arch qwen4exp` (NMSE 1e-14) and `test-backend-ops`. `QWEN4EXP_HC_FUSED=0` rebuilds the chain. The op enum grows by two, so the RPC protocol patch version is bumped and both ends of a split must run this build. Measured effect is small (about 1 ms per verify step): a rocprof trace of the live model shows the decode step is not launch-bound but spent in the weight reads - the 517 MB Q6_K output head three times per step (target verify plus two draft steps, 6.8 ms), the routed experts at the memory roofline (10 ms), the dense projections (10 ms) - plus the RPC worker's share.
 - Keeps a ring of the last four built graphs per context (`LLAMA_GRAPH_RING`, 1 = the previous single slot). Speculative decoding alternates ubatch shapes - one-token draft steps, catch-up and verify batches of 2..n, shorter verify batches whenever the draft stops early at a high `--spec-draft-p-min` - and a single previous graph rebuilt on every switch: ~30 ms per step on the RPC split, `graphs reused = 96 of 219` at p-min 0.75. A reused slot that the scheduler does not hold is planned again from scratch so it lands on the addresses it had (`LLAMA_GRAPH_RING_CHECK=1` reports any tensor that moved), which keeps the backends' captured graphs and the RPC server's stored graph valid. Checked by `test-llama-archs --arch qwen4exp` (ring vs single slot over ten alternating shapes, NMSE 0).
 - Writes an `rpc-server -c` cache entry only for a whole tensor, to a temporary name that is renamed into place once the write succeeded, so a full disk leaves no truncated file that a later `SET_TENSOR_HASH` would serve as valid. (The weights-only hash gate and the `cache_flag` in `SET_TENSOR` are upstream since [#28789](https://github.com/ggml-org/llama.cpp/pull/28789).)
 - The RPC server stores the last four deserialized graphs per device, addressed by the hash of the serialized graph instead of the graph uid; the recompute request has a reply, and a graph the server no longer holds is sent whole. Protocol patch version 2 - both ends of a split must run this build.
@@ -234,7 +233,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 6011c34ce6099646ccdf0d39a61c6e681477c178
+git checkout aa39d7a3e145a88202793a89462d65e94a5fc25f
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
