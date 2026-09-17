@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..dc56520fb 100644
+index aae3bcd35..26b8a222d 100644
 --- a/README.md
 +++ b/README.md
 @@ -17,6 +17,227 @@
@@ -8,7 +8,7 @@ index aae3bcd35..dc56520fb 100644
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`f172be756ae6e12a6aa294ecaeb2a387649ac6f8`](https://github.com/ggml-org/llama.cpp/commit/f172be756ae6e12a6aa294ecaeb2a387649ac6f8).
++Based on upstream llama.cpp commit [`972d2313bc0bf0a45f634f77d95c9fb03aeab12c`](https://github.com/ggml-org/llama.cpp/commit/972d2313bc0bf0a45f634f77d95c9fb03aeab12c).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -222,7 +222,7 @@ index aae3bcd35..dc56520fb 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout f172be756ae6e12a6aa294ecaeb2a387649ac6f8
++git checkout 972d2313bc0bf0a45f634f77d95c9fb03aeab12c
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -5398,7 +5398,7 @@ index 000000000..afb823fd5
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 3607bacd6..5975886d4 100644
+index de3b2e38f..f27963c2a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
