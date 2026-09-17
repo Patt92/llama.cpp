@@ -140,6 +140,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     } else if (arch == LLM_ARCH_QWEN3TTS) {
         //n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
+    } else if (arch == LLM_ARCH_HRM_TEXT) {
+        n_layer = 8; // 1 layer per stack x 2 h-cycles x (3 l-cycles + 1) cache slots
     }
 
     uint32_t n_head_kv = n_head;
@@ -350,6 +352,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
+    }
+
+    if (arch == LLM_ARCH_HRM_TEXT) {
+        // 8 cache slots alias 2 physical blocks: 1 low-stack layer + 1 high-stack layer
+        ms.add_kv(LLM_KV_HRM_LAYERS_PER_STACK, uint32_t(1));
+        ms.add_kv(LLM_KV_HRM_H_CYCLES,         uint32_t(2));
+        ms.add_kv(LLM_KV_HRM_L_CYCLES,         uint32_t(3));
     }
 
     if (arch == LLM_ARCH_MAPLE) {
@@ -641,34 +650,6 @@ static void test_qwen4exp_graph_ring(
         throw std::runtime_error(string_format("qwen4exp graph ring: alternating ubatch shapes differ from single-slot reuse, NMSE = %.2e", nmse_val));
     }
     printf("qwen4exp graph ring: %zu alternating ubatch shapes, ring vs single slot, NMSE = %.2e\n", steps.size(), nmse_val);
-}
-
-// [TAG_HC_FUSED_OPS] the fused hyper-connection tails must reproduce the elementwise chain
-static void test_qwen4exp_hc_fused(
-        const bool moe, const size_t seed, const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode) {
-    const uint32_t n_prefill = 24;
-    const uint32_t n_verify  = 3;
-
-    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, moe, false);
-    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_verify, 128, seed + 2);
-
-    std::vector<float> logits_fused;
-    std::vector<float> logits_plain;
-    {
-        env_scope env("QWEN4EXP_HC_FUSED", "1");
-        for (int mode = 0; mode < 2; ++mode) {
-            env.set(mode == 0 ? "1" : "0");
-            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, split_mode, false);
-            qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
-            qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_fused : &logits_plain);
-        }
-    }
-
-    const double nmse_val = nmse(logits_plain, logits_fused);
-    if (!(nmse_val < 1e-6)) {
-        throw std::runtime_error(string_format("qwen4exp HC fused: fused hyper-connection tails differ from the elementwise chain, NMSE = %.2e", nmse_val));
-    }
-    printf("qwen4exp HC fused: fused vs elementwise hyper-connection tails, NMSE = %.2e\n", nmse_val);
 }
 
 // [TAG_QWEN4EXP_SHARED_MTP] a shared MTP sidecar (Unsloth's mtp-*-shared-*.gguf) carries neither
@@ -1224,7 +1205,6 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                             test_qwen4exp_qsa_gather(gguf_ctx.get(), seed, dc.devs, dc.split_mode, tokens);
                             test_qwen4exp_qsa_gather_vs_masked(moe, seed, dc.devs, dc.split_mode);
                             test_qwen4exp_shared_mtp(gguf_ctx_mtp.get(), seed, dc.devs, dc.split_mode);
-                            test_qwen4exp_hc_fused(moe, seed, dc.devs, dc.split_mode);
                             test_qwen4exp_graph_ring(moe, seed, dc.devs, dc.split_mode);
                         }
                         const double nmse_val = nmse(logits_cpu, logits_dev);

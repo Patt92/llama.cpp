@@ -88,6 +88,10 @@ namespace cub = hipcub;
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly

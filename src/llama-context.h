@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
 #include <vector>
 
@@ -254,6 +255,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,

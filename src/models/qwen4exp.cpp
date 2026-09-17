@@ -351,14 +351,6 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
-// [TAG_HC_FUSED_OPS] QWEN4EXP_HC_FUSED=0 rebuilds the hyper-connection tails from the elementwise
-// ops (the reference the fused kernels are checked against); default on.
-static bool qwen4exp_hc_fused() {
-    // read per call so a test can flip it between graph builds; a few hundred getenv per build
-    const char * e = getenv("QWEN4EXP_HC_FUSED");
-    return e == nullptr || atoi(e) != 0;
-}
-
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -379,21 +371,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+    ggml_tensor * gate = build_lora_mm(w_up, lo);
+    cb(gate, "hc_gate", il);
 
-    ggml_tensor * mixed;
-    if (qwen4exp_hc_fused()) {
-        // [TAG_HC_FUSED_OPS] sigmoid, gating, the stream collapse and its 1/hc in one kernel
-        ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
-        cb(gate_logits, "hc_gate_logits", il);
-
-        mixed = ggml_hc_gate_mix(ctx0,
-                ggml_reshape_3d(ctx0, xn,          n_embd, hc, nt),
-                ggml_reshape_3d(ctx0, gate_logits, n_embd, hc, nt));
+    ggml_tensor * mixed = nullptr;
+    if (cparams.fused_dsv4_hc_pre && il >= 0) {
+        // sigmoid gate and mean over the streams in one op
+        mixed = ggml_dsv4_hc_pre_gated(ctx0,
+                ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
+                ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
     } else {
-        ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
-        cb(gate, "hc_gate", il);
-
-        ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
+        ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
         // collapse the streams by their mean
@@ -426,22 +415,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
-    if (qwen4exp_hc_fused()) {
-        // [TAG_HC_FUSED_OPS] the scatter in one kernel: residual + block_out * 2*sigmoid(inject/hc)
-        ggml_tensor * cur = ggml_hc_combine(ctx0, residual, block_out, inject, 1.0f / (float) hc);
-        cb(cur, "hc_combine", il);
-        return cur;
-    }
-
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
-    w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
-    ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
-    b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+    ggml_tensor * cur = nullptr;
+    if (cparams.fused_dsv4_hc_post && il >= 0) {
+        // identity comb: every stream adds the same block output, scaled by its own weight
+        cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
+    } else {
+        w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
-    ggml_tensor * cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+        ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+        b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+
+        cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+    }
     cb(cur, "hc_combine", il);
 
     return cur;
