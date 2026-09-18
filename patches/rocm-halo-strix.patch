@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..26b8a222d 100644
+index aae3bcd35..6038c2349 100644
 --- a/README.md
 +++ b/README.md
 @@ -17,6 +17,227 @@
@@ -8,7 +8,7 @@ index aae3bcd35..26b8a222d 100644
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`972d2313bc0bf0a45f634f77d95c9fb03aeab12c`](https://github.com/ggml-org/llama.cpp/commit/972d2313bc0bf0a45f634f77d95c9fb03aeab12c).
++Based on upstream llama.cpp commit [`4fea119de30f6a923992780f6fd5ccb0bee5d47d`](https://github.com/ggml-org/llama.cpp/commit/4fea119de30f6a923992780f6fd5ccb0bee5d47d).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -222,7 +222,7 @@ index aae3bcd35..26b8a222d 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 972d2313bc0bf0a45f634f77d95c9fb03aeab12c
++git checkout 4fea119de30f6a923992780f6fd5ccb0bee5d47d
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -421,7 +421,7 @@ index 224bdef92..22fbedda8 100644
              struct ggml_tensor * a,
              struct ggml_tensor * sinks);
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 6faa68047..2617bfdb4 100644
+index 20bf96501..403d215f4 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -783,10 +783,25 @@ struct ggml_backend_sched_split {
@@ -477,7 +477,7 @@ index 6faa68047..2617bfdb4 100644
                      node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                  }
              }
-@@ -1854,6 +1881,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1857,6 +1884,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
      GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
@@ -485,7 +485,7 @@ index 6faa68047..2617bfdb4 100644
  
      const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
      sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
-@@ -1940,6 +1968,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -1943,6 +1971,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
      free(sched->context_buffer);
      free(sched->graph.nodes);
      free(sched->graph.leafs);
@@ -493,7 +493,7 @@ index 6faa68047..2617bfdb4 100644
      free(sched);
  }
  
-@@ -1947,6 +1976,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+@@ -1950,6 +1979,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      // reset state for the next run
      if (!sched->is_reset) {
@@ -501,7 +501,7 @@ index 6faa68047..2617bfdb4 100644
          ggml_hash_set_reset(&sched->hash_set);
          memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
          memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
-@@ -2005,6 +2035,40 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -2008,6 +2038,40 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
      return true;
  }
  
@@ -3317,7 +3317,7 @@ index 175281409..b390a3314 100644
          struct ggml_tensor * a,
          struct ggml_tensor * sinks) {
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index 36b4c3190..609b82123 100644
+index 27c126b36..a8ab6137f 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
 @@ -1193,6 +1193,11 @@ class MODEL_TENSOR(IntEnum):
@@ -5398,7 +5398,7 @@ index 000000000..afb823fd5
 +    const llama_memory_status status;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index de3b2e38f..f27963c2a 100644
+index e195f50d0..04700cfb7 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -17,6 +17,7 @@
@@ -5476,7 +5476,7 @@ index de3b2e38f..f27963c2a 100644
  
          // use what we call a normal RoPE, operating on pairs of consecutive head values
 diff --git a/src/llama-model.h b/src/llama-model.h
-index d61afa2cb..664c3abac 100644
+index 984b2cf38..867de6776 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -231,6 +231,12 @@ struct llama_layer_nextn {
@@ -7527,10 +7527,10 @@ index 9258d4a1f..2e7a065e7 100644
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index dc529a352..001b94042 100644
+index 30792e409..f61c474c0 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -4298,6 +4298,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
+@@ -4300,6 +4300,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
  };
  
  
@@ -7538,7 +7538,7 @@ index dc529a352..001b94042 100644
  // GGML_OP_SSM_CONV
  struct test_ssm_conv : public test_case {
      const ggml_type type;
-@@ -6377,7 +6378,7 @@ struct test_concat : public test_case {
+@@ -6379,7 +6380,7 @@ struct test_concat : public test_case {
      const std::array<int64_t, 4> ne_a;
      const int64_t ne_b_d;
      const int dim;
@@ -7547,7 +7547,7 @@ index dc529a352..001b94042 100644
  
      std::string vars() override {
          return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
-@@ -6412,7 +6413,15 @@ struct test_concat : public test_case {
+@@ -6414,7 +6415,15 @@ struct test_concat : public test_case {
              ggml_set_name(a, "a");
          }
          ggml_tensor * b;
@@ -7564,7 +7564,7 @@ index dc529a352..001b94042 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -9880,6 +9889,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9883,6 +9892,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  #endif
  
  #if 1
@@ -7589,7 +7589,7 @@ index dc529a352..001b94042 100644
      for (ggml_type type_a : base_types) {
          for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
              std::vector<int> ks = { 256 };
-@@ -10389,6 +10416,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10400,6 +10427,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -7598,7 +7598,7 @@ index dc529a352..001b94042 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10939,6 +10968,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10950,6 +10979,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -7610,7 +7610,7 @@ index dc529a352..001b94042 100644
      // gdn + cache cpy fusion (K > 1)
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
-@@ -11190,6 +11224,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11201,6 +11235,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      }
  
  
@@ -7645,7 +7645,7 @@ index dc529a352..001b94042 100644
      // gpt-oss-20b
      for (int bs : {1, 4, 8, 512}) {
          for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
-@@ -11260,6 +11322,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11271,6 +11333,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
@@ -8394,7 +8394,7 @@ index f737ccc24..196390a28 100644
  
      float eps = 1e-6;
 diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
-index cd6421def..36c017e98 100644
+index 1783c7ddf..d89c02bd8 100644
 --- a/tools/mtmd/clip.cpp
 +++ b/tools/mtmd/clip.cpp
 @@ -684,6 +684,14 @@ ggml_tensor * clip_graph::build_ffn(
@@ -8474,7 +8474,7 @@ index cd6421def..36c017e98 100644
          case PROJECTOR_TYPE_YOUTUVL:
          case PROJECTOR_TYPE_MUSE_GLIMMER:
              {
-@@ -4780,6 +4808,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+@@ -4783,6 +4811,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
          case PROJECTOR_TYPE_QWEN2VL:
          case PROJECTOR_TYPE_QWEN3VL:
          case PROJECTOR_TYPE_GLM4V:
@@ -8482,7 +8482,7 @@ index cd6421def..36c017e98 100644
              {
                  const int merge_ratio = hparams.n_merge;
                  const int pw = image_size_width  / patch_size;
-@@ -5994,6 +6023,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+@@ -5997,6 +6026,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
          case PROJECTOR_TYPE_GRANITE4_VISION:
              return ctx->model.qf_proj_blocks.size() * ctx->model.hparams.projection_dim;
          case PROJECTOR_TYPE_GLM4V:
