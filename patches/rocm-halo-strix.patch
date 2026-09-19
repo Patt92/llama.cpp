@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..6038c2349 100644
+index aae3bcd35..c1d99bf38 100644
 --- a/README.md
 +++ b/README.md
 @@ -17,6 +17,227 @@
@@ -8,7 +8,7 @@ index aae3bcd35..6038c2349 100644
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`4fea119de30f6a923992780f6fd5ccb0bee5d47d`](https://github.com/ggml-org/llama.cpp/commit/4fea119de30f6a923992780f6fd5ccb0bee5d47d).
++Based on upstream llama.cpp commit [`e613ef2c81bae98d59850d061ac29e6e3e88cb00`](https://github.com/ggml-org/llama.cpp/commit/e613ef2c81bae98d59850d061ac29e6e3e88cb00).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -222,7 +222,7 @@ index aae3bcd35..6038c2349 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout 4fea119de30f6a923992780f6fd5ccb0bee5d47d
++git checkout e613ef2c81bae98d59850d061ac29e6e3e88cb00
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -543,7 +543,7 @@ index 20bf96501..403d215f4 100644
      enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
      ggml_backend_sched_synchronize(sched);
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
-index 26af90025..b2f462a21 100644
+index 24115da09..2e5125399 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
 +++ b/ggml/src/ggml-cuda/argsort.cu
 @@ -1,13 +1,15 @@
@@ -573,7 +573,7 @@ index 26af90025..b2f462a21 100644
  
  // returns the suggested maximum number of rows to process during one argsort_f32_i32_cuda_cub() call
  int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
-@@ -153,7 +155,7 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
+@@ -156,7 +158,7 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
          }
      }
  }
@@ -582,7 +582,7 @@ index 26af90025..b2f462a21 100644
  
  // Bitonic sort implementation
  template<typename T>
-@@ -263,7 +265,7 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -266,7 +268,7 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
  
      enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
  
@@ -7527,10 +7527,10 @@ index 9258d4a1f..2e7a065e7 100644
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 30792e409..f61c474c0 100644
+index 34f5e4587..07c6fc5b9 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -4300,6 +4300,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
+@@ -4338,6 +4338,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
  };
  
  
@@ -7538,7 +7538,7 @@ index 30792e409..f61c474c0 100644
  // GGML_OP_SSM_CONV
  struct test_ssm_conv : public test_case {
      const ggml_type type;
-@@ -6379,7 +6380,7 @@ struct test_concat : public test_case {
+@@ -6417,7 +6418,7 @@ struct test_concat : public test_case {
      const std::array<int64_t, 4> ne_a;
      const int64_t ne_b_d;
      const int dim;
@@ -7547,7 +7547,7 @@ index 30792e409..f61c474c0 100644
  
      std::string vars() override {
          return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
-@@ -6414,7 +6415,15 @@ struct test_concat : public test_case {
+@@ -6452,7 +6453,15 @@ struct test_concat : public test_case {
              ggml_set_name(a, "a");
          }
          ggml_tensor * b;
@@ -7564,7 +7564,7 @@ index 30792e409..f61c474c0 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -9883,6 +9892,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9923,6 +9932,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  #endif
  
  #if 1
@@ -7589,7 +7589,7 @@ index 30792e409..f61c474c0 100644
      for (ggml_type type_a : base_types) {
          for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
              std::vector<int> ks = { 256 };
-@@ -10400,6 +10427,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10440,6 +10467,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -7598,7 +7598,7 @@ index 30792e409..f61c474c0 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10950,6 +10979,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10994,6 +11023,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -7610,7 +7610,7 @@ index 30792e409..f61c474c0 100644
      // gdn + cache cpy fusion (K > 1)
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
-@@ -11201,6 +11235,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11245,6 +11279,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      }
  
  
@@ -7645,7 +7645,7 @@ index 30792e409..f61c474c0 100644
      // gpt-oss-20b
      for (int bs : {1, 4, 8, 512}) {
          for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
-@@ -11271,6 +11333,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11315,6 +11377,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
@@ -7659,7 +7659,7 @@ index 30792e409..f61c474c0 100644
          for (int hs : { 64, 128, 256, 576, }) {
              const int  hsv    = hs == 576 ? 512 : hs;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 568f7234c..c3e049572 100644
+index 80a045185..fbba3633d 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -10,9 +10,13 @@
@@ -7775,7 +7775,7 @@ index 568f7234c..c3e049572 100644
          ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
          ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
          ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
-@@ -405,7 +432,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
+@@ -417,7 +444,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
  
  static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
          struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
@@ -7784,7 +7784,7 @@ index 568f7234c..c3e049572 100644
      GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
      llama_model_params model_params = llama_model_default_params();
      model_params.progress_callback = silent_model_load_progress;
-@@ -413,11 +440,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -425,11 +452,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
      devs_copy.push_back(nullptr);
      model_params.devices = devs_copy.data();
      model_params.split_mode = split_mode;
@@ -7798,7 +7798,7 @@ index 568f7234c..c3e049572 100644
      if (!encode) {
          ctx_params.n_ubatch = 64;
      }
-@@ -436,6 +465,363 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -448,6 +477,363 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
      return std::make_pair(std::move(model), std::move(lctx));
  }
  
@@ -8162,7 +8162,7 @@ index 568f7234c..c3e049572 100644
  static std::vector<float> get_logits(
          llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
      const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
-@@ -492,6 +878,7 @@ static bool moe_mandatory(const llm_arch arch) {
+@@ -504,6 +890,7 @@ static bool moe_mandatory(const llm_arch arch) {
          case LLM_ARCH_DEEPSEEK4:
          case LLM_ARCH_GLM4_MOE:
          case LLM_ARCH_GLM_DSA:
@@ -8170,7 +8170,7 @@ index 568f7234c..c3e049572 100644
          case LLM_ARCH_EXAONE_MOE:
          case LLM_ARCH_BAILINGMOE:
          case LLM_ARCH_BAILINGMOE2:
-@@ -691,6 +1078,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -703,6 +1090,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
      std::vector<device_config> dev_configs;
      size_t max_device_label_length = 4;
      {
@@ -8193,7 +8193,7 @@ index 568f7234c..c3e049572 100644
          std::vector<ggml_backend_dev_t> devices_meta;
          {
              const size_t device_count = ggml_backend_dev_count();
-@@ -776,10 +1179,34 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -788,10 +1191,34 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                      if (logits_cpu.empty()) {
                          model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                          logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
