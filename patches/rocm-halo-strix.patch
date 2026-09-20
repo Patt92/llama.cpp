@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index aae3bcd35..c1d99bf38 100644
+index aae3bcd35..47332f3ea 100644
 --- a/README.md
 +++ b/README.md
 @@ -17,6 +17,227 @@
@@ -8,7 +8,7 @@ index aae3bcd35..c1d99bf38 100644
  
 +## Patt92 ROCm Halo Strix additions
 +
-+Based on upstream llama.cpp commit [`e613ef2c81bae98d59850d061ac29e6e3e88cb00`](https://github.com/ggml-org/llama.cpp/commit/e613ef2c81bae98d59850d061ac29e6e3e88cb00).
++Based on upstream llama.cpp commit [`a894dae939d426954ce54bb604824f1ae918a0c5`](https://github.com/ggml-org/llama.cpp/commit/a894dae939d426954ce54bb604824f1ae918a0c5).
 +
 +This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 +
@@ -222,7 +222,7 @@ index aae3bcd35..c1d99bf38 100644
 +```sh
 +git clone https://github.com/ggml-org/llama.cpp.git
 +cd llama.cpp
-+git checkout e613ef2c81bae98d59850d061ac29e6e3e88cb00
++git checkout a894dae939d426954ce54bb604824f1ae918a0c5
 +git apply --check /path/to/rocm-halo-strix.patch
 +git apply /path/to/rocm-halo-strix.patch
 +```
@@ -6866,7 +6866,7 @@ index 3f9c67c63..ea2ae2d74 100644
  };
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 9258d4a1f..2e7a065e7 100644
+index f33989de0..f79507ba3 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -6,6 +6,26 @@
@@ -7477,7 +7477,7 @@ index 9258d4a1f..2e7a065e7 100644
      ggml_tensor * kq_mask = inp->get_kq_mask();
  
      // prepare new kq mask - starts filled with -INFINITY
-@@ -788,7 +1179,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -785,7 +1176,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      // indexer reads the same block input as q/k/v; no cache or no ratio means dense
      const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
  
@@ -7515,7 +7515,7 @@ index 9258d4a1f..2e7a065e7 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -841,7 +1261,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -838,7 +1258,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  
      if (top_k) {
@@ -7527,10 +7527,10 @@ index 9258d4a1f..2e7a065e7 100644
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 34f5e4587..07c6fc5b9 100644
+index c75cb3c0f..8f01dc7d0 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -4338,6 +4338,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
+@@ -4339,6 +4339,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
  };
  
  
@@ -7538,7 +7538,7 @@ index 34f5e4587..07c6fc5b9 100644
  // GGML_OP_SSM_CONV
  struct test_ssm_conv : public test_case {
      const ggml_type type;
-@@ -6417,7 +6418,7 @@ struct test_concat : public test_case {
+@@ -6418,7 +6419,7 @@ struct test_concat : public test_case {
      const std::array<int64_t, 4> ne_a;
      const int64_t ne_b_d;
      const int dim;
@@ -7547,7 +7547,7 @@ index 34f5e4587..07c6fc5b9 100644
  
      std::string vars() override {
          return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
-@@ -6452,7 +6453,15 @@ struct test_concat : public test_case {
+@@ -6453,7 +6454,15 @@ struct test_concat : public test_case {
              ggml_set_name(a, "a");
          }
          ggml_tensor * b;
@@ -7564,7 +7564,7 @@ index 34f5e4587..07c6fc5b9 100644
              auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
              b = ggml_new_tensor(ctx, type, 4, ne.data());
              ggml_set_name(b, "b");
-@@ -9923,6 +9932,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9935,6 +9944,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  #endif
  
  #if 1
@@ -7589,7 +7589,7 @@ index 34f5e4587..07c6fc5b9 100644
      for (ggml_type type_a : base_types) {
          for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
              std::vector<int> ks = { 256 };
-@@ -10440,6 +10467,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10452,6 +10479,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
      }
  
@@ -7598,7 +7598,7 @@ index 34f5e4587..07c6fc5b9 100644
      // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
      test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
-@@ -10994,6 +11023,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11011,6 +11040,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
  
@@ -7610,7 +7610,7 @@ index 34f5e4587..07c6fc5b9 100644
      // gdn + cache cpy fusion (K > 1)
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
-@@ -11245,6 +11279,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11262,6 +11296,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      }
  
  
@@ -7645,7 +7645,7 @@ index 34f5e4587..07c6fc5b9 100644
      // gpt-oss-20b
      for (int bs : {1, 4, 8, 512}) {
          for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
-@@ -11315,6 +11377,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11332,6 +11394,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
