@@ -515,9 +515,9 @@ static void test_qwen4exp_mtp(
         const llama_split_mode split_mode) {
     // A full checkpoint may embed its trailing NextN block. Loading that same file as a normal
     // target must skip the draft tensors without asking the allocator for a backend buffer.
-    get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 0.1f, devs, split_mode, false, false);
+    get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 1.0e-2f, devs, split_mode, false, false);
 
-    auto model_and_ctx = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 0.1f, devs, split_mode, false, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 1.0e-2f, devs, split_mode, false, true);
 
     const int32_t n_tokens = 4;
     const int32_t n_embd   = llama_model_n_embd_out(model_and_ctx.first.get());
@@ -605,12 +605,12 @@ static void test_qwen4exp_qsa_gather(
     std::vector<float> logits_batched;
     std::vector<float> logits_single;
     {
-        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 0.1f, devs, split_mode, false);
+        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 1.0e-2f, devs, split_mode, false);
         qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
         qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, &logits_batched);
     }
     {
-        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 0.1f, devs, split_mode, false);
+        auto mc = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 1.0e-2f, devs, split_mode, false);
         qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
         qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, 1, &logits_single);
     }
@@ -645,7 +645,7 @@ static void test_qwen4exp_qsa_gather_vs_masked(
         env_scope env("QWEN4EXP_QSA_GATHER", "2");
         for (int mode = 0; mode < 2; ++mode) {
             env.set(mode == 0 ? "2" : "0");
-            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, /*stdev =*/ 0.1f, devs, split_mode, false);
+            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, /*stdev =*/ 1.0e-2f, devs, split_mode, false);
             qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
             qwen4exp_decode_range(mc.second.get(), tokens, n_prefill, n_verify, n_verify, mode == 0 ? &logits_gather : &logits_masked);
         }
@@ -679,7 +679,7 @@ static void test_qwen4exp_graph_ring(
         env_scope env("LLAMA_GRAPH_RING", "4");
         for (int mode = 0; mode < 2; ++mode) {
             env.set(mode == 0 ? "4" : "1");
-            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, /*stdev =*/ 0.1f, devs, split_mode, false);
+            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, /*stdev =*/ 1.0e-2f, devs, split_mode, false);
             std::vector<float> & out = mode == 0 ? logits_ring : logits_one;
             qwen4exp_decode_range(mc.second.get(), tokens, 0, n_prefill, n_prefill, nullptr);
             uint32_t pos = n_prefill;
@@ -734,8 +734,8 @@ static void test_qwen4exp_shared_mtp(
         model_params.devices = devs_copy.data();
         model_params.split_mode = split_mode;
         model_params.load_mtp = true;
-        size_t tmp = seed;
-        llama_model_ptr model(llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params));
+        tensor_data_params tensor_params = { seed, /*stdev =*/ 1.0e-2f };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params));
         if (!model) {
             throw std::runtime_error("qwen4exp shared MTP: failed to create draft model");
         }
@@ -778,7 +778,7 @@ static void test_qwen4exp_shared_mtp(
     };
 
     // the target: the same checkpoint loaded as a plain model
-    auto target = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 0.1f, devs, split_mode, false, false);
+    auto target = get_model_and_ctx(gguf_ctx, nullptr, seed, /*stdev =*/ 1.0e-2f, devs, split_mode, false, false);
 
     // reference: a self-contained draft using its own token_embd / output
     std::vector<float> logits_own;
@@ -1230,7 +1230,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
                         // [TAG_KPOOL_KEY_CACHE] glm5next carries pool keys across passes
                         if (arch == LLM_ARCH_GLM5NEXT && !encode) {
-                            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, /*stdev =*/ 0.1f, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                            auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, /*stdev =*/ 1.0e-2f, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                             const std::vector<float> logits_chunked =
                                 get_logits_chunked(mc.first.get(), mc.second.get(), tokens);
                             const double nmse_chunked = nmse(logits_cpu, logits_chunked);
