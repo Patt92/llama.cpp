@@ -2491,15 +2491,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             llama_pos pos_min = std::numeric_limits<llama_pos>::max();
             llama_pos pos_max = -1;
-            for (int32_t k = 0; k < batch_inp.n_tokens; ++k) {
-                pos_min = std::min(pos_min, balloc->get_batch().pos[k]);
-                pos_max = std::max(pos_max, balloc->get_batch().pos[k]);
+            for (const auto & tok : batch_inp.tokens) {
+                pos_min = std::min(pos_min, tok.pos[0]);
+                pos_max = std::max(pos_max, tok.pos[0]);
             }
 
+            const llama_seq_id seq_id_0 = batch_inp.tokens.empty() || batch_inp.tokens[0].seq_ids.empty()
+                ? -1 : *batch_inp.tokens[0].seq_ids.begin();
+
             LLAMA_LOG_ERROR("%s: [TAG_NAN_CHECK] non-finite logits in output row %" PRId64 " of %" PRId64
-                            ": batch n_tokens = %d, embd = %d, pos = [%d, %d], seq_id[0] = %d, ctx_type = %d, arch = %s\n",
-                            __func__, i, (int64_t) n_outputs_all, batch_inp.n_tokens, batch_inp.embd != nullptr,
-                            pos_min, pos_max, batch_inp.n_seq_id ? batch_inp.seq_id[0][0] : -1,
+                            ": batch n_tokens = %zu, embd = %d, pos = [%d, %d], seq_id[0] = %d, ctx_type = %d, arch = %s\n",
+                            __func__, i, (int64_t) n_outputs_all, batch_inp.tokens.size(), batch_inp.n_embd > 0,
+                            pos_min, pos_max, seq_id_0,
                             (int) cparams.ctx_type, model.arch_name().c_str());
             break;
         }
