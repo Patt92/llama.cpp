@@ -6,23 +6,6 @@
 #include <algorithm>
 #include <cinttypes>
 
-// [TAG_QWEN4EXP_SHARED_MTP] a shared draft head has no token_embd / output of its own; it is only
-// usable as the draft of its target (-md), whose context arrives here as cparams.ctx_other.
-// The memory-fitting pass measures the draft before the target exists (ctx_other == nullptr):
-// throw, like gemma4-assistant does, so common_params_fit logs it and fits the target alone.
-static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams, const llama_model & model, const char * name) {
-    if (cparams.ctx_other == nullptr) {
-        throw std::runtime_error(format("QWEN4EXP MTP: this draft head has no '%s' of its own and needs ctx_other "
-                                        "(this warning is normal during memory fitting); load it as a draft of "
-                                        "its target model (-md), not on its own", name));
-    }
-    const llama_model & other = *llama_get_model(cparams.ctx_other);
-    if (other.hparams.n_embd != model.hparams.n_embd || other.vocab.n_tokens() != model.vocab.n_tokens()) {
-        throw std::runtime_error(format("QWEN4EXP MTP: draft and target disagree on the shape of '%s'", name));
-    }
-    return other;
-}
-
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -203,10 +186,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // no file-backed tensors to skip, so the MTP block must be left out there entirely
     const int  mtp_flags   = ml.load_mtp ? 0 : (TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL);
 
-    // [TAG_QWEN4EXP_SHARED_MTP] a *shared* draft export (Unsloth's mtp-*-shared-*.gguf) ships the
-    // MTP block alone and borrows token_embd and output from its target, so both are optional
-    // exactly when the trunk is absent; graph_mtp resolves them through cparams.ctx_other.
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -215,9 +195,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    // [TAG_QWEN4EXP_SHARED_MTP] never tie to a token_embd a borrowing draft does not have:
-    // a shared draft leaves both null and borrows them at graph time
-    if (output == NULL && tok_embd != NULL) {
+    if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -583,11 +561,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    // [TAG_QWEN4EXP_SHARED_MTP] a shared draft borrows the target's embedding table and LM head
-    ggml_tensor * w_tok_embd = model.tok_embd ? model.tok_embd
-        : qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
-
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, w_tok_embd, inp->tokens);
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h = inp->h;
@@ -642,11 +616,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // [TAG_QWEN4EXP_SHARED_MTP] likewise for the LM head
-    ggml_tensor * w_output = model.output ? model.output
-        : qwen4exp_shared_model(cparams, model, "output.weight").output;
-
-    cur = build_lora_mm(w_output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

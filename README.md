@@ -19,9 +19,16 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`4364bf7232e65c34eca8d9500c5464389662de6b`](https://github.com/ggml-org/llama.cpp/commit/4364bf7232e65c34eca8d9500c5464389662de6b).
+Based on upstream llama.cpp commit [`16c163d561b976d8375a17db5660105abe47cda1`](https://github.com/ggml-org/llama.cpp/commit/16c163d561b976d8375a17db5660105abe47cda1).
 
 This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
+
+Upstream has meanwhile merged its own GLM-5.3-Flash (`glm5-next`, with a `glm5v` projector) and its
+own Qwen3.8-Flash-Next MTP head. The qwen4exp MTP path here is now upstream's, unmodified except for
+two loader fixes that only virtual test models hit. The GLM implementation below is kept **beside**
+upstream's, under its own architecture name `glm5next` and its own `glm5next` projector, because the
+measured gfx1151 work in this branch (pool-key cache, F16 pool keys, fused indexer scorer, tile
+compaction) sits on it; a GGUF selects one or the other by its `general.architecture` string.
 
 - Adds isolated `glm5next` / GLM-5.3-Flash text inference, including its hybrid KDA/MLA memory layout and NextN/MTP draft context.
 - Keeps completed GLM indexer pool keys in a persistent cache instead of rebuilding the entire context on every pass.
@@ -31,18 +38,15 @@ This branch tracks the current upstream `llama.cpp` master and intentionally kee
 - Holds the GLM indexer's pooled key cache in F16 rather than F32. `ggml_cuda_lightning_indexer` only takes the AMD WMMA kernel when K is F16, and GLM's indexer is exactly that kernel's shape (`hsk=128, nh=32`), so at F32 gfx1151 fell back to the scalar float4 kernel -- one warp per KV row, every head re-reading global memory. Measured on gfx1151: 5472 -> 1570 us at ubatch 2048, 3.48x on the term that scales with `n_kv`. This is precision the inputs never had, since a pool key is a weighted mean of indexer keys that are themselves cached F16, and the score built from it only ranks pools for a top-k. Decode does not reach the kernel -- it needs a batch of 16 -- and pays about 4% more on the scalar path, which is 0.04% of a token. The cache halves as a side effect.
 - Compacts masked-out KV rows inside the flash-attention tile kernel. GLM's indexer selects roughly 2048 of `n_kv` cells and expresses that as a full-width mask; the attention read every column anyway, because absorbed MLA makes Q 512 wide and so lands on the tile kernel, where upstream's sparse path -- wired only into `fattn-mma` -- never reaches it. The kernel now ballots which rows of each warp-sized group survive the mask and remaps lanes onto them, so the KQ and VKQ work scales with the selection. Row granularity rather than block skipping is what this model needs: its selection is 512 contiguous runs of four cells scattered over the context. Measured on gfx1151 at `hsk=512, gqa 8, kv=32768, ubatch 2048, 2048 selected`: 6.88 -> 16.65 TFLOPS, 2.42x. Prefill only; decode picks a different tile shape and is unaffected. No cache-type change is needed -- a q8_0 cache is converted to F16 scratch before the kernel as before.
 - The GLM-specific hyper-connection fused nodes are retained because they keep GLM graph reservation tractable; no global fusion policy or backend dispatcher is replaced.
-- Adds external NextN/MTP draft-head support for Qwen3.8-Flash-Next (`qwen4exp`). The target exports its four-stream hyper-connection state, while a self-contained MTP sidecar loads only the trailing NextN block and its own HC output mixer. The streams remain separate through `eh_proj`; averaging them first destroys draft acceptance. The draft block uses the correctness-first dense-attention path and does not enable the experimental sparse-FA transplant.
 - Adds `ggml_flash_attn_ext_add_top_k`, an explicit-index counterpart to upstream's mask-derived `ggml_flash_attn_ext_set_n_kv_max`. Upstream's sparse selection is CUDA-only - `ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse` returns false on HIP and MUSA - so on those backends attention reads every KV column even where the caller already knows which few matter. The new call takes the indices directly, on `src[5]` and op_params slot 5, both previously unused; the two APIs are independent and one graph may carry both. No backend reads it yet, so this is API and graph plumbing only and changes nothing on its own.
 - Gates the AMD `MUL_MAT_ID` float path on `ggml_cuda_should_use_mmvf`. That branch called `mul_mat_vec_f` unconditionally for any non-quantized `src0`, while the kernel asserts `ncols % 2 == 0` and needs its strides aligned to `2*type_size`. Every other caller consults the predicate; this one did not, so a model with float expert or dense weights aborted at load with `mmvf.cu:426`. Verified on gfx1151 with DeepSeek-V4-Flash UD-Q8_K_XL, whose dense stack is BF16 rather than quantized.
 - On ROCm with rocPRIM 4.4 or newer, enables hipCUB for RPC argsort without changing upstream HIP top-k selection.
-- Loads Unsloth's *shared* MTP sidecar (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), which ships the NextN block without `token_embd` or `output`. The head borrows both from the target through `ctx_other`, so the sidecar is only usable as `--model-draft` of its target; loaded on its own it stops with a message instead of segfaulting, and the memory-fitting pass logs `requires ctx_other (this warning is normal during memory fitting)` and fits the target alone. The self-contained draft export is driven exactly as before (own KV cache, catch-up decode, sequential positions); the shared sidecar gets the same treatment, not the Gemma4-assistant shared-memory semantics that `ctx_other` used to imply. `test-llama-archs --arch qwen4exp` checks that the borrowed head reproduces the self-contained one (NMSE 0).
 - Keys the captured HIP graph by the first node's shape and node count, not the first node alone. Speculative decoding alternates graphs of different token counts in one context (the draft decodes one token per step and catches up on the accepted tokens; the verify batch shrinks when the draft stops early), and every switch found the other shape in the slot, reset the warmup and captured again: 20% of graph computes were captures and HIP graphs cost 5-8% of decode on gfx1151 against running without them. With the shape in the key each variant keeps its own graph (replay 91%, capture 1.5%).
 - Keeps a ring of the last four built graphs per context (`LLAMA_GRAPH_RING`, 1 = the previous single slot). Speculative decoding alternates ubatch shapes - one-token draft steps, catch-up and verify batches of 2..n, shorter verify batches whenever the draft stops early at a high `--spec-draft-p-min` - and a single previous graph rebuilt on every switch: ~30 ms per step on the RPC split, `graphs reused = 96 of 219` at p-min 0.75. A reused slot that the scheduler does not hold is planned again from scratch so it lands on the addresses it had (`LLAMA_GRAPH_RING_CHECK=1` reports any tensor that moved), which keeps the backends' captured graphs and the RPC server's stored graph valid. Checked by `test-llama-archs --arch qwen4exp` (ring vs single slot over ten alternating shapes, NMSE 0).
 - Writes an `rpc-server -c` cache entry only for a whole tensor, to a temporary name that is renamed into place once the write succeeded, so a full disk leaves no truncated file that a later `SET_TENSOR_HASH` would serve as valid. (The weights-only hash gate and the `cache_flag` in `SET_TENSOR` are upstream since [#28789](https://github.com/ggml-org/llama.cpp/pull/28789).)
 - The RPC server stores the last four deserialized graphs per device, addressed by the hash of the serialized graph instead of the graph uid; the recompute request has a reply, and a graph the server no longer holds is sent whole. Protocol patch version 2 - both ends of a split must run this build.
 - `LLAMA_OP_PROFILE=1` times every node of the decode and verify graphs (ubatches up to 8 tokens, `=<n>` raises the ceiling) through the scheduler's eval callback, which synchronizes after each node, and prints a table per backend/op and per node name with the layer numbers folded every 32 graphs (`LLAMA_OP_PROFILE_EVERY`), separately for the target and the MTP draft context. The per-node sync (about 10 us on HIP, a round trip on RPC) is part of every number, so read it as a ranking of where a token's time goes, not as kernel time.
 - Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
-- Gathers the QSA-selected keys and values into a compact buffer for decode, instead of masking them out of a full-width attention. The indexer already picked roughly 2048 positions, but expressing that as a mask over the whole cache left the cost growing with context depth. Taken from [`#28213`](https://github.com/ggml-org/llama.cpp/pull/28213), which limited it to one token per stream; its author measured +6% at 31k, +19% at 62k and +50% at 130k with byte-identical greedy output. Extended here to ubatches of up to 8 tokens per stream, because speculative verification hands the target `n-max + 1` tokens per pass and the one-token gate sent every such pass down the masked path -- with `--spec-draft-n-max 2` the gather never engaged at all, which is why Qwen3.8-Flash-Next decoded at 28.7 t/s at 123 tokens but 15.7 t/s at 80k on the same build, with draft acceptance unchanged. Each token carries its own top-k list and becomes one entry of the attention batch; `test-llama-archs --arch qwen4exp` checks an 8-token verify batch against eight single-token gathers, and gathered against masked attention with equal selection widths on a cache deeper than the width. Engages from about 9k of context; `QWEN4EXP_QSA_GATHER=0` disables it, `=2` forces it. Note this does nothing unless the GGUF carries non-zero `attention.compress_ratios` -- everything on that path hangs off the same flag.
 - Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
 - Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
 - Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
@@ -101,12 +105,14 @@ took acceptance from 0.899 to 0.286 and halved token generation; accepted tokens
 from 2.70 to 1.70 while the drafted count doubled. Any acceptance figure is an average over the
 depths that were actually drafted and does not extrapolate past them.
 
-**Two sidecar formats load.** The self-contained export (`…-MTP-draft.gguf`, from this branch's
-converter) carries its own `token_embd` and `output`; Unsloth's shared export
-(`mtp-…-shared-Q8_0.gguf`) borrows both from the target and therefore only works as `--model-draft`.
-Both run with their own KV cache and the catch-up decode. The shared file saves the duplicate
-embedding and LM head (about 1 GB at Q8_0); whether its head drafts better is a measurement, not a
-given -- the self-contained one is the baseline every number in this section was taken with.
+**Use a self-contained sidecar export.** The qwen4exp MTP head is upstream's own implementation
+since [`c061df198`](https://github.com/ggml-org/llama.cpp/commit/c061df198), and it reads
+`token_embd` and `output` from the draft file itself, so a self-contained export
+(`…-MTP-draft.gguf`) is what loads. Unsloth's *shared* export (`mtp-…-shared-Q8_0.gguf`) ships the
+NextN block without either tensor; this branch used to borrow both from the target through
+`ctx_other`, and that support is deliberately gone — upstream rewrote the MTP graph and the borrow
+would have shipped unverified. The numbers in this section were all taken with the self-contained
+export, which is unaffected.
 
 **Know where the draft model lands when the target is split over RPC.** Without
 `--spec-draft-device` the draft's device list is empty, so it inherits the target's `--split-mode`
@@ -196,7 +202,7 @@ falls with context depth, so a figure without the KV depth it was taken at means
 one flag at a time; `draft acceptance` is the leading indicator for anything speculative, with the
 generation rate only its consequence.
 
-The implementation comes from [`ggml-org/llama.cpp#27836`](https://github.com/ggml-org/llama.cpp/pull/27836) by [@rmonsurate](https://github.com/rmonsurate). Draft-only sidecar loading follows [`unslothai/llama.cpp#144`](https://github.com/unslothai/llama.cpp/pull/144) by [@danielhanchen](https://github.com/danielhanchen). The loader guard and the CPU/ROCm regression coverage are maintained here by [@Patt92](https://github.com/Patt92).
+The qwen4exp MTP implementation is upstream's, from [`ggml-org/llama.cpp#27836`](https://github.com/ggml-org/llama.cpp/pull/27836) by [@rmonsurate](https://github.com/rmonsurate) and its later rewrite; this branch carries only the virtual-model loader fixes and the CPU regression coverage, maintained by [@Patt92](https://github.com/Patt92).
 
 ### Measured on gfx1151
 
@@ -233,7 +239,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 4364bf7232e65c34eca8d9500c5464389662de6b
+git checkout 16c163d561b976d8375a17db5660105abe47cda1
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
