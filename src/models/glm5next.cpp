@@ -1183,7 +1183,7 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // nope-only, so no YaRN mscale correction - identical to the trunk graph
     const float kq_scale = 1.0f / sqrtf(float(hparams.n_embd_head_k_mla()));
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd, hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);

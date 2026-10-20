@@ -19,7 +19,7 @@
 
 ## Patt92 ROCm Halo Strix additions
 
-Based on upstream llama.cpp commit [`16c163d561b976d8375a17db5660105abe47cda1`](https://github.com/ggml-org/llama.cpp/commit/16c163d561b976d8375a17db5660105abe47cda1).
+Based on upstream llama.cpp commit [`839a572a4cdecdb80d211297b8e7d7323a6e99d2`](https://github.com/ggml-org/llama.cpp/commit/839a572a4cdecdb80d211297b8e7d7323a6e99d2).
 
 This branch tracks the current upstream `llama.cpp` master and intentionally keeps upstream ROCm fusion, Qwen, DeepSeek, and Ornith graph semantics intact. Its backend delta is limited to tested gfx1151 MMQ layouts, scoped hipCUB argsort support, and the AMD `MUL_MAT_ID` guard; `TOP_K` remains on the upstream HIP implementation.
 
@@ -44,20 +44,18 @@ compaction) sits on it; a GGUF selects one or the other by its `general.architec
 - Keys the captured HIP graph by the first node's shape and node count, not the first node alone. Speculative decoding alternates graphs of different token counts in one context (the draft decodes one token per step and catches up on the accepted tokens; the verify batch shrinks when the draft stops early), and every switch found the other shape in the slot, reset the warmup and captured again: 20% of graph computes were captures and HIP graphs cost 5-8% of decode on gfx1151 against running without them. With the shape in the key each variant keeps its own graph (replay 91%, capture 1.5%).
 - Keeps a ring of the last four built graphs per context (`LLAMA_GRAPH_RING`, 1 = the previous single slot). Speculative decoding alternates ubatch shapes - one-token draft steps, catch-up and verify batches of 2..n, shorter verify batches whenever the draft stops early at a high `--spec-draft-p-min` - and a single previous graph rebuilt on every switch: ~30 ms per step on the RPC split, `graphs reused = 96 of 219` at p-min 0.75. A reused slot that the scheduler does not hold is planned again from scratch so it lands on the addresses it had (`LLAMA_GRAPH_RING_CHECK=1` reports any tensor that moved), which keeps the backends' captured graphs and the RPC server's stored graph valid. Checked by `test-llama-archs --arch qwen4exp` (ring vs single slot over ten alternating shapes, NMSE 0).
 - Writes an `rpc-server -c` cache entry only for a whole tensor, to a temporary name that is renamed into place once the write succeeded, so a full disk leaves no truncated file that a later `SET_TENSOR_HASH` would serve as valid. (The weights-only hash gate and the `cache_flag` in `SET_TENSOR` are upstream since [#28789](https://github.com/ggml-org/llama.cpp/pull/28789).)
-- The RPC server stores the last four deserialized graphs per device, addressed by the hash of the serialized graph instead of the graph uid; the recompute request has a reply, and a graph the server no longer holds is sent whole. Protocol patch version 2 - both ends of a split must run this build.
+- RPC graph caching uses upstream graph UIDs and its per-device cache. Both ends of an RPC split must run the same build.
 - `LLAMA_OP_PROFILE=1` times every node of the decode and verify graphs (ubatches up to 8 tokens, `=<n>` raises the ceiling) through the scheduler's eval callback, which synchronizes after each node, and prints a table per backend/op and per node name with the layer numbers folded every 32 graphs (`LLAMA_OP_PROFILE_EVERY`), separately for the target and the MTP draft context. The per-node sync (about 10 us on HIP, a round trip on RPC) is part of every number, so read it as a ranking of where a token's time goes, not as kernel time.
-- Zeroes the MTP hidden-state graph input on token-only batches. `llm_graph_input_embd_h::set_input` writes `h` only when the ubatch carries embeddings, so a token-only ubatch left the `DECODER_MTP` graph reading whatever the compute buffer held. Upstream master has the same gap.
+- Uses upstream's explicit MTP state embedding input in `llm_graph_input_embd_h`.
 - Restores `prop.integrated` on RDNA3.5. Upstream reverted it for all HIP builds over corrupted output in #15034, but gfx1151 has no VRAM carveout worth the name -- `mem_info_vram_total` reports 0.5 GB and the model lives in GTT -- so with the flag off, `ggml_backend_cuda_device_supports_buft` refuses host buffers and the scheduler keeps a device copy of memory the GPU could address in place. On a 124 GB node with two models resident that was the difference between 82 GB used and 119 GB used with 8 GB of swap, and prefill segments falling from 325 t/s to 12.6 t/s as ubatches hit swapped pages. Restored for RDNA3.5 only; every other architecture keeps upstream's `false`.
 - Restores the measured gfx1151 MMQ warp distribution and the Q8_0/Q5_K/Q6_K RDNA3.5 tile choices without replacing upstream's MMQ implementation.
-- Widens the `gated_delta_net` warp grid on gfx1151: eight warps at 32 heads, sixteen plus a shared-memory input cache at 64 or more, for prefill batches of 2048 tokens and up. GDN carries the whole Qwen3.8-Flash-Next prefill and the upstream kernel launches a fixed four warps regardless of batch size. Decode, KDA and state-keeping runs are untouched.
 - Adds an AMD WMMA kernel for the lightning indexer, used when the indexer K cache is f16 and the batch is at least 16 rows. The indexer is the `n_kv`-proportional term of DeepSeek-V4 and GLM prefill and previously ran the scalar float4 kernel on HIP, one warp per KV row with every head re-reading global memory. Decode and quantized indexer caches keep the old path.
 - Adds a coalesced dim-0 `concat` for a transposed `src1`, the shape DeepSeek-V4 builds when it joins its SWA-bounded `raw_k` to the narrowed `csa_k`. The generic kernel reads one element per row stride; the new one stages a 32x32 tile through shared memory.
 - Gives RDNA3.5 its own MMVQ parameter table instead of aliasing it onto RDNA2, which always resolved to one warp per block. Token generation now takes two warps for MXFP4, Q4_K, Q5_K, Q6_K and Q8_0, and Q8_0 gets a vec-dot ratio of 4 so its K loop retires in half the trips.
 - Shares the mm-ids helper and the q8_1 quantization of the activation across the gate/up `MUL_MAT_ID` pair of a MoE FFN. The two matmuls stay separate MMQ launches with unchanged arguments, so no GLU, bias or scale is folded in and this is not the class of fusion behind upstream #28113.
-- Chooses the `MUL_MAT_ID` J tile on gfx1151 from the type and the average columns per expert rather than from the generic minimum-tile-count scan. `GGML_CUDA_MMQ_ID_J=<J>` forces a value, `=auto` restores the default.
 - Caches the q8_1 activation for the duration of one graph evaluation on gfx1151, so MoE decode quantizes each row once instead of once per expert matmul. Off while a HIP graph is captured or replayed; `GGML_CUDA_DISABLE_MMVQ_Q8_1_CACHE=1` disables it.
 
-The seven items above are ported from [myhacsint/llama.cpp `production/strix-halo-qwen4exp-b10685`](https://github.com/myhacsint/llama.cpp/tree/production/strix-halo-qwen4exp-b10685). That branch is Vulkan-first and states that its ROCm paths are not claimed to be validated there, so each was re-verified here: the full `test-backend-ops` suite passes 14747/14747 on gfx1151, and coverage was added for the two shapes upstream does not exercise -- `concat` with a transposed `src1`, and `gated_delta_net` at 2048 tokens. The `MUL_MAT_ID` pair and the q8_1 cache only engage in a real MoE graph, which single-op tests cannot reach.
+The five remaining items above are ported from [myhacsint/llama.cpp `production/strix-halo-qwen4exp-b10685`](https://github.com/myhacsint/llama.cpp/tree/production/strix-halo-qwen4exp-b10685). That branch is Vulkan-first and states that its ROCm paths are not claimed to be validated there, so each was re-verified here: the earlier gfx1151 test suite passed on the prior base, and coverage was added for `concat` with a transposed `src1`. The new upstream GDN chunked kernel replaced the old warp-grid tune; this refresh has no runtime benchmark. The `MUL_MAT_ID` pair and the q8_1 cache only engage in a real MoE graph, which single-op tests cannot reach.
 
 #### When these engage
 
@@ -66,29 +64,15 @@ the model's own metadata before expecting a change, because several are narrower
 
 | tune | engages when | Qwen3.8-Flash-Next Q5_K_M |
 | --- | --- | --- |
-| `gated_delta_net` warp grid | `ssm.time_step_rank` is 32, or 64 and above | **no** -- the model has 48 |
 | AMD WMMA lightning indexer | `attention.indexer.head_count` is 32 or 64, indexer K is f16, batch >= 16 | **no** -- the model has 4 |
 | transposed-`src1` `concat` | dim-0 concat of a 2-D tensor with a transposed operand | no -- DeepSeek-V4 shape |
 | RDNA3.5 MMVQ table | MXFP4/Q4_K/Q5_K/Q6_K/Q8_0 at one output column | yes, but token generation on this model is bandwidth-bound, so the warp count is not what limits it |
 | `MUL_MAT_ID` pair | two adjacent `MUL_MAT_ID` over one activation, prefill | yes |
-| `MUL_MAT_ID` auto J | RDNA3.5; Q5_K/Q6_K with 256 or more experts, or Q8_0 | yes -- 512 experts, so J is forced to 64 |
 | q8_1 activation cache | RDNA3.5 MoE decode outside a HIP graph | yes |
 
-Widening the first two is mechanical -- 48 heads divide evenly into the sixteen-warp path, and the
-indexer kernel is templated on head count -- but the thresholds above are where the original author
-measured, so anything wider needs its own measurement rather than an assumption.
+The AMD indexer kernel is templated on head count, but its current thresholds are where the original author measured. Wider use needs its own measurement.
 
-Upstream reached the same conclusion about MoE tile sizing independently in
-[`#24546`](https://github.com/ggml-org/llama.cpp/pull/24546), which sized routed-MoE MMQ N-tiles
-from typical expert width, and then reverted it in
-[`#28551`](https://github.com/ggml-org/llama.cpp/pull/28551). The revert was about where the logic
-lives, not about whether it works: the objection was that it changed kernel configurations when the
-choice belongs entirely on the host side, and the suggested shape is an `ncols_opt` field on
-`mmq_args` decided in `ggml_cuda_mul_mat_q`. The version carried here is already host-side -- it
-only overrides the J that `mul_mat_q_switch_J` would have picked -- and it is gated to RDNA3.5,
-which that PR explicitly excluded. Its measurements are still the best evidence available for the
-idea on this hardware: at a typical expert width of 16 on gfx1151, `+21.7%` for Q4_K and `+7.5%`
-for Q5_K at the operator level, with width-64 negative controls flat.
+The paired `MUL_MAT_ID` path uses upstream's current host-side J selection, with RDNA3.5 sizing based on the average columns per expert.
 
 The model-specific ports are architecture-gated: they do not alter the Qwen3.5/Ornith or DeepSeek graph implementations.
 
@@ -239,7 +223,7 @@ full-width masks that make a larger ubatch expensive in VRAM. That is what
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 16c163d561b976d8375a17db5660105abe47cda1
+git checkout 839a572a4cdecdb80d211297b8e7d7323a6e99d2
 git apply --check /path/to/rocm-halo-strix.patch
 git apply /path/to/rocm-halo-strix.patch
 ```
