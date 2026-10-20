@@ -1,13 +1,28 @@
 #include "argsort.cuh"
 
+// returns the suggested maximum number of rows to process at once, given the temporary buffer bytes per row
+int ggml_cuda_chunk_nrows(const size_t row_bytes, const int64_t nrows) {
+    // process rows in chunks up to approximately this size (currently 64MB)
+    // to avoid excessive temporary buffers memory usage
+    const int chunk_bytes = 1 << 26;
+
+    // calculate how many rows will fit in one chunk (must be at least one)
+    const int chunk_nrows = std::max((int) (chunk_bytes / row_bytes), 1);
+
+    // limit the resulting amount to total nrows
+    return std::min((int64_t) chunk_nrows, nrows);
+}
+
+
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_HIP_USE_CUB_ARGSORT)
 #if !defined(GGML_USE_HIP)
 #    include <cub/cub.cuh>
-#endif
-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
+    // strided_iterator was added in CCCL 3.1
+#    if (CCCL_MAJOR_VERSION > 3 || (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION >= 1))
 #        define STRIDED_ITERATOR_AVAILABLE
 #        include <cuda/iterator>
 #    endif
+#endif // !defined(GGML_USE_HIP)
 using namespace cub;
 #endif  // GGML_CUDA_USE_CUB || GGML_HIP_USE_CUB_ARGSORT
 
@@ -30,20 +45,6 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 #endif  // STRIDED_ITERATOR_AVAILABLE
 
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_HIP_USE_CUB_ARGSORT)
-
-// returns the suggested maximum number of rows to process during one argsort_f32_i32_cuda_cub() call
-int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
-    // perform argsort in chunks up to approximately this size (currently 64MB)
-    // to avoid excessive temporary buffers memory usage
-    const int chunk_bytes = 1 << 26;
-
-    // calculate how many rows will fit in one chunk (must be at least one)
-    const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);
-
-    // limit the resulting amount to total nrows
-    return std::min((int64_t) chunk_nrows, nrows);
-}
-
 void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               const float *    x,
                               int *            dst,
@@ -291,7 +292,7 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
-    const int chunk_nrows = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+    const int chunk_nrows = ggml_cuda_chunk_nrows(src0->nb[1], nrows);
 
     ggml_cuda_pool & pool = ctx.pool();
 

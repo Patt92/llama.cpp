@@ -259,6 +259,7 @@ class Keys:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
         DIMENSION_COUNT_SWA       = "{arch}.rope.dimension_count_swa"
         DIMENSION_SECTIONS        = "{arch}.rope.dimension_sections"
+        SECTION_ORDER             = "{arch}.rope.section_order"
         FREQ_BASE                 = "{arch}.rope.freq_base"
         FREQ_BASE_SWA             = "{arch}.rope.freq_base_swa"
         SCALING_TYPE              = "{arch}.rope.scaling.type"
@@ -318,6 +319,7 @@ class Keys:
     class Classifier:
         OUTPUT_LABELS = "{arch}.classifier.output_labels"
         POOLING_TYPE  = "{arch}.classifier.pooling_type"
+        ACTIVATION    = "{arch}.classifier.activation"
 
     class ShortConv:
         L_CACHE = "{arch}.shortconv.l_cache"
@@ -408,6 +410,8 @@ class Keys:
         BLOCK_COUNT           = "clip.vision.block_count"
         IMAGE_MEAN            = "clip.vision.image_mean"
         IMAGE_STD             = "clip.vision.image_std"
+        MAX_SLICE_NUMS        = "clip.vision.max_slice_nums"
+        IMAGE_RESIZE_ALGO     = "clip.vision.image_resize_algo"
         SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
         SWIGLU_CLAMP          = "clip.vision.swiglu_clamp"
         EXPERT_COUNT_PER_LAYER = "clip.vision.expert_count_per_layer" # dots3note pyramid MoE, 0 = dense layer
@@ -490,6 +494,19 @@ class Keys:
         ALPHA_N             = "xielu.alpha_n"
         BETA                = "xielu.beta"
         EPS                 = "xielu.eps"
+
+    class PrismHadamard:
+        VERSION              = "prism.hadamard.version"
+        TIED_OUTPUT          = "prism.hadamard.tied_output"
+        BLOCK_SIZE           = "prism.hadamard.block_size"
+        TRANSFORM            = "prism.hadamard.transform"
+        AXIS                 = "prism.hadamard.axis"
+        SIGN_MODE            = "prism.hadamard.sign_mode"
+        SIGN_WIDTHS          = "prism.hadamard.sign_widths"
+        SIGN_VALUES          = "prism.hadamard.sign_values"
+        WEIGHT_NAMES         = "prism.hadamard.weight_names"
+        INVERSE_WEIGHT_NAMES = "prism.hadamard.inverse_weight_names"
+        GDN_V_GROUPED        = "prism.hadamard.gdn_v_grouped"
 
 
 #
@@ -1049,6 +1066,7 @@ class MODEL_TENSOR(IntEnum):
     V_SAM_NET_3          = auto() # Deepseek-OCR
     V_ENC_EMBD_IMGNL     = auto() # Deepseek-OCR
     V_ENC_EMBD_VSEP      = auto() # Deepseek-OCR
+    V_TOK_EMBD_SEP       = auto() # MiniCPM-V 4.7
     V_RESMPL_QUERY_768   = auto() # Deepseek-OCR-2
     V_RESMPL_QUERY_1024  = auto() # Deepseek-OCR-2
 
@@ -1830,6 +1848,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_SAM_NET_3:               "v.sam.net_3",
     MODEL_TENSOR.V_ENC_EMBD_IMGNL:          "v.image_newline", # Deepseek-OCR, Granite4Vision
     MODEL_TENSOR.V_ENC_EMBD_VSEP:           "v.view_seperator", # Deepseek-OCR
+    MODEL_TENSOR.V_TOK_EMBD_SEP:            "v.tok_embd_sep", # MiniCPM-V 4.7
     MODEL_TENSOR.V_RESMPL_QUERY_768:        "v.resample_query_768", # Deepseek-OCR-2 qwen2
     MODEL_TENSOR.V_RESMPL_QUERY_1024:       "v.resample_query_1024", # Deepseek-OCR-2 qwen2
     # Granite4 Vision
@@ -2077,6 +2096,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_ENC_EMBD_POS,
         MODEL_TENSOR.V_ENC_EMBD_IMGNL,
         MODEL_TENSOR.V_ENC_EMBD_VSEP,
+        MODEL_TENSOR.V_TOK_EMBD_SEP,
         MODEL_TENSOR.V_ENC_INPUT_NORM,
         MODEL_TENSOR.V_ENC_ATTN_QKV,
         MODEL_TENSOR.V_ENC_ATTN_Q,
@@ -5171,6 +5191,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.DENSE_2_OUT, # LFM2-ColBert-350M
+        MODEL_TENSOR.TOKEN_TYPES, # decision head
+        MODEL_TENSOR.CLS,
+        MODEL_TENSOR.CLS_NORM,
+        MODEL_TENSOR.CLS_OUT,
     ],
     MODEL_ARCH.LFM2MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5921,6 +5945,12 @@ class RopeScalingType(Enum):
     LONGROPE = 'longrope'
 
 
+# M-RoPE: input position slot (t, y, x, z) that feeds each RoPE section, in section order
+class RopeSectionOrder(Enum):
+    TYXZ = 'tyxz' # default
+    ZYXT = 'zyxt'
+
+
 class PoolingType(IntEnum):
     NONE = 0
     MEAN = 1
@@ -6070,6 +6100,8 @@ class DecisionType:
     NIMBLE  = "nimble"   # same as openjev, the prompt lists all the questions of the request
     CLEF    = "clef"     # joint head over all questions, one score per option
     PPLX_DECIDER = "pplx-decider"  # same as openjev, label codes of 1 or 2 letters
+    LFM2_D1 = "lfm2-d1"  # same as openjev, the labels depend on the question type
+    LFM2_D1_OMNI = "lfm2-d1-omni"  # same head as laya on a bidirectional LFM2 trunk, other prompt layout
 
 
 class VisionProjectorType:
@@ -6125,11 +6157,15 @@ class VisionProjectorType:
     PARAKEET       = "parakeet"  # audio
     MINIMAXM3      = "minimax_m3"
     MINICPMV4_6    = "minicpmv4_6"
+    MINICPMV4_7    = "minicpmv4_7"
     GRANITE_SPEECH = "granite_speech"  # audio
     MIMOVL         = "mimovl"
     MIMO_AUDIO     = "mimo_audio"
     GRANITE4_VISION = "granite4_vision"
     MUSE_GLIMMER   = "muse-glimmer"
+    COHERE2V       = "cohere2v"
+    D1OMNI_V       = "d1omni_v"  # lfm2 vision, without separator tokens
+    D1OMNI_A       = "d1omni_a"  # lfm2a audio, with a residual block after the projector
 
 
 # Items here are (block size, type size)
