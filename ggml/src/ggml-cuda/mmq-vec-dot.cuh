@@ -160,8 +160,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     const float * y_df = (const float *) y;
     const half2 * y_ds = (const half2 *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (rows_per_warp);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (rows_per_warp);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (rows_per_warp);
@@ -224,8 +224,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
     float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (rows_per_warp);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (rows_per_warp);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (rows_per_warp);
@@ -341,8 +341,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_dm = (const half2 *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (rows_per_warp);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (rows_per_warp);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (rows_per_warp);
@@ -400,8 +400,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     tile_A   A[ntx][MMQ_TILE_NE_K/QI8_1];
     float2 dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (rows_per_warp);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (rows_per_warp);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (rows_per_warp);
@@ -517,8 +517,8 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (rows_per_warp);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (rows_per_warp);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (rows_per_warp);
@@ -573,8 +573,8 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (ntx*tile_A::I);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (ntx*tile_A::I);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (ntx*tile_A::I);
@@ -727,8 +727,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (rows_per_warp);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (rows_per_warp);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (rows_per_warp);
@@ -802,8 +802,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (ntx*tile_A::I);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (ntx*tile_A::I);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (ntx*tile_A::I);
@@ -1075,8 +1075,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (rows_per_warp);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (rows_per_warp);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (rows_per_warp);
@@ -1132,8 +1132,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (ntx*tile_A::I);
+    constexpr int nwarps_pw = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) / (ntx*tile_A::I);
     constexpr int warps_j   = nwarps_pw / warps_i > 0 ? nwarps_pw / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (ntx*tile_A::I);

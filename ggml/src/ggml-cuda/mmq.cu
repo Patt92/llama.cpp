@@ -170,7 +170,9 @@ static void ggml_cuda_mul_mat_q_id(
         src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    size_t nbytes_src1_q8_1 = n_tokens*n_expert_used*ne10_padded * y_block_size/y_values_per_block;
+    // The quantized activation may be read through the end of a J=128 tile.
+    const size_t nbytes_src1_q8_1 = n_tokens*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
+        128 * sizeof(block_q8_1_mmq);
     for (int i = 0; i < n_mats; ++i) {
         const ggml_tensor * src0_i = src0s[i];
         ggml_tensor * dst_i = dsts[i];
@@ -181,10 +183,6 @@ static void ggml_cuda_mul_mat_q_id(
         GGML_ASSERT(src0_i->ne[0] == src1->ne[0]);
         GGML_ASSERT(dst_i->ne[1] == n_expert_used);
 
-        const bool fallback = src0_i->ne[1] % 128 != 0;
-        nbytes_src1_q8_1 = std::max(nbytes_src1_q8_1,
-            n_tokens*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0_i->type, fallback, cc, src1->ne[1]) * sizeof(block_q8_1_mmq));
     }
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);

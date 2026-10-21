@@ -484,8 +484,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback, prec_src1);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
 
-    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback) / (ntx*tile_C::I);
-    constexpr int nwarps_wb = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
+    constexpr int warps_i   = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1) / (ntx*tile_C::I);
+    constexpr int nwarps_wb = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / ggml_cuda_get_physical_warp_size();
     constexpr int warps_j   = nwarps_wb / warps_i > 0 ? nwarps_wb / warps_i : 1;
     const int wg = threadIdx.y / ntx;
     const int i0 = (wg % warps_i) * (ntx*tile_C::I);

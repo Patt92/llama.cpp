@@ -2064,7 +2064,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc) &&
-                ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, dst->ne[2])) {
+                ggml_cuda_should_use_mmvf(src0->type, cc, ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, src0->ne, src0->nb, dst->ne[2])) {
             // [TAG_MMVF_MMID_GUARD] must mirror the dispatch exactly. This predicate decides up
             // front whether HIP graphs are safe; claiming "no sync needed" here while the
             // dispatch falls through to the sorted path aborts on
@@ -2115,7 +2115,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 // instead of falling through to MMQ or BLAS. Hit by DeepSeek-V4-Flash UD-Q8_K_XL,
                 // whose dense weights are BF16 rather than quantized.
                 if (GGML_CUDA_CC_IS_AMD(cc) &&
-                        ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne2)) {
+                        ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne2)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
