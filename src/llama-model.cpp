@@ -3098,9 +3098,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_kv_cache::layer_filter_cb filter_mtp =
                         [&](int32_t il) { return il >= (int32_t) hparams.n_layer(); };
                     res = new llama_kv_cache(
-                            *this, hparams, params.type_k, params.type_v, !cparams.flash_attn,
+                            *this, params.no_alloc, hparams, params.type_k, params.type_v, !cparams.flash_attn,
                             cparams.offload_kqv, cparams.kv_unified, cparams.n_ctx_seq,
-                            cparams.n_seq_max, 1, hparams.n_swa, hparams.swa_type,
+                            cparams.n_seq_max, hparams.n_swa, hparams.swa_type,
                             nullptr, filter_mtp, nullptr, nullptr);
                     break;
                 }
@@ -3118,8 +3118,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE);
                 res = new llama_memory_hybrid_kpool(
-                        *this, params.type_k, params.type_v, !cparams.flash_attn,
-                        cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
+                        *this, params.no_alloc, params.type_k, params.type_v, !cparams.flash_attn,
+                        cparams.n_ctx_seq, hparams.n_swa, hparams.swa_type,
                         GGML_TYPE_F32, GGML_TYPE_F32, std::max((uint32_t) 1, cparams.n_seq_max),
                         2*hparams.indexer_head_size, hparams.indexer_block_size, true,
                         cparams.n_seq_max, cparams.n_rs_seq, cparams.offload_kqv, cparams.kv_unified,
